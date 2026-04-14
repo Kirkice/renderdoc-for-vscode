@@ -1,0 +1,404 @@
+{
+  "name": "renderdoc-for-vscode",
+  "displayName": "RenderDoc for VS Code",
+  "description": "View and analyze RenderDoc capture (.rdc) files in VS Code",
+  "version": "0.0.1",
+  "publisher": "renderdoc-community",
+  "engines": {
+    "vscode": "^1.95.0"
+  },
+  "categories": [
+    "Visualization",
+    "Debuggers",
+    "Other"
+  ],
+  "keywords": [
+    "renderdoc",
+    "graphics",
+    "vulkan",
+    "d3d12",
+    "d3d11",
+    "opengl",
+    "gpu",
+    "rdc"
+  ],
+  "activationEvents": [
+    "onLanguage:rdc",
+    "workspaceContains:**/*.rdc"
+  ],
+  "extensionDependencies": [
+    "github.copilot-chat"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "chatParticipants": [
+      {
+        "id": "renderdoc",
+        "fullName": "RenderDoc GPU Analyzer",
+        "name": "renderdoc",
+        "description": "Analyze GPU captures — draw calls, shaders, textures, pipeline state, and performance",
+        "isSticky": true
+      }
+    ],
+    "languageModelTools": [
+      {
+        "name": "renderdoc_getCaptureInfo",
+        "displayName": "Get Capture Info",
+        "toolReferenceName": "captureInfo",
+        "icon": "$(info)",
+        "description": "Get metadata about the currently loaded RenderDoc capture file (.rdc), including graphics API, GPU driver, capture version, and file sections.",
+        "inputSchema": { "type": "object", "properties": {} }
+      },
+      {
+        "name": "renderdoc_getDrawCalls",
+        "displayName": "Get Draw Calls",
+        "toolReferenceName": "drawCalls",
+        "icon": "$(list-tree)",
+        "description": "Get the list of GPU draw calls/events in the captured frame with event IDs, names, index/instance counts. Optionally filter by name.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "filter": { "type": "string", "description": "Optional name filter (case-insensitive substring match)" }
+          }
+        }
+      },
+      {
+        "name": "renderdoc_getResources",
+        "displayName": "Get Resources",
+        "toolReferenceName": "resources",
+        "icon": "$(database)",
+        "description": "Get the list of GPU resources in the capture: textures, buffers, shaders. Optionally filter by type.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "type": { "type": "string", "description": "Optional resource type filter: Texture, Buffer, Shader" }
+          }
+        }
+      },
+      {
+        "name": "renderdoc_getResourceDetail",
+        "displayName": "Get Resource Detail",
+        "toolReferenceName": "resourceDetail",
+        "icon": "$(symbol-property)",
+        "description": "Get detailed information about a specific GPU resource by its resource ID.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "resourceId": { "type": "string", "description": "The resource ID to look up" }
+          },
+          "required": ["resourceId"]
+        }
+      },
+      {
+        "name": "renderdoc_getEventDetails",
+        "displayName": "Get Event Details",
+        "toolReferenceName": "eventDetails",
+        "icon": "$(debug-step-into)",
+        "description": "Get full details of a specific GPU event/draw call by its event ID, including pipeline state if native bridge is available.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "eventId": { "type": "number", "description": "The event ID to inspect" }
+          },
+          "required": ["eventId"]
+        }
+      },
+      {
+        "name": "renderdoc_getPipelineState",
+        "displayName": "Get Pipeline State",
+        "toolReferenceName": "pipelineState",
+        "icon": "$(symbol-event)",
+        "description": "Get the full GPU pipeline state at a specific draw call event, including bound shaders, textures, blend/depth state. Requires native bridge.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "eventId": { "type": "number", "description": "The event ID to get pipeline state for" }
+          },
+          "required": ["eventId"]
+        }
+      },
+      {
+        "name": "renderdoc_getShaderSource",
+        "displayName": "Get Shader Source",
+        "toolReferenceName": "shaderSource",
+        "icon": "$(code)",
+        "description": "Get shader source code (GLSL/HLSL) at a specific draw call event. Optionally specify shader stage (vertex, fragment, compute).",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "eventId": { "type": "number", "description": "The event ID" },
+            "stage": { "type": "string", "description": "Shader stage: vertex, fragment, geometry, compute" }
+          },
+          "required": ["eventId"]
+        }
+      },
+      {
+        "name": "renderdoc_getTextureInfo",
+        "displayName": "Get Texture Info",
+        "toolReferenceName": "textureInfo",
+        "icon": "$(file-media)",
+        "description": "Get information about textures in the capture. Optionally filter by texture ID.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "textureId": { "type": "string", "description": "Optional texture resource ID" }
+          }
+        }
+      },
+      {
+        "name": "renderdoc_analyzeFrame",
+        "displayName": "Analyze Frame",
+        "toolReferenceName": "analyzeFrame",
+        "icon": "$(graph)",
+        "description": "Perform a comprehensive analysis of the captured frame: draw call statistics, resource usage, potential performance issues.",
+        "inputSchema": { "type": "object", "properties": {} }
+      }
+    ],
+    "commands": [
+      {
+        "command": "renderdoc.openCapture",
+        "title": "Open RDC Capture",
+        "category": "RenderDoc",
+        "icon": "$(file-binary)"
+      },
+      {
+        "command": "renderdoc.showThumbnail",
+        "title": "Show Capture Thumbnail",
+        "category": "RenderDoc",
+        "icon": "$(preview)"
+      },
+      {
+        "command": "renderdoc.refreshCapture",
+        "title": "Refresh Capture",
+        "category": "RenderDoc",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "renderdoc.configureRenderdocPath",
+        "title": "Configure RenderDoc Path",
+        "category": "RenderDoc",
+        "icon": "$(gear)"
+      },
+      {
+        "command": "renderdoc.showDrawCallDetails",
+        "title": "Show Draw Call Details",
+        "category": "RenderDoc"
+      },
+      {
+        "command": "renderdoc.showResourceDetails",
+        "title": "Show Resource Details",
+        "category": "RenderDoc"
+      },
+      {
+        "command": "renderdoc.viewShaderSource",
+        "title": "View Shader Source",
+        "category": "RenderDoc",
+        "icon": "$(code)"
+      },
+      {
+        "command": "renderdoc.viewPipelineState",
+        "title": "View Pipeline State",
+        "category": "RenderDoc",
+        "icon": "$(symbol-event)"
+      },
+      {
+        "command": "renderdoc.exportTexture",
+        "title": "Export Texture",
+        "category": "RenderDoc",
+        "icon": "$(desktop-download)"
+      },
+      {
+        "command": "renderdoc.previewTexture",
+        "title": "Preview Texture",
+        "category": "RenderDoc",
+        "icon": "$(eye)"
+      },
+      {
+        "command": "renderdoc.viewAllShaders",
+        "title": "View All Shaders",
+        "category": "RenderDoc",
+        "icon": "$(code)"
+      },
+      {
+        "command": "renderdoc.tryLocalReplay",
+        "title": "Try Local Replay",
+        "category": "RenderDoc",
+        "icon": "$(debug-start)"
+      }
+    ],
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "renderdoc-explorer",
+          "title": "RenderDoc",
+          "icon": "$(device-camera)"
+        }
+      ]
+    },
+    "views": {
+      "renderdoc-explorer": [
+        {
+          "id": "renderdoc-captureInfo",
+          "name": "Capture Info"
+        },
+        {
+          "id": "renderdoc-drawCalls",
+          "name": "Draw Calls"
+        },
+        {
+          "id": "renderdoc-resources",
+          "name": "Resources"
+        }
+      ]
+    },
+    "viewsWelcome": [
+      {
+        "view": "renderdoc-captureInfo",
+        "contents": "No RDC capture file opened.\n[Open Capture File](command:renderdoc.openCapture)"
+      }
+    ],
+    "menus": {
+      "view/title": [
+        {
+          "command": "renderdoc.refreshCapture",
+          "when": "view == renderdoc-captureInfo",
+          "group": "navigation"
+        },
+        {
+          "command": "renderdoc.openCapture",
+          "when": "view == renderdoc-captureInfo",
+          "group": "navigation"
+        },
+        {
+          "command": "renderdoc.tryLocalReplay",
+          "when": "view == renderdoc-captureInfo",
+          "group": "navigation"
+        },
+        {
+          "command": "renderdoc.viewAllShaders",
+          "when": "view == renderdoc-drawCalls",
+          "group": "navigation"
+        }
+      ],
+      "explorer/context": [
+        {
+          "command": "renderdoc.openCapture",
+          "when": "resourceExtname == .rdc",
+          "group": "navigation"
+        }
+      ],
+      "view/item/context": [
+        {
+          "command": "renderdoc.viewShaderSource",
+          "when": "view == renderdoc-drawCalls && viewItem == drawcall",
+          "group": "inline@1"
+        },
+        {
+          "command": "renderdoc.viewPipelineState",
+          "when": "view == renderdoc-drawCalls && viewItem == drawcall",
+          "group": "inline@2"
+        },
+        {
+          "command": "renderdoc.viewShaderSource",
+          "when": "view == renderdoc-drawCalls && viewItem == drawcall",
+          "group": "renderdoc@1"
+        },
+        {
+          "command": "renderdoc.viewPipelineState",
+          "when": "view == renderdoc-drawCalls && viewItem == drawcall",
+          "group": "renderdoc@2"
+        },
+        {
+          "command": "renderdoc.previewTexture",
+          "when": "view == renderdoc-resources && viewItem == texture",
+          "group": "inline@1"
+        },
+        {
+          "command": "renderdoc.exportTexture",
+          "when": "view == renderdoc-resources && viewItem == texture",
+          "group": "inline@2"
+        },
+        {
+          "command": "renderdoc.previewTexture",
+          "when": "view == renderdoc-resources && viewItem == texture",
+          "group": "renderdoc@1"
+        },
+        {
+          "command": "renderdoc.exportTexture",
+          "when": "view == renderdoc-resources && viewItem == texture",
+          "group": "renderdoc@2"
+        },
+        {
+          "command": "renderdoc.viewShaderSource",
+          "when": "view == renderdoc-resources && viewItem == shader",
+          "group": "inline@1"
+        },
+        {
+          "command": "renderdoc.viewShaderSource",
+          "when": "view == renderdoc-resources && viewItem == shader",
+          "group": "renderdoc@1"
+        }
+      ],
+      "commandPalette": [
+        {
+          "command": "renderdoc.showDrawCallDetails",
+          "when": "false"
+        },
+        {
+          "command": "renderdoc.showResourceDetails",
+          "when": "false"
+        },
+        {
+          "command": "renderdoc.viewShaderSource",
+          "when": "false"
+        },
+        {
+          "command": "renderdoc.viewPipelineState",
+          "when": "false"
+        },
+        {
+          "command": "renderdoc.exportTexture",
+          "when": "false"
+        },
+        {
+          "command": "renderdoc.previewTexture",
+          "when": "false"
+        },
+        {
+          "command": "renderdoc.viewAllShaders",
+          "when": "false"
+        },
+        {
+          "command": "renderdoc.tryLocalReplay",
+          "when": "false"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "RenderDoc",
+      "properties": {
+        "renderdoc.installPath": {
+          "type": "string",
+          "default": "",
+          "description": "Path to the RenderDoc installation directory. If empty, the extension will attempt to auto-detect."
+        },
+        "renderdoc.pythonScriptTimeout": {
+          "type": "number",
+          "default": 30000,
+          "description": "Timeout in milliseconds for Python script execution."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "lint": "eslint src --ext ts"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "@types/vscode": "^1.95.0",
+    "typescript": "^5.3.0"
+  }
+}
