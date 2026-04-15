@@ -1,4 +1,6 @@
 import * as vscode from 'vscode';
+import * as fs from 'fs';
+import * as path from 'path';
 import { RenderDocBridge } from './renderdocBridge';
 import { CaptureInfoProvider } from './views/captureInfoProvider';
 import { DrawCallProvider } from './views/drawCallProvider';
@@ -112,23 +114,82 @@ async function loadCapture(context: vscode.ExtensionContext, filePath: string) {
         console.log('[RenderDoc] No native bridge available');
     }
 
+    // Set replay status based on nativeOpenCapture result
+    if (nativeResult && nativeResult.replay) {
+        captureInfoProvider.setReplayStatus('active');
+    } else if (nativeResult && nativeResult.canTryReplay) {
+        captureInfoProvider.setReplayStatus('unavailable');
+    } else if (nativeResult && !nativeResult.replay) {
+        captureInfoProvider.setReplayStatus('failed');
+    }
+
     // If the capture is from a different OS (SuggestRemote), show a modal dialog
     if (nativeResult && nativeResult.canTryReplay && !nativeResult.replay) {
+        // Check ANGLE availability for GLES captures
+        const angleStatus = checkAngleAvailability();
+        const angleSources = !angleStatus.available ? findAngleSources() : null;
+        const hasAngle = angleStatus.available;
+
+        let message = nativeResult.replayMessage || 'This capture was made on a different OS. Local replay may be unstable.';
+        if (!hasAngle) {
+            message += '\n\nNote: ANGLE (libEGL.dll) is not installed. GLES captures require ANGLE for desktop replay.';
+            if (angleSources) {
+                message += ` Found ANGLE in ${angleSources.source} — can be installed automatically.`;
+            }
+        }
+
+        const buttons = hasAngle
+            ? ['Try Local Replay', 'Skip Replay'] as const
+            : angleSources
+                ? ['Install ANGLE & Replay', 'Skip Replay'] as const
+                : ['Try Local Replay', 'Skip Replay'] as const;
+
         const action = await vscode.window.showWarningMessage(
-            nativeResult.replayMessage || 'This capture was made on a different OS. Local replay may be unstable.',
+            message,
             { modal: true },
-            'Try Local Replay',
-            'Skip Replay'
+            ...buttons
         );
-        if (action === 'Try Local Replay') {
+        if (action === 'Install ANGLE & Replay' && angleSources) {
+            const installed = await installAngleDlls(angleSources);
+            if (installed) {
+                vscode.window.showInformationMessage('ANGLE installed! Restarting bridge and attempting replay...');
+                bridge.restartNativeBridge();
+                if (bridge.hasNativeBridge()) {
+                    try {
+                        await bridge.nativeOpenCapture(filePath);
+                        const tryResult = await bridge.nativeTryReplay();
+                        if (tryResult && tryResult.replay) {
+                            captureInfoProvider.setReplayStatus('active');
+                            vscode.window.showInformationMessage('Local replay started successfully! All advanced features are now available.');
+                        } else {
+                            captureInfoProvider.setReplayStatus('failed');
+                            vscode.window.showWarningMessage(`Replay failed: ${tryResult?.replayError || 'Unknown error'}`);
+                        }
+                    } catch (err: any) {
+                        captureInfoProvider.setReplayStatus('failed');
+                        console.log('[RenderDoc] tryReplay crashed after ANGLE install, restarting bridge...');
+                        bridge.restartNativeBridge();
+                        if (bridge.hasNativeBridge()) {
+                            try { await bridge.nativeOpenCapture(filePath); } catch { /* ignore */ }
+                        }
+                        vscode.window.showWarningMessage(
+                            'Replay still crashed even with ANGLE. The capture may use unsupported GLES features.'
+                        );
+                    }
+                }
+            }
+        } else if (action === 'Try Local Replay') {
             try {
                 const tryResult = await bridge.nativeTryReplay();
                 if (tryResult && tryResult.replay) {
+                    captureInfoProvider.setReplayStatus('active');
                     vscode.window.showInformationMessage('Local replay started successfully! Shader/pipeline/texture features are now available.');
                 } else {
+                    captureInfoProvider.setReplayStatus('failed');
                     vscode.window.showWarningMessage(`Replay failed: ${tryResult?.replayError || 'Unknown error'}`);
                 }
             } catch (err: any) {
+                captureInfoProvider.setReplayStatus('failed');
                 // Bridge likely crashed — restart it so file info still works
                 console.log('[RenderDoc] tryReplay crashed, restarting bridge...');
                 bridge.tryStartNativeBridge();
@@ -271,8 +332,14 @@ async function viewShaderSource(context: vscode.ExtensionContext, item: any) {
             try {
                 if (bridge.hasNativeBridge() && eventId !== undefined) {
                     const result = await bridge.nativeGetShaderSource(eventId);
-                    if (result && (result.vertex || result.fragment || result.compute || result.source)) {
-                        showShaderPanel(context, result, eventId);
+                    if (result && result.shaders && Object.keys(result.shaders).length > 0) {
+                        // Convert new format {shaders: {vertex: {source:...}, fragment: {source:...}}}
+                        // to the format showShaderPanel expects {vertex: "source", fragment: "source"}
+                        const panelData: Record<string, string> = {};
+                        for (const [stage, info] of Object.entries(result.shaders) as [string, any][]) {
+                            panelData[stage] = info.source || info.disassembly || '// No source available';
+                        }
+                        showShaderPanel(context, panelData, eventId);
                         return;
                     }
                 }
@@ -333,6 +400,104 @@ async function viewAllShaders(context: vscode.ExtensionContext) {
     );
 }
 
+// ── ANGLE (libEGL) detection and installation helpers ──────────────────────
+
+function getRenderDocDir(): string {
+    const config = vscode.workspace.getConfiguration('renderdoc');
+    const configuredPath = config.get<string>('installPath');
+    if (configuredPath) { return configuredPath; }
+    // Default Windows path
+    return path.join(process.env['ProgramFiles'] || 'C:\\Program Files', 'RenderDoc');
+}
+
+function checkAngleAvailability(): { available: boolean; targetDir: string } {
+    const rdcDir = getRenderDocDir();
+    const pluginDir = path.join(rdcDir, 'plugins', 'gles');
+    const eglPath = path.join(pluginDir, 'libEGL.dll');
+    const glesPath = path.join(pluginDir, 'libGLESv2.dll');
+    return {
+        available: fs.existsSync(eglPath) && fs.existsSync(glesPath),
+        targetDir: pluginDir,
+    };
+}
+
+function findAngleSources(): { egl: string; gles: string; source: string } | null {
+    // Search for ANGLE DLLs in common locations
+    const candidates: Array<{ dir: string; source: string }> = [];
+
+    // Chrome
+    const chromeDirs = [
+        path.join(process.env['ProgramFiles'] || '', 'Google', 'Chrome', 'Application'),
+        path.join(process.env['ProgramFiles(x86)'] || '', 'Google', 'Chrome', 'Application'),
+        path.join(process.env['LOCALAPPDATA'] || '', 'Google', 'Chrome', 'Application'),
+    ];
+    for (const chromeBase of chromeDirs) {
+        try {
+            if (!fs.existsSync(chromeBase)) { continue; }
+            const entries = fs.readdirSync(chromeBase).filter(e => /^\d+\./.test(e)).sort().reverse();
+            for (const ver of entries) {
+                const dir = path.join(chromeBase, ver);
+                candidates.push({ dir, source: `Chrome ${ver}` });
+            }
+        } catch { /* ignore */ }
+    }
+
+    // Edge
+    const edgeDirs = [
+        path.join(process.env['ProgramFiles'] || '', 'Microsoft', 'Edge', 'Application'),
+        path.join(process.env['ProgramFiles(x86)'] || '', 'Microsoft', 'Edge', 'Application'),
+    ];
+    for (const edgeBase of edgeDirs) {
+        try {
+            if (!fs.existsSync(edgeBase)) { continue; }
+            const entries = fs.readdirSync(edgeBase).filter(e => /^\d+\./.test(e)).sort().reverse();
+            for (const ver of entries) {
+                const dir = path.join(edgeBase, ver);
+                candidates.push({ dir, source: `Edge ${ver}` });
+            }
+        } catch { /* ignore */ }
+    }
+
+    for (const { dir, source } of candidates) {
+        const egl = path.join(dir, 'libEGL.dll');
+        const gles = path.join(dir, 'libGLESv2.dll');
+        if (fs.existsSync(egl) && fs.existsSync(gles)) {
+            return { egl, gles, source };
+        }
+    }
+    return null;
+}
+
+async function installAngleDlls(sources: { egl: string; gles: string; source: string }): Promise<boolean> {
+    const { targetDir } = checkAngleAvailability();
+    try {
+        // Try direct copy first (may fail without admin)
+        if (!fs.existsSync(targetDir)) {
+            fs.mkdirSync(targetDir, { recursive: true });
+        }
+        fs.copyFileSync(sources.egl, path.join(targetDir, 'libEGL.dll'));
+        fs.copyFileSync(sources.gles, path.join(targetDir, 'libGLESv2.dll'));
+        return true;
+    } catch {
+        // Need admin elevation on Windows
+        if (process.platform === 'win32') {
+            try {
+                const cp = await import('child_process');
+                const psCmd = `New-Item '${targetDir}' -ItemType Directory -Force | Out-Null; ` +
+                    `Copy-Item '${sources.egl}' '${path.join(targetDir, 'libEGL.dll')}' -Force; ` +
+                    `Copy-Item '${sources.gles}' '${path.join(targetDir, 'libGLESv2.dll')}' -Force`;
+                cp.execSync(`powershell -Command "Start-Process powershell -Verb RunAs -Wait -ArgumentList '-NoProfile','-Command',\\"${psCmd.replace(/"/g, '`"')}\\""`, { timeout: 30000 });
+                // Verify
+                return fs.existsSync(path.join(targetDir, 'libEGL.dll')) && fs.existsSync(path.join(targetDir, 'libGLESv2.dll'));
+            } catch (adminErr: any) {
+                vscode.window.showErrorMessage(`Failed to install ANGLE (admin privileges required): ${adminErr.message}`);
+                return false;
+            }
+        }
+        return false;
+    }
+}
+
 async function tryLocalReplay() {
     if (!currentCapturePath) {
         vscode.window.showWarningMessage('No capture file loaded.');
@@ -341,6 +506,42 @@ async function tryLocalReplay() {
     if (!bridge.hasNativeBridge()) {
         vscode.window.showWarningMessage('Native bridge not available.');
         return;
+    }
+
+    // Check if ANGLE is needed but missing (GLES capture without libEGL.dll)
+    const angleStatus = checkAngleAvailability();
+    if (!angleStatus.available) {
+        const angleSources = findAngleSources();
+        if (angleSources) {
+            const action = await vscode.window.showWarningMessage(
+                'This GLES capture needs ANGLE (libEGL.dll) for local replay, but it is not installed in RenderDoc plugins. ' +
+                `Found ANGLE DLLs in: ${angleSources.source}. Install them now?`,
+                { modal: true },
+                'Install ANGLE',
+                'Try Anyway'
+            );
+            if (action === 'Install ANGLE') {
+                const installed = await installAngleDlls(angleSources);
+                if (installed) {
+                    vscode.window.showInformationMessage('ANGLE installed! The native bridge must be restarted. Restarting...');
+                    bridge.restartNativeBridge();
+                    if (bridge.hasNativeBridge() && currentCapturePath) {
+                        try { await bridge.nativeOpenCapture(currentCapturePath); } catch { /* ignore */ }
+                    }
+                }
+            } else if (action !== 'Try Anyway') {
+                return;
+            }
+        } else {
+            const action = await vscode.window.showWarningMessage(
+                'This GLES capture needs ANGLE (libEGL.dll + libGLESv2.dll) for desktop replay. ' +
+                'ANGLE was not found on this system. Install Google Chrome or copy ANGLE DLLs to:\n' +
+                `${angleStatus.targetDir}`,
+                { modal: true },
+                'Try Anyway'
+            );
+            if (action !== 'Try Anyway') { return; }
+        }
     }
 
     const confirm = await vscode.window.showWarningMessage(
@@ -353,11 +554,14 @@ async function tryLocalReplay() {
     try {
         const result = await bridge.nativeTryReplay();
         if (result && result.replay) {
+            captureInfoProvider.setReplayStatus('active');
             vscode.window.showInformationMessage('Local replay active! Shader/pipeline/texture features are now available.');
         } else {
+            captureInfoProvider.setReplayStatus('failed');
             vscode.window.showWarningMessage(`Replay failed: ${result?.replayError || 'Unknown error'}`);
         }
     } catch (err: any) {
+        captureInfoProvider.setReplayStatus('failed');
         console.log('[RenderDoc] tryLocalReplay crashed, restarting bridge...');
         bridge.tryStartNativeBridge();
         if (bridge.hasNativeBridge()) {

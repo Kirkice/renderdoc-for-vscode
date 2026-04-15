@@ -462,6 +462,20 @@ export class RenderDocBridge {
         }
     }
 
+    /** Kill and restart the native bridge (e.g. after installing ANGLE DLLs) */
+    restartNativeBridge(): void {
+        if (this.nativeProcess) {
+            try { this.nativeProcess.kill(); } catch { /* ignore */ }
+            this.nativeProcess = undefined;
+        }
+        for (const [, pending] of this.nativePendingRequests) {
+            pending.reject(new Error('Native bridge restarting'));
+        }
+        this.nativePendingRequests.clear();
+        this.nativeOutputBuffer = '';
+        this.tryStartNativeBridge();
+    }
+
     /** Find the native bridge executable */
     private findNativeBridge(): string | undefined {
         // Look next to the extension
@@ -547,12 +561,12 @@ export class RenderDocBridge {
 
     /** Get shader source at a specific event via native bridge */
     async nativeGetShaderSource(eventId: number, stage?: string): Promise<any> {
-        return this.nativeCall('getShaderSource', { eventId, stage });
+        return this.nativeCall('getShaderSourceForEvent', { eventId, stage });
     }
 
-    /** Get texture data via native bridge */
+    /** Get texture data via native bridge (saves to temp PNG, returns base64) */
     async nativeGetTextureData(textureId: string, mip?: number): Promise<any> {
-        return this.nativeCall('getTextureData', { textureId, mip: mip ?? 0 });
+        return this.nativeCall('getTexturePreview', { resourceId: parseInt(textureId, 10) || 0, mip: mip ?? 0 });
     }
 
     /** Get root actions (draw call tree) via native bridge */

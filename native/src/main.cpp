@@ -423,6 +423,241 @@ static json handleGetShaderSource(int id, const json &params) {
     return makeResult(id, result);
 }
 
+// High-level: SetFrameEvent → GetPipelineState → GetShader for all bound stages
+// Returns shader source for each active stage at a given draw call event.
+static json handleGetShaderSourceForEvent(int id, const json &params) {
+    if (!g_replay)
+        return makeError(id, -1, "No replay active");
+
+    uint32_t eventId = params.value("eventId", (uint32_t)0);
+    std::string targetDisasm = params.value("target", "");
+
+    fprintf(stderr, "[bridge] getShaderSourceForEvent: eventId=%u\n", eventId);
+
+    // 1. Set the frame event
+    g_replay->SetFrameEvent(eventId, true);
+
+    // 2. Get pipeline state to find bound shaders
+    struct StageInfo {
+        const char *name;
+        ResourceId resourceId;
+        ShaderStage stage;
+    };
+    std::vector<StageInfo> stages;
+
+    const auto *gl = g_replay->GetGLPipelineState();
+    if (gl) {
+        if (gl->vertexShader.shaderResourceId != ResourceId())
+            stages.push_back({"vertex", gl->vertexShader.shaderResourceId, ShaderStage::Vertex});
+        if (gl->fragmentShader.shaderResourceId != ResourceId())
+            stages.push_back({"fragment", gl->fragmentShader.shaderResourceId, ShaderStage::Pixel});
+        if (gl->geometryShader.shaderResourceId != ResourceId())
+            stages.push_back({"geometry", gl->geometryShader.shaderResourceId, ShaderStage::Geometry});
+        if (gl->tessControlShader.shaderResourceId != ResourceId())
+            stages.push_back({"tessControl", gl->tessControlShader.shaderResourceId, ShaderStage::Hull});
+        if (gl->tessEvalShader.shaderResourceId != ResourceId())
+            stages.push_back({"tessEval", gl->tessEvalShader.shaderResourceId, ShaderStage::Domain});
+        if (gl->computeShader.shaderResourceId != ResourceId())
+            stages.push_back({"compute", gl->computeShader.shaderResourceId, ShaderStage::Compute});
+    }
+    const auto *vk = g_replay->GetVulkanPipelineState();
+    if (vk) {
+        if (vk->vertexShader.resourceId != ResourceId())
+            stages.push_back({"vertex", vk->vertexShader.resourceId, ShaderStage::Vertex});
+        if (vk->fragmentShader.resourceId != ResourceId())
+            stages.push_back({"fragment", vk->fragmentShader.resourceId, ShaderStage::Pixel});
+        if (vk->geometryShader.resourceId != ResourceId())
+            stages.push_back({"geometry", vk->geometryShader.resourceId, ShaderStage::Geometry});
+        if (vk->tessControlShader.resourceId != ResourceId())
+            stages.push_back({"tessControl", vk->tessControlShader.resourceId, ShaderStage::Hull});
+        if (vk->tessEvalShader.resourceId != ResourceId())
+            stages.push_back({"tessEval", vk->tessEvalShader.resourceId, ShaderStage::Domain});
+        if (vk->computeShader.resourceId != ResourceId())
+            stages.push_back({"compute", vk->computeShader.resourceId, ShaderStage::Compute});
+    }
+    const auto *d11 = g_replay->GetD3D11PipelineState();
+    if (d11) {
+        if (d11->vertexShader.resourceId != ResourceId())
+            stages.push_back({"vertex", d11->vertexShader.resourceId, ShaderStage::Vertex});
+        if (d11->pixelShader.resourceId != ResourceId())
+            stages.push_back({"pixel", d11->pixelShader.resourceId, ShaderStage::Pixel});
+        if (d11->geometryShader.resourceId != ResourceId())
+            stages.push_back({"geometry", d11->geometryShader.resourceId, ShaderStage::Geometry});
+        if (d11->hullShader.resourceId != ResourceId())
+            stages.push_back({"hull", d11->hullShader.resourceId, ShaderStage::Hull});
+        if (d11->domainShader.resourceId != ResourceId())
+            stages.push_back({"domain", d11->domainShader.resourceId, ShaderStage::Domain});
+        if (d11->computeShader.resourceId != ResourceId())
+            stages.push_back({"compute", d11->computeShader.resourceId, ShaderStage::Compute});
+    }
+    const auto *d12 = g_replay->GetD3D12PipelineState();
+    if (d12) {
+        if (d12->vertexShader.resourceId != ResourceId())
+            stages.push_back({"vertex", d12->vertexShader.resourceId, ShaderStage::Vertex});
+        if (d12->pixelShader.resourceId != ResourceId())
+            stages.push_back({"pixel", d12->pixelShader.resourceId, ShaderStage::Pixel});
+        if (d12->geometryShader.resourceId != ResourceId())
+            stages.push_back({"geometry", d12->geometryShader.resourceId, ShaderStage::Geometry});
+        if (d12->hullShader.resourceId != ResourceId())
+            stages.push_back({"hull", d12->hullShader.resourceId, ShaderStage::Hull});
+        if (d12->domainShader.resourceId != ResourceId())
+            stages.push_back({"domain", d12->domainShader.resourceId, ShaderStage::Domain});
+        if (d12->computeShader.resourceId != ResourceId())
+            stages.push_back({"compute", d12->computeShader.resourceId, ShaderStage::Compute});
+    }
+
+    if (stages.empty())
+        return makeError(id, -2, "No shaders bound at this event");
+
+    // 3. For each stage, get shader reflection and source
+    json result;
+    json shaderSources = json::object();
+
+    // Find pipeline ID (needed for GetShader)
+    ResourceId pipelineId;
+    if (gl)  pipelineId = gl->pipelineResourceId;
+    // Vulkan/D3D pipelines — use default ResourceId (works for most APIs)
+
+    for (auto &si : stages) {
+        ShaderEntryPoint ep;
+        ep.name = "main";
+        ep.stage = si.stage;
+
+        const ShaderReflection *refl = g_replay->GetShader(pipelineId, si.resourceId, ep);
+        if (!refl) {
+            fprintf(stderr, "[bridge] GetShader returned null for stage %s\n", si.name);
+            continue;
+        }
+
+        json stageResult;
+        stageResult["resourceId"] = resIdToU64(si.resourceId);
+        stageResult["entryPoint"] = rdcToStr(refl->entryPoint);
+
+        // Get source from debug info files
+        if (!refl->debugInfo.files.empty()) {
+            std::string combinedSource;
+            json files = json::array();
+            for (size_t i = 0; i < refl->debugInfo.files.size(); i++) {
+                files.push_back({
+                    {"filename", rdcToStr(refl->debugInfo.files[i].filename)},
+                    {"contents", rdcToStr(refl->debugInfo.files[i].contents)}
+                });
+                if (!combinedSource.empty()) combinedSource += "\n\n";
+                combinedSource += rdcToStr(refl->debugInfo.files[i].contents);
+            }
+            stageResult["sourceFiles"] = files;
+            stageResult["source"] = combinedSource;
+        }
+
+        // Also try disassembly if no source files available or if target requested
+        if (refl->debugInfo.files.empty() || !targetDisasm.empty()) {
+            rdcarray<rdcstr> targets = g_replay->GetDisassemblyTargets(true);
+            rdcstr tgt;
+            if (!targetDisasm.empty()) {
+                tgt = targetDisasm.c_str();
+            } else if (!targets.empty()) {
+                tgt = targets[0];
+            }
+            if (!tgt.empty()) {
+                rdcstr disasm = g_replay->DisassembleShader(si.resourceId, refl, tgt);
+                std::string disasmStr = rdcToStr(disasm);
+                if (!disasmStr.empty()) {
+                    stageResult["disassembly"] = disasmStr;
+                    if (!stageResult.contains("source") || stageResult["source"].get<std::string>().empty()) {
+                        stageResult["source"] = disasmStr;
+                    }
+                }
+            }
+        }
+
+        shaderSources[si.name] = stageResult;
+    }
+
+    result["eventId"] = eventId;
+    result["shaders"] = shaderSources;
+    return makeResult(id, result);
+}
+
+// High-level: Save texture to temp file and return base64-encoded image data
+static json handleGetTexturePreview(int id, const json &params) {
+    if (!g_replay)
+        return makeError(id, -1, "No replay active");
+
+    uint64_t rid = params.value("resourceId", (uint64_t)0);
+    uint32_t mip = params.value("mip", (uint32_t)0);
+
+    ResourceId resId = u64ToResId(rid);
+    fprintf(stderr, "[bridge] getTexturePreview: resourceId=%llu mip=%u\n", rid, mip);
+
+    // Get texture info for dimensions
+    const rdcarray<TextureDescription> &textures = g_replay->GetTextures();
+    uint32_t width = 0, height = 0;
+    std::string format;
+    for (size_t i = 0; i < textures.size(); i++) {
+        if (textures[i].resourceId == resId) {
+            width = textures[i].width;
+            height = textures[i].height;
+            format = formatToStr(textures[i].format);
+            break;
+        }
+    }
+
+    // Save to temp PNG file
+    std::string tmpPath = std::filesystem::temp_directory_path().string() + "/rdctex_" + std::to_string(rid) + ".png";
+
+    TextureSave save;
+    save.resourceId = resId;
+    save.destType = FileType::PNG;
+    save.mip = mip;
+    save.slice.sliceIndex = 0;
+    save.comp.blackPoint = 0.0f;
+    save.comp.whitePoint = 1.0f;
+
+    rdcstr outPath(tmpPath.c_str());
+    ResultDetails saveResult = g_replay->SaveTexture(save, outPath);
+
+    if (saveResult.code != ResultCode::Succeeded)
+        return makeError(id, -3, "SaveTexture failed: " + resultMessage(saveResult));
+
+    // Read the PNG file and base64 encode it
+    std::ifstream file(tmpPath, std::ios::binary);
+    if (!file.is_open())
+        return makeError(id, -4, "Failed to open temp texture file");
+
+    std::vector<uint8_t> data((std::istreambuf_iterator<char>(file)),
+                               std::istreambuf_iterator<char>());
+    file.close();
+
+    // Clean up temp file
+    std::filesystem::remove(tmpPath);
+
+    if (data.empty())
+        return makeError(id, -5, "Texture file is empty");
+
+    // Base64 encode
+    static const char b64chars[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    std::string base64;
+    base64.reserve((data.size() + 2) / 3 * 4);
+    for (size_t i = 0; i < data.size(); i += 3) {
+        uint32_t n = (uint32_t)data[i] << 16;
+        if (i + 1 < data.size()) n |= (uint32_t)data[i+1] << 8;
+        if (i + 2 < data.size()) n |= (uint32_t)data[i+2];
+        base64 += b64chars[(n >> 18) & 0x3F];
+        base64 += b64chars[(n >> 12) & 0x3F];
+        base64 += (i + 1 < data.size()) ? b64chars[(n >> 6) & 0x3F] : '=';
+        base64 += (i + 2 < data.size()) ? b64chars[n & 0x3F] : '=';
+    }
+
+    json result;
+    result["base64"] = base64;
+    result["format"] = "png";
+    result["width"] = width;
+    result["height"] = height;
+    result["texFormat"] = format;
+    result["size"] = data.size();
+    return makeResult(id, result);
+}
+
 static json handleSaveTexture(int id, const json &params) {
     if (!g_replay)
         return makeError(id, -1, "No replay active");
@@ -546,6 +781,8 @@ static json dispatch(const json &req) {
         if (method == "getDisassemblyTargets") return handleGetDisassemblyTargets(id);
         if (method == "getShaderEntryPoints") return handleGetShaderEntryPoints(id, params);
         if (method == "getShaderSource")    return handleGetShaderSource(id, params);
+        if (method == "getShaderSourceForEvent") return handleGetShaderSourceForEvent(id, params);
+        if (method == "getTexturePreview") return handleGetTexturePreview(id, params);
         if (method == "saveTexture")        return handleSaveTexture(id, params);
         if (method == "getPipelineState")   return handleGetPipelineState(id);
         if (method == "shutdown")           return handleShutdown(id);

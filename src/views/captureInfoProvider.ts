@@ -6,6 +6,7 @@ export class CaptureInfoProvider implements vscode.TreeDataProvider<CaptureInfoI
     readonly onDidChangeTreeData = this._onDidChangeTreeData.event;
 
     private captureInfo: CaptureInfo | undefined;
+    private replayStatus: 'none' | 'active' | 'failed' | 'unavailable' = 'none';
 
     getCaptureInfo(): CaptureInfo | undefined {
         return this.captureInfo;
@@ -13,6 +14,12 @@ export class CaptureInfoProvider implements vscode.TreeDataProvider<CaptureInfoI
 
     update(info: CaptureInfo) {
         this.captureInfo = info;
+        this._onDidChangeTreeData.fire(undefined);
+    }
+
+    setReplayStatus(status: 'none' | 'active' | 'failed' | 'unavailable') {
+        this.replayStatus = status;
+        vscode.commands.executeCommand('setContext', 'renderdoc.replayActive', status === 'active');
         this._onDidChangeTreeData.fire(undefined);
     }
 
@@ -35,6 +42,16 @@ export class CaptureInfoProvider implements vscode.TreeDataProvider<CaptureInfoI
                 new CaptureInfoItem('Machine', this.captureInfo.machineIdent, vscode.TreeItemCollapsibleState.None, 'device-desktop'),
                 new CaptureInfoItem('Timestamp', this.captureInfo.timestamp, vscode.TreeItemCollapsibleState.None, 'calendar'),
             ];
+
+            // Replay status indicator
+            if (this.replayStatus === 'active') {
+                items.push(new CaptureInfoItem('Replay', 'Active — all features available', vscode.TreeItemCollapsibleState.None, 'debug-start'));
+            } else if (this.replayStatus === 'failed') {
+                items.push(new CaptureInfoItem('Replay', 'Failed — use View All Shaders for shader access', vscode.TreeItemCollapsibleState.None, 'error'));
+            } else if (this.replayStatus === 'unavailable') {
+                items.push(new CaptureInfoItem('Replay', 'Cross-platform capture — click Try Local Replay', vscode.TreeItemCollapsibleState.None, 'warning'));
+            }
+
             if (this.captureInfo.sections && this.captureInfo.sections.length > 0) {
                 items.push(new CaptureInfoItem(
                     'Sections',
