@@ -21,6 +21,11 @@
 
 #ifdef _WIN32
 #include <windows.h>
+// Export the replay marker so that renderdoc.dll recognizes this process as a
+// replay application and does NOT install its D3D11/DXGI/Vulkan hooks.
+// Without this, ANGLE's D3D11 backend deadlocks because RenderDoc hooks
+// intercept and try to wrap the D3D11 device ANGLE creates internally.
+extern "C" __declspec(dllexport) int renderdoc__replay__marker = 0;
 #endif
 
 using json = nlohmann::json;
