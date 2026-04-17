@@ -10,9 +10,6 @@ native/build/
 # VS Code test
 .vscode-test/
 
-# Extension package
-*.vsix
-
 # OS files
 Thumbs.db
 ehthumbs.db

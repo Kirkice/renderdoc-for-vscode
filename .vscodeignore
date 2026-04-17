@@ -1,8 +1,25 @@
-.vscode
-.vscode-test
-src/
-node_modules/
-tsconfig.json
-.gitignore
+# TypeScript sources (compiled output lives in out/)
+src/**
 **/*.ts
 **/*.map
+tsconfig.json
+
+# Node / tooling
+node_modules/**
+.vscode/**
+.vscode-test/**
+.gitignore
+.github/**
+package-lock.json
+
+# Native bridge — ship only the final executable, not the build tree,
+# intermediates, third-party sources, or public headers.
+native/build/**
+!native/build/Release/renderdoc_bridge.exe
+native/src/**
+native/include/**
+native/3rdparty/**
+native/CMakeLists.txt
+
+# Misc
+*.vsix

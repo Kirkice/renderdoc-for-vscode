@@ -86,6 +86,106 @@ Built-in ASTC decoder plus `R11F_G11F_B10F` / `RGBA16F` previews — works on mo
 
 ---
 
+## 📖 Usage Guide
+
+### 1 · Installing the extension
+
+**Option A — from VSIX (recommended for end users):**
+```powershell
+code --install-extension renderdoc-for-vscode-0.0.1.vsix
+```
+Or in VS Code: `Extensions` panel → `···` menu → **Install from VSIX…**
+
+**Option B — from source (for contributors):** see [Building from Source](#️-building-from-source).
+
+### 2 · Installing RenderDoc (runtime dependency)
+
+The extension loads RenderDoc's replay library at runtime. Install it from
+[renderdoc.org/builds](https://renderdoc.org/builds) — the default install
+location is auto-detected:
+
+| Platform | Auto-detected path                       |
+| -------- | ---------------------------------------- |
+| Windows  | `C:\Program Files\RenderDoc\`            |
+| Linux    | `/usr/lib/x86_64-linux-gnu/librenderdoc` |
+| macOS    | `/Applications/RenderDoc.app/`           |
+
+If installed elsewhere, run **`RenderDoc: Configure RenderDoc Path`** from the
+command palette, or set `renderdoc.installPath` in Settings.
+
+### 3 · Opening a capture
+
+Three equivalent ways:
+
+- **File explorer:** right-click a `.rdc` file → **Open RDC Capture**
+- **Command palette:** `RenderDoc: Open RDC Capture`
+- **Drag & drop** a `.rdc` onto the VS Code window
+
+Once loaded, the **RenderDoc** activity-bar icon (🎥) shows three sidebar
+views: `Capture Info`, `Draw Calls`, and `Resources`.
+
+### 4 · The Inspector workflow
+
+Click any draw call in the **Draw Calls** tree — or press the `Open Inspector`
+button on the sidebar title — to open the tabbed Inspector panel beside your
+editor.
+
+| Tab         | Workflow tip                                                                      |
+| ----------- | --------------------------------------------------------------------------------- |
+| **Overview**  | Start here to see frame thumbnail + capture metadata                              |
+| **Pipeline**  | Click a shader stage chip to jump to its source                                   |
+| **Shaders**   | `Open in Editor` button pipes the source to a new VS Code tab for diff/search    |
+| **Textures**  | Thumbnails load automatically; click to open the full preview modal              |
+| **Mesh**      | Inspect vertex buffers, index buffer, and input layout                           |
+| **Events**    | Use the EID search box to jump to any event                                       |
+
+Navigation shortcuts inside the Inspector:
+- **‹ / ›** — previous/next event
+- **EID input → Go** — jump to a specific event by number
+
+### 5 · Asking Copilot Chat (`@renderdoc`)
+
+Open VS Code Chat (`Ctrl+Alt+I`) and mention `@renderdoc`:
+
+```
+@renderdoc 你看下这个draw的开销
+@renderdoc Find all draw calls that render to the depth buffer
+@renderdoc Show the fragment shader for event 246
+@renderdoc Analyze this frame for potential optimization opportunities
+@renderdoc Which textures are sampled by the currently selected draw?
+```
+
+The participant automatically reads your **current selection** from the
+Inspector (focused EID, draw call, sidebar item), so "this draw" / "the
+selected event" always refers to what you're looking at.
+
+Under the hood it has access to these tools — which you can also invoke
+directly via `#tool-name` in chat:
+
+```
+#selectionContext  #captureInfo    #drawCalls       #resources
+#resourceDetail    #eventDetails   #pipelineState   #shaderSource
+#textureInfo       #analyzeFrame
+```
+
+### 6 · Exporting resources
+
+- **Export a texture to disk:** right-click a texture in the `Resources` tree
+  → **Export Texture** (saves as PNG, handles ASTC / HDR / sRGB automatically)
+- **Copy shader source:** open a shader in Inspector → toolbar **Copy** button,
+  or `Open in Editor` for a full editor buffer
+
+### 7 · Troubleshooting
+
+| Symptom                                        | Fix                                                              |
+| ---------------------------------------------- | ---------------------------------------------------------------- |
+| "Native bridge not available" / empty shaders  | Install RenderDoc and set `renderdoc.installPath`                |
+| Inspector stays blank after clicking a draw    | Reload window (`Developer: Reload Window`) — auto-recreates panel |
+| Textures tab shows nothing in current-draw mode | The draw has no sampled inputs / RTs, or pipeline is still loading |
+| `@renderdoc` not available in Chat             | Make sure GitHub Copilot Chat is signed in and enabled           |
+
+---
+
 ## 🧭 Feature Tour
 
 ### The Inspector

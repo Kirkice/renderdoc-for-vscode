@@ -1,0 +1,53 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build:
+    name: Build (Windows)
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install npm dependencies
+        run: npm ci
+
+      - name: Compile TypeScript
+        run: npm run compile
+
+      - name: Configure native bridge (CMake)
+        working-directory: native
+        run: cmake -B build -G "Visual Studio 17 2022" -A x64
+
+      - name: Build native bridge
+        working-directory: native
+        run: cmake --build build --config Release
+
+      - name: Verify bridge binary exists
+        run: |
+          if (-not (Test-Path "native\build\Release\renderdoc_bridge.exe")) {
+            throw "renderdoc_bridge.exe was not produced"
+          }
+          Get-Item "native\build\Release\renderdoc_bridge.exe" | Select-Object Name, Length
+
+      - name: Package VSIX
+        run: npx --yes @vscode/vsce package --allow-missing-repository --skip-license --baseContentUrl https://github.com/${{ github.repository }} --baseImagesUrl https://github.com/${{ github.repository }}/raw/main
+
+      - name: Upload VSIX artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: renderdoc-for-vscode-vsix
+          path: '*.vsix'
+          if-no-files-found: error

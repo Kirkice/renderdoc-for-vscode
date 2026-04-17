@@ -1,0 +1,51 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build and Publish Release
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install npm dependencies
+        run: npm ci
+
+      - name: Compile TypeScript
+        run: npm run compile
+
+      - name: Configure native bridge
+        working-directory: native
+        run: cmake -B build -G "Visual Studio 17 2022" -A x64
+
+      - name: Build native bridge
+        working-directory: native
+        run: cmake --build build --config Release
+
+      - name: Package VSIX
+        run: npx --yes @vscode/vsce package --allow-missing-repository --skip-license --baseContentUrl https://github.com/${{ github.repository }} --baseImagesUrl https://github.com/${{ github.repository }}/raw/main
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            *.vsix
+            native/build/Release/renderdoc_bridge.exe
+          generate_release_notes: true
+          draft: false
+          prerelease: false
