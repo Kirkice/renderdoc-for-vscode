@@ -18,6 +18,16 @@
 #include <fstream>
 #include <filesystem>
 #include <mutex>
+#include <vector>
+#include <map>
+#include <set>
+
+// Third-party: ASTC LDR software decoder (BSD/Apache from ANGLE via basis_universal)
+#include "astc_dec/astc_decomp.h"
+
+// Third-party: single-header PNG encoder
+#define STB_IMAGE_WRITE_IMPLEMENTATION
+#include "stb/stb_image_write.h"
 
 #ifdef _WIN32
 #include <windows.h>
@@ -90,12 +100,23 @@ static std::string formatToStr(const ResourceFormat &f) {
 }
 
 // Serialize ActionDescription tree to JSON (recursive)
-static json actionToJson(const ActionDescription &a) {
+static json actionToJson(const ActionDescription &a, const SDFile *sdfile) {
     json j;
     j["eventId"]  = a.eventId;
     j["actionId"] = a.actionId;
-    j["name"]     = rdcToStr(a.customName);
-    j["flags"]    = (uint32_t)a.flags;
+
+    // Prefer the human-readable name: customName for markers, chunk name for draws.
+    std::string name;
+    if (!a.customName.empty()) {
+        name = rdcToStr(a.customName);
+    } else if (sdfile && !a.events.empty()) {
+        uint32_t chunkIndex = a.events.back().chunkIndex;
+        if (chunkIndex < sdfile->chunks.size() && sdfile->chunks[chunkIndex]) {
+            name = rdcToStr(sdfile->chunks[chunkIndex]->name) + "()";
+        }
+    }
+    j["name"]  = name;
+    j["flags"] = (uint32_t)a.flags;
 
     if (a.numIndices > 0)    j["numIndices"]   = a.numIndices;
     if (a.numInstances > 1)  j["numInstances"] = a.numInstances;
@@ -103,10 +124,23 @@ static json actionToJson(const ActionDescription &a) {
     if (!a.children.empty()) {
         json kids = json::array();
         for (size_t i = 0; i < a.children.size(); i++)
-            kids.push_back(actionToJson(a.children[i]));
+            kids.push_back(actionToJson(a.children[i], sdfile));
         j["children"] = std::move(kids);
     }
     return j;
+}
+
+// Look up a resource's display name (O(n) per call — callers should cache
+// when looping over many ids).
+static std::string resNameLookup(ResourceId rid) {
+    if (rid == ResourceId() || !g_replay) return "";
+    const rdcarray<ResourceDescription> &resources = g_replay->GetResources();
+    for (size_t i = 0; i < resources.size(); i++) {
+        if (resources[i].resourceId == rid) {
+            return rdcToStr(resources[i].name);
+        }
+    }
+    return "";
 }
 
 // Serialize ResourceDescription to JSON
@@ -313,9 +347,10 @@ static json handleGetRootActions(int id) {
         return makeError(id, -1, "No replay active");
 
     const rdcarray<ActionDescription> &actions = g_replay->GetRootActions();
+    const SDFile &sdfile = g_replay->GetStructuredFile();
     json arr = json::array();
     for (size_t i = 0; i < actions.size(); i++)
-        arr.push_back(actionToJson(actions[i]));
+        arr.push_back(actionToJson(actions[i], &sdfile));
 
     return makeResult(id, {{"actions", arr}, {"count", actions.size()}});
 }
@@ -452,18 +487,23 @@ static json handleGetShaderSourceForEvent(int id, const json &params) {
 
     const auto *gl = g_replay->GetGLPipelineState();
     if (gl) {
-        if (gl->vertexShader.shaderResourceId != ResourceId())
-            stages.push_back({"vertex", gl->vertexShader.shaderResourceId, ShaderStage::Vertex});
-        if (gl->fragmentShader.shaderResourceId != ResourceId())
-            stages.push_back({"fragment", gl->fragmentShader.shaderResourceId, ShaderStage::Pixel});
-        if (gl->geometryShader.shaderResourceId != ResourceId())
-            stages.push_back({"geometry", gl->geometryShader.shaderResourceId, ShaderStage::Geometry});
-        if (gl->tessControlShader.shaderResourceId != ResourceId())
-            stages.push_back({"tessControl", gl->tessControlShader.shaderResourceId, ShaderStage::Hull});
-        if (gl->tessEvalShader.shaderResourceId != ResourceId())
-            stages.push_back({"tessEval", gl->tessEvalShader.shaderResourceId, ShaderStage::Domain});
-        if (gl->computeShader.shaderResourceId != ResourceId())
-            stages.push_back({"compute", gl->computeShader.shaderResourceId, ShaderStage::Compute});
+        // On GLES the shader object may be null (monolithic program); fall
+        // back to programResourceId in that case so GetShader() still works.
+        auto pickGL = [](const GLPipe::Shader &s) -> ResourceId {
+            return s.shaderResourceId != ResourceId() ? s.shaderResourceId : s.programResourceId;
+        };
+        if (pickGL(gl->vertexShader) != ResourceId())
+            stages.push_back({"vertex", pickGL(gl->vertexShader), ShaderStage::Vertex});
+        if (pickGL(gl->fragmentShader) != ResourceId())
+            stages.push_back({"fragment", pickGL(gl->fragmentShader), ShaderStage::Pixel});
+        if (pickGL(gl->geometryShader) != ResourceId())
+            stages.push_back({"geometry", pickGL(gl->geometryShader), ShaderStage::Geometry});
+        if (pickGL(gl->tessControlShader) != ResourceId())
+            stages.push_back({"tessControl", pickGL(gl->tessControlShader), ShaderStage::Hull});
+        if (pickGL(gl->tessEvalShader) != ResourceId())
+            stages.push_back({"tessEval", pickGL(gl->tessEvalShader), ShaderStage::Domain});
+        if (pickGL(gl->computeShader) != ResourceId())
+            stages.push_back({"compute", pickGL(gl->computeShader), ShaderStage::Compute});
     }
     const auto *vk = g_replay->GetVulkanPipelineState();
     if (vk) {
@@ -536,6 +576,7 @@ static json handleGetShaderSourceForEvent(int id, const json &params) {
 
         json stageResult;
         stageResult["resourceId"] = resIdToU64(si.resourceId);
+        stageResult["name"] = resNameLookup(si.resourceId);
         stageResult["entryPoint"] = rdcToStr(refl->entryPoint);
 
         // Get source from debug info files
@@ -583,75 +624,240 @@ static json handleGetShaderSourceForEvent(int id, const json &params) {
     return makeResult(id, result);
 }
 
+// Find the maximum eventId in the action tree (recursive)
+static uint32_t findMaxEventId(const rdcarray<ActionDescription> &actions) {
+    uint32_t maxId = 0;
+    for (size_t i = 0; i < actions.size(); i++) {
+        if (actions[i].eventId > maxId) maxId = actions[i].eventId;
+        if (!actions[i].children.empty()) {
+            uint32_t childMax = findMaxEventId(actions[i].children);
+            if (childMax > maxId) maxId = childMax;
+        }
+    }
+    return maxId;
+}
+
 // High-level: Save texture to temp file and return base64-encoded image data
+// Base64-encode a byte buffer
+static std::string base64Encode(const std::vector<uint8_t> &data) {
+    static const char b64chars[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    std::string out;
+    out.reserve((data.size() + 2) / 3 * 4);
+    for (size_t i = 0; i < data.size(); i += 3) {
+        uint32_t n = (uint32_t)data[i] << 16;
+        if (i + 1 < data.size()) n |= (uint32_t)data[i+1] << 8;
+        if (i + 2 < data.size()) n |= (uint32_t)data[i+2];
+        out += b64chars[(n >> 18) & 0x3F];
+        out += b64chars[(n >> 12) & 0x3F];
+        out += (i + 1 < data.size()) ? b64chars[(n >> 6) & 0x3F] : '=';
+        out += (i + 2 < data.size()) ? b64chars[n & 0x3F] : '=';
+    }
+    return out;
+}
+
+// Read a file into a byte vector
+static std::vector<uint8_t> readFileBytes(const std::string &path) {
+    std::ifstream f(path, std::ios::binary);
+    if (!f.is_open()) return {};
+    return std::vector<uint8_t>((std::istreambuf_iterator<char>(f)),
+                                 std::istreambuf_iterator<char>());
+}
+
+// Known 2D ASTC block sizes (blockW, blockH)
+static const int astcBlockSizes[][2] = {
+    {4,4},{5,4},{5,5},{6,5},{6,6},{8,5},{8,6},{8,8},
+    {10,5},{10,6},{10,8},{10,10},{12,10},{12,12}
+};
+
+// Deduce ASTC block dimensions from raw data size and texture dimensions
+static bool deduceASTCBlockSize(size_t dataSize, uint32_t w, uint32_t h,
+                                 int &outBW, int &outBH) {
+    for (auto &bs : astcBlockSizes) {
+        int bw = bs[0], bh = bs[1];
+        size_t blocksX = (w + bw - 1) / bw;
+        size_t blocksY = (h + bh - 1) / bh;
+        if (blocksX * blocksY * 16 == dataSize) {
+            outBW = bw; outBH = bh;
+            return true;
+        }
+    }
+    return false;
+}
+
+// Decompress an entire ASTC LDR texture into an RGBA8 buffer.
+// Returns true on success. `rgbaOut` will be resized to w*h*4 bytes.
+static bool decompressASTCNative(const uint8_t *blockData, size_t dataSize,
+                                  uint32_t w, uint32_t h,
+                                  int blockW, int blockH,
+                                  bool isSRGB,
+                                  std::vector<uint8_t> &rgbaOut) {
+    const uint32_t blocksX = (w + blockW - 1) / blockW;
+    const uint32_t blocksY = (h + blockH - 1) / blockH;
+    if (blocksX * blocksY * 16 != dataSize) {
+        fprintf(stderr, "[bridge] ASTC: data size mismatch (expected %u, got %zu)\n",
+                blocksX * blocksY * 16, dataSize);
+        return false;
+    }
+
+    rgbaOut.assign((size_t)w * h * 4, 0);
+    std::vector<uint8_t> blockPixels((size_t)blockW * blockH * 4);
+
+    const uint8_t *src = blockData;
+    for (uint32_t by = 0; by < blocksY; by++) {
+        for (uint32_t bx = 0; bx < blocksX; bx++, src += 16) {
+            if (!basisu::astc::decompress(blockPixels.data(), src, isSRGB, blockW, blockH)) {
+                // Block decode failed — leave as black+opaque for that block
+                std::fill(blockPixels.begin(), blockPixels.end(), (uint8_t)0);
+                for (int i = 3; i < (int)blockPixels.size(); i += 4) blockPixels[i] = 255;
+            }
+
+            // Copy block pixels into the full image (clamped to image bounds)
+            for (int py = 0; py < blockH; py++) {
+                uint32_t iy = by * blockH + py;
+                if (iy >= h) break;
+                for (int px = 0; px < blockW; px++) {
+                    uint32_t ix = bx * blockW + px;
+                    if (ix >= w) break;
+                    const uint8_t *s = &blockPixels[(py * blockW + px) * 4];
+                    uint8_t *d = &rgbaOut[((size_t)iy * w + ix) * 4];
+                    d[0] = s[0]; d[1] = s[1]; d[2] = s[2]; d[3] = s[3];
+                }
+            }
+        }
+    }
+    return true;
+}
+
+// stb_image_write callback — append bytes to a std::vector<uint8_t>
+static void stbiWriteToVector(void *ctx, void *data, int size) {
+    auto *v = (std::vector<uint8_t> *)ctx;
+    v->insert(v->end(), (uint8_t *)data, (uint8_t *)data + size);
+}
+
+// Encode RGBA8 pixels as PNG into a memory buffer
+static bool encodePNGToMemory(const std::vector<uint8_t> &rgba, uint32_t w, uint32_t h,
+                               std::vector<uint8_t> &pngOut) {
+    pngOut.clear();
+    int stride = (int)(w * 4);
+    return stbi_write_png_to_func(stbiWriteToVector, &pngOut,
+                                   (int)w, (int)h, 4, rgba.data(), stride) != 0;
+}
+
 static json handleGetTexturePreview(int id, const json &params) {
     if (!g_replay)
         return makeError(id, -1, "No replay active");
 
     uint64_t rid = params.value("resourceId", (uint64_t)0);
     uint32_t mip = params.value("mip", (uint32_t)0);
+    uint32_t eventId = params.value("eventId", (uint32_t)0);
+    int channelExtract = params.value("channelExtract", -1);  // -1=all, 0=R, 1=G, 2=B, 3=A
 
     ResourceId resId = u64ToResId(rid);
-    fprintf(stderr, "[bridge] getTexturePreview: resourceId=%llu mip=%u\n", rid, mip);
+    fprintf(stderr, "[bridge] getTexturePreview: resourceId=%llu mip=%u eventId=%u\n", rid, mip, eventId);
 
-    // Get texture info for dimensions
+    // Set the frame event so that textures have their rendered content.
+    if (eventId == 0) {
+        const rdcarray<ActionDescription> &actions = g_replay->GetRootActions();
+        eventId = findMaxEventId(actions);
+    }
+    if (eventId > 0) {
+        fprintf(stderr, "[bridge] Setting frame event to %u for texture preview\n", eventId);
+        g_replay->SetFrameEvent(eventId, true);
+    }
+
+    // Get texture info
     const rdcarray<TextureDescription> &textures = g_replay->GetTextures();
     uint32_t width = 0, height = 0;
+    uint32_t compCount = 0;
+    ResourceFormatType fmtType = ResourceFormatType::Undefined;
     std::string format;
     for (size_t i = 0; i < textures.size(); i++) {
         if (textures[i].resourceId == resId) {
             width = textures[i].width;
             height = textures[i].height;
+            compCount = textures[i].format.compCount;
+            fmtType = textures[i].format.type;
             format = formatToStr(textures[i].format);
             break;
         }
     }
 
-    // Save to temp PNG file
-    std::string tmpPath = std::filesystem::temp_directory_path().string() + "/rdctex_" + std::to_string(rid) + ".png";
+    std::vector<uint8_t> pngData;
+    bool usedASTCFallback = false;
 
-    TextureSave save;
-    save.resourceId = resId;
-    save.destType = FileType::PNG;
-    save.mip = mip;
-    save.slice.sliceIndex = 0;
-    save.comp.blackPoint = 0.0f;
-    save.comp.whitePoint = 1.0f;
+    // ASTC: ANGLE D3D11 backend can't sample ASTC textures, so SaveTexture
+    // returns all-black output. Use software decompression instead.
+    if (fmtType == ResourceFormatType::ASTC && width > 0 && height > 0) {
+        fprintf(stderr, "[bridge] ASTC texture detected, using native software decompression\n");
 
-    rdcstr outPath(tmpPath.c_str());
-    ResultDetails saveResult = g_replay->SaveTexture(save, outPath);
+        Subresource sub;
+        sub.mip = mip;
+        sub.slice = 0;
+        sub.sample = 0;
+        bytebuf rawData = g_replay->GetTextureData(resId, sub);
 
-    if (saveResult.code != ResultCode::Succeeded)
-        return makeError(id, -3, "SaveTexture failed: " + resultMessage(saveResult));
-
-    // Read the PNG file and base64 encode it
-    std::ifstream file(tmpPath, std::ios::binary);
-    if (!file.is_open())
-        return makeError(id, -4, "Failed to open temp texture file");
-
-    std::vector<uint8_t> data((std::istreambuf_iterator<char>(file)),
-                               std::istreambuf_iterator<char>());
-    file.close();
-
-    // Clean up temp file
-    std::filesystem::remove(tmpPath);
-
-    if (data.empty())
-        return makeError(id, -5, "Texture file is empty");
-
-    // Base64 encode
-    static const char b64chars[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    std::string base64;
-    base64.reserve((data.size() + 2) / 3 * 4);
-    for (size_t i = 0; i < data.size(); i += 3) {
-        uint32_t n = (uint32_t)data[i] << 16;
-        if (i + 1 < data.size()) n |= (uint32_t)data[i+1] << 8;
-        if (i + 2 < data.size()) n |= (uint32_t)data[i+2];
-        base64 += b64chars[(n >> 18) & 0x3F];
-        base64 += b64chars[(n >> 12) & 0x3F];
-        base64 += (i + 1 < data.size()) ? b64chars[(n >> 6) & 0x3F] : '=';
-        base64 += (i + 2 < data.size()) ? b64chars[n & 0x3F] : '=';
+        if (!rawData.empty()) {
+            int blockW = 0, blockH = 0;
+            if (deduceASTCBlockSize(rawData.size(), width, height, blockW, blockH)) {
+                std::vector<uint8_t> rgba;
+                // sRGB flag: match source format's sRGB-ness for correct endpoint scaling
+                bool isSRGB = false;
+                for (size_t i = 0; i < textures.size(); i++) {
+                    if (textures[i].resourceId == resId) {
+                        isSRGB = (textures[i].format.compType == CompType::UNormSRGB);
+                        break;
+                    }
+                }
+                if (decompressASTCNative(rawData.data(), rawData.size(),
+                                          width, height, blockW, blockH,
+                                          isSRGB, rgba)) {
+                    if (encodePNGToMemory(rgba, width, height, pngData)) {
+                        usedASTCFallback = true;
+                        fprintf(stderr, "[bridge] ASTC decoded: %ux%u block=%dx%d srgb=%d\n",
+                                width, height, blockW, blockH, isSRGB);
+                    }
+                }
+            } else {
+                fprintf(stderr, "[bridge] Could not deduce ASTC block size from %zu bytes for %ux%u\n",
+                        rawData.size(), width, height);
+            }
+        } else {
+            fprintf(stderr, "[bridge] GetTextureData returned empty for ASTC texture\n");
+        }
     }
+
+    // Standard path: use SaveTexture (works for non-ASTC formats)
+    if (!usedASTCFallback) {
+        std::string tmpPath = std::filesystem::temp_directory_path().string() + "/rdctex_" + std::to_string(rid) + ".png";
+
+        TextureSave save;
+        save.resourceId = resId;
+        save.destType = FileType::PNG;
+        save.mip = mip;
+        save.slice.sliceIndex = 0;
+        save.comp.blackPoint = 0.0f;
+        save.comp.whitePoint = 1.0f;
+        save.alpha = AlphaMapping::Preserve;
+        save.channelExtract = channelExtract;
+
+        rdcstr outPath(tmpPath.c_str());
+        fprintf(stderr, "[bridge] SaveTexture: %ux%u fmt=%s -> %s\n", width, height, format.c_str(), tmpPath.c_str());
+        ResultDetails saveResult = g_replay->SaveTexture(save, outPath);
+
+        if (saveResult.code != ResultCode::Succeeded)
+            return makeError(id, -3, "SaveTexture failed: " + resultMessage(saveResult));
+
+        pngData = readFileBytes(tmpPath);
+        std::filesystem::remove(tmpPath);
+    }
+
+    if (pngData.empty())
+        return makeError(id, -5, "Texture data is empty");
+
+    fprintf(stderr, "[bridge] Texture ready: %zu bytes PNG, %ux%u, fmt=%s, astcFallback=%d\n",
+            pngData.size(), width, height, format.c_str(), usedASTCFallback);
+
+    std::string base64 = base64Encode(pngData);
 
     json result;
     result["base64"] = base64;
@@ -659,7 +865,8 @@ static json handleGetTexturePreview(int id, const json &params) {
     result["width"] = width;
     result["height"] = height;
     result["texFormat"] = format;
-    result["size"] = data.size();
+    result["size"] = pngData.size();
+    result["compCount"] = compCount;
     return makeResult(id, result);
 }
 
@@ -691,9 +898,14 @@ static json handleSaveTexture(int id, const json &params) {
     return makeResult(id, {{"path", outputPath}, {"saved", true}});
 }
 
-static json handleGetPipelineState(int id) {
+static json handleGetPipelineState(int id, const json &params) {
     if (!g_replay)
         return makeError(id, -1, "No replay active");
+
+    uint32_t eventId = params.value("eventId", (uint32_t)0);
+    if (eventId > 0) {
+        g_replay->SetFrameEvent(eventId, true);
+    }
 
     json result;
     json shaders = json::object();
@@ -704,21 +916,60 @@ static json handleGetPipelineState(int id) {
         if (resId != ResourceId()) {
             shaders[name] = {
                 {"resourceId", resIdToU64(resId)},
+                {"name",       resNameLookup(resId)},
                 {"stage", (uint32_t)stage}
             };
         }
     };
 
+    // Collect framebuffer color/depth render targets so UI can scope "bound
+    // textures at this draw" to actual render targets.
+    json framebuffer = json::object();
+    json colorTargets = json::array();
+    uint64_t depthTarget = 0;
+    uint64_t stencilTarget = 0;
+
+    // Vertex input (index buffer + vertex buffers)
+    json vertexInput = json::object();
+    json vertexBuffers = json::array();
+    uint64_t indexBuffer = 0;
+
     // Try each API
     const auto *gl = g_replay->GetGLPipelineState();
     if (gl) {
         result["api"] = "OpenGL";
-        addShader("vertex",   gl->vertexShader.shaderResourceId,   ShaderStage::Vertex);
-        addShader("tessCtrl", gl->tessControlShader.shaderResourceId, ShaderStage::Hull);
-        addShader("tessEval", gl->tessEvalShader.shaderResourceId,  ShaderStage::Domain);
-        addShader("geometry", gl->geometryShader.shaderResourceId,  ShaderStage::Geometry);
-        addShader("fragment", gl->fragmentShader.shaderResourceId,  ShaderStage::Pixel);
-        addShader("compute",  gl->computeShader.shaderResourceId,   ShaderStage::Compute);
+        // On GLES, program-only pipelines may leave shaderResourceId empty;
+        // fall back to programResourceId so the stage is reported as bound.
+        auto pickGL = [](const GLPipe::Shader &s) -> ResourceId {
+            return s.shaderResourceId != ResourceId() ? s.shaderResourceId : s.programResourceId;
+        };
+        addShader("vertex",   pickGL(gl->vertexShader),   ShaderStage::Vertex);
+        addShader("tessCtrl", pickGL(gl->tessControlShader), ShaderStage::Hull);
+        addShader("tessEval", pickGL(gl->tessEvalShader),  ShaderStage::Domain);
+        addShader("geometry", pickGL(gl->geometryShader),  ShaderStage::Geometry);
+        addShader("fragment", pickGL(gl->fragmentShader),  ShaderStage::Pixel);
+        addShader("compute",  pickGL(gl->computeShader),   ShaderStage::Compute);
+
+        for (const auto &att : gl->framebuffer.drawFBO.colorAttachments) {
+            if (att.resource != ResourceId())
+                colorTargets.push_back(resIdToU64(att.resource));
+        }
+        if (gl->framebuffer.drawFBO.depthAttachment.resource != ResourceId())
+            depthTarget = resIdToU64(gl->framebuffer.drawFBO.depthAttachment.resource);
+        if (gl->framebuffer.drawFBO.stencilAttachment.resource != ResourceId())
+            stencilTarget = resIdToU64(gl->framebuffer.drawFBO.stencilAttachment.resource);
+
+        if (gl->vertexInput.indexBuffer != ResourceId())
+            indexBuffer = resIdToU64(gl->vertexInput.indexBuffer);
+        for (const auto &vb : gl->vertexInput.vertexBuffers) {
+            if (vb.resourceId != ResourceId()) {
+                vertexBuffers.push_back({
+                    {"resourceId", resIdToU64(vb.resourceId)},
+                    {"stride", vb.byteStride},
+                    {"offset", (uint64_t)vb.byteOffset},
+                });
+            }
+        }
     }
     const auto *vk = g_replay->GetVulkanPipelineState();
     if (vk) {
@@ -729,6 +980,22 @@ static json handleGetPipelineState(int id) {
         addShader("geometry", vk->geometryShader.resourceId,  ShaderStage::Geometry);
         addShader("fragment", vk->fragmentShader.resourceId,  ShaderStage::Pixel);
         addShader("compute",  vk->computeShader.resourceId,   ShaderStage::Compute);
+
+        for (const auto &att : vk->currentPass.framebuffer.attachments) {
+            if (att.resource != ResourceId())
+                colorTargets.push_back(resIdToU64(att.resource));
+        }
+        if (vk->inputAssembly.indexBuffer.resourceId != ResourceId())
+            indexBuffer = resIdToU64(vk->inputAssembly.indexBuffer.resourceId);
+        for (const auto &vb : vk->vertexInput.vertexBuffers) {
+            if (vb.resourceId != ResourceId()) {
+                vertexBuffers.push_back({
+                    {"resourceId", resIdToU64(vb.resourceId)},
+                    {"stride", vb.byteStride},
+                    {"offset", (uint64_t)vb.byteOffset},
+                });
+            }
+        }
     }
     const auto *d11 = g_replay->GetD3D11PipelineState();
     if (d11) {
@@ -739,6 +1006,25 @@ static json handleGetPipelineState(int id) {
         addShader("geometry", d11->geometryShader.resourceId,  ShaderStage::Geometry);
         addShader("pixel",    d11->pixelShader.resourceId,    ShaderStage::Pixel);
         addShader("compute",  d11->computeShader.resourceId,   ShaderStage::Compute);
+
+        for (const auto &rt : d11->outputMerger.renderTargets) {
+            if (rt.resource != ResourceId())
+                colorTargets.push_back(resIdToU64(rt.resource));
+        }
+        if (d11->outputMerger.depthTarget.resource != ResourceId())
+            depthTarget = resIdToU64(d11->outputMerger.depthTarget.resource);
+
+        if (d11->inputAssembly.indexBuffer.resourceId != ResourceId())
+            indexBuffer = resIdToU64(d11->inputAssembly.indexBuffer.resourceId);
+        for (const auto &vb : d11->inputAssembly.vertexBuffers) {
+            if (vb.resourceId != ResourceId()) {
+                vertexBuffers.push_back({
+                    {"resourceId", resIdToU64(vb.resourceId)},
+                    {"stride", vb.byteStride},
+                    {"offset", (uint64_t)vb.byteOffset},
+                });
+            }
+        }
     }
     const auto *d12 = g_replay->GetD3D12PipelineState();
     if (d12) {
@@ -749,7 +1035,69 @@ static json handleGetPipelineState(int id) {
         addShader("geometry", d12->geometryShader.resourceId,  ShaderStage::Geometry);
         addShader("pixel",    d12->pixelShader.resourceId,    ShaderStage::Pixel);
         addShader("compute",  d12->computeShader.resourceId,   ShaderStage::Compute);
+
+        for (const auto &rt : d12->outputMerger.renderTargets) {
+            if (rt.resource != ResourceId())
+                colorTargets.push_back(resIdToU64(rt.resource));
+        }
+        if (d12->outputMerger.depthTarget.resource != ResourceId())
+            depthTarget = resIdToU64(d12->outputMerger.depthTarget.resource);
+
+        if (d12->inputAssembly.indexBuffer.resourceId != ResourceId())
+            indexBuffer = resIdToU64(d12->inputAssembly.indexBuffer.resourceId);
+        for (const auto &vb : d12->inputAssembly.vertexBuffers) {
+            if (vb.resourceId != ResourceId()) {
+                vertexBuffers.push_back({
+                    {"resourceId", resIdToU64(vb.resourceId)},
+                    {"stride", vb.byteStride},
+                    {"offset", (uint64_t)vb.byteOffset},
+                });
+            }
+        }
     }
+
+    framebuffer["colorTargets"] = colorTargets;
+    if (depthTarget != 0)   framebuffer["depthTarget"]   = depthTarget;
+    if (stencilTarget != 0) framebuffer["stencilTarget"] = stencilTarget;
+    result["framebuffer"] = framebuffer;
+
+    vertexInput["vertexBuffers"] = vertexBuffers;
+    if (indexBuffer != 0) vertexInput["indexBuffer"] = indexBuffer;
+    result["vertexInput"] = vertexInput;
+
+    // Bound read-only textures (sampler bindings) at the current event.
+    // Walks DescriptorAccess → GetDescriptors and filters image-type entries.
+    json boundTextures = json::array();
+    {
+        const rdcarray<DescriptorAccess> &accesses = g_replay->GetDescriptorAccess();
+        // Group ranges per descriptor store so we batch GetDescriptors calls.
+        std::map<ResourceId, rdcarray<DescriptorRange>> storeRanges;
+        std::map<ResourceId, std::vector<const DescriptorAccess *>> storeAccesses;
+        for (size_t i = 0; i < accesses.size(); i++) {
+            const DescriptorAccess &acc = accesses[i];
+            if (acc.descriptorStore == ResourceId()) continue;
+            // Only sampler-read image types
+            if (acc.type != DescriptorType::Image &&
+                acc.type != DescriptorType::ImageSampler &&
+                acc.type != DescriptorType::TypedBuffer)
+                continue;
+            storeRanges[acc.descriptorStore].push_back(DescriptorRange(acc));
+            storeAccesses[acc.descriptorStore].push_back(&acc);
+        }
+        std::set<uint64_t> seen;
+        for (auto &kv : storeRanges) {
+            rdcarray<Descriptor> descs = g_replay->GetDescriptors(kv.first, kv.second);
+            for (size_t i = 0; i < descs.size(); i++) {
+                const Descriptor &d = descs[i];
+                if (d.resource == ResourceId()) continue;
+                uint64_t rid = resIdToU64(d.resource);
+                if (seen.count(rid)) continue;
+                seen.insert(rid);
+                boundTextures.push_back(rid);
+            }
+        }
+    }
+    result["boundTextures"] = boundTextures;
 
     result["shaders"] = shaders;
     return makeResult(id, result);
@@ -789,7 +1137,7 @@ static json dispatch(const json &req) {
         if (method == "getShaderSourceForEvent") return handleGetShaderSourceForEvent(id, params);
         if (method == "getTexturePreview") return handleGetTexturePreview(id, params);
         if (method == "saveTexture")        return handleSaveTexture(id, params);
-        if (method == "getPipelineState")   return handleGetPipelineState(id);
+        if (method == "getPipelineState")   return handleGetPipelineState(id, params);
         if (method == "shutdown")           return handleShutdown(id);
         return makeError(id, -100, "Unknown method: " + method);
     } catch (const std::exception &e) {

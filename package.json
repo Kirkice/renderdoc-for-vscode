@@ -42,11 +42,21 @@
     ],
     "languageModelTools": [
       {
+        "name": "renderdoc_getSelectionContext",
+        "displayName": "Get Selection Context",
+        "toolReferenceName": "selectionContext",
+        "icon": "$(eye)",
+        "modelDescription": "Get what the user is currently focused on in the RenderDoc Inspector: focused event ID, current draw call, pipeline state, and sidebar selection. Call this FIRST for any question referring to 'this/the current/the selected' draw call, event, or resource.",
+        "userDescription": "Returns what the user has focused in the RenderDoc Inspector.",
+        "inputSchema": { "type": "object", "properties": {} }
+      },
+      {
         "name": "renderdoc_getCaptureInfo",
         "displayName": "Get Capture Info",
         "toolReferenceName": "captureInfo",
         "icon": "$(info)",
-        "description": "Get metadata about the currently loaded RenderDoc capture file (.rdc), including graphics API, GPU driver, capture version, and file sections.",
+        "modelDescription": "Get metadata about the currently loaded RenderDoc capture file (.rdc), including graphics API, GPU driver, capture version, and file sections.",
+        "userDescription": "Reads metadata about the current capture.",
         "inputSchema": { "type": "object", "properties": {} }
       },
       {
@@ -54,7 +64,8 @@
         "displayName": "Get Draw Calls",
         "toolReferenceName": "drawCalls",
         "icon": "$(list-tree)",
-        "description": "Get the list of GPU draw calls/events in the captured frame with event IDs, names, index/instance counts. Optionally filter by name.",
+        "modelDescription": "Get the list of GPU draw calls/events in the captured frame with event IDs, names, index/instance counts. Optionally filter by name.",
+        "userDescription": "Lists draw calls in the capture.",
         "inputSchema": {
           "type": "object",
           "properties": {
@@ -67,7 +78,8 @@
         "displayName": "Get Resources",
         "toolReferenceName": "resources",
         "icon": "$(database)",
-        "description": "Get the list of GPU resources in the capture: textures, buffers, shaders. Optionally filter by type.",
+        "modelDescription": "Get the list of GPU resources in the capture: textures, buffers, shaders. Optionally filter by type.",
+        "userDescription": "Lists GPU resources in the capture.",
         "inputSchema": {
           "type": "object",
           "properties": {
@@ -80,7 +92,8 @@
         "displayName": "Get Resource Detail",
         "toolReferenceName": "resourceDetail",
         "icon": "$(symbol-property)",
-        "description": "Get detailed information about a specific GPU resource by its resource ID.",
+        "modelDescription": "Get detailed information about a specific GPU resource by its resource ID.",
+        "userDescription": "Reads details for a single GPU resource.",
         "inputSchema": {
           "type": "object",
           "properties": {
@@ -94,7 +107,8 @@
         "displayName": "Get Event Details",
         "toolReferenceName": "eventDetails",
         "icon": "$(debug-step-into)",
-        "description": "Get full details of a specific GPU event/draw call by its event ID, including pipeline state if native bridge is available.",
+        "modelDescription": "Get full details of a specific GPU event/draw call by its event ID, including pipeline state if native bridge is available.",
+        "userDescription": "Reads full details for a specific draw call event.",
         "inputSchema": {
           "type": "object",
           "properties": {
@@ -108,7 +122,8 @@
         "displayName": "Get Pipeline State",
         "toolReferenceName": "pipelineState",
         "icon": "$(symbol-event)",
-        "description": "Get the full GPU pipeline state at a specific draw call event, including bound shaders, textures, blend/depth state. Requires native bridge.",
+        "modelDescription": "Get the full GPU pipeline state at a specific draw call event, including bound shaders, textures, blend/depth state. Requires native bridge.",
+        "userDescription": "Reads the GPU pipeline state at a draw call.",
         "inputSchema": {
           "type": "object",
           "properties": {
@@ -122,7 +137,8 @@
         "displayName": "Get Shader Source",
         "toolReferenceName": "shaderSource",
         "icon": "$(code)",
-        "description": "Get shader source code (GLSL/HLSL) at a specific draw call event. Optionally specify shader stage (vertex, fragment, compute).",
+        "modelDescription": "Get shader source code (GLSL/HLSL) at a specific draw call event. Optionally specify shader stage (vertex, fragment, compute).",
+        "userDescription": "Reads shader source at a draw call.",
         "inputSchema": {
           "type": "object",
           "properties": {
@@ -137,7 +153,8 @@
         "displayName": "Get Texture Info",
         "toolReferenceName": "textureInfo",
         "icon": "$(file-media)",
-        "description": "Get information about textures in the capture. Optionally filter by texture ID.",
+        "modelDescription": "Get information about textures in the capture. Optionally filter by texture ID.",
+        "userDescription": "Reads information about textures.",
         "inputSchema": {
           "type": "object",
           "properties": {
@@ -150,7 +167,8 @@
         "displayName": "Analyze Frame",
         "toolReferenceName": "analyzeFrame",
         "icon": "$(graph)",
-        "description": "Perform a comprehensive analysis of the captured frame: draw call statistics, resource usage, potential performance issues.",
+        "modelDescription": "Perform a comprehensive analysis of the captured frame: draw call statistics, resource usage, potential performance issues.",
+        "userDescription": "Analyzes the captured frame holistically.",
         "inputSchema": { "type": "object", "properties": {} }
       }
     ],
@@ -178,6 +196,12 @@
         "title": "Configure RenderDoc Path",
         "category": "RenderDoc",
         "icon": "$(gear)"
+      },
+      {
+        "command": "renderdoc.openInspector",
+        "title": "Open Inspector",
+        "category": "RenderDoc",
+        "icon": "$(window)"
       },
       {
         "command": "renderdoc.showDrawCallDetails",
@@ -254,11 +278,16 @@
     "viewsWelcome": [
       {
         "view": "renderdoc-captureInfo",
-        "contents": "No RDC capture file opened.\n[Open Capture File](command:renderdoc.openCapture)"
+        "contents": "No RDC capture file opened.\n[Open Capture File](command:renderdoc.openCapture)\n[Open Inspector](command:renderdoc.openInspector)"
       }
     ],
     "menus": {
       "view/title": [
+        {
+          "command": "renderdoc.openInspector",
+          "when": "view == renderdoc-captureInfo",
+          "group": "navigation@0"
+        },
         {
           "command": "renderdoc.refreshCapture",
           "when": "view == renderdoc-captureInfo",
@@ -273,6 +302,11 @@
           "command": "renderdoc.tryLocalReplay",
           "when": "view == renderdoc-captureInfo",
           "group": "navigation"
+        },
+        {
+          "command": "renderdoc.openInspector",
+          "when": "view == renderdoc-drawCalls",
+          "group": "navigation@0"
         },
         {
           "command": "renderdoc.viewAllShaders",

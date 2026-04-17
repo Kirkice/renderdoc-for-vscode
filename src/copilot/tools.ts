@@ -1,14 +1,21 @@
 import * as vscode from 'vscode';
 import { RenderDocBridge } from '../renderdocBridge';
 import { CaptureInfo, DrawCall, ResourceInfo } from '../types';
+import { InspectorPanel } from '../views/inspectorPanel';
 
 // Shared state — set by extension.ts after bridge/providers are initialized
 let _bridge: RenderDocBridge;
 let _getCurrentCapturePath: () => string | undefined;
+let _getSelectionContext: () => { selectedDrawCall: any; selectedResource: any };
 
-export function initTools(bridge: RenderDocBridge, getCurrentCapturePath: () => string | undefined) {
+export function initTools(
+    bridge: RenderDocBridge,
+    getCurrentCapturePath: () => string | undefined,
+    getSelectionContext: () => { selectedDrawCall: any; selectedResource: any },
+) {
     _bridge = bridge;
     _getCurrentCapturePath = getCurrentCapturePath;
+    _getSelectionContext = getSelectionContext;
 }
 
 function requireCapturePath(): string {
@@ -423,6 +430,59 @@ function detectIssues(
     return issues;
 }
 
+// ─── Tool: Get Selection Context ────────────────────────────────────────────
+export class GetSelectionContextTool implements vscode.LanguageModelTool<Record<string, never>> {
+    async invoke(
+        _options: vscode.LanguageModelToolInvocationOptions<Record<string, never>>,
+        _token: vscode.CancellationToken,
+    ): Promise<vscode.LanguageModelToolResult> {
+        const capturePath = _getCurrentCapturePath();
+        const selection = _getSelectionContext();
+
+        // Inspector panel represents "what the user is looking at right now".
+        // Its focused event takes precedence over sidebar selection when present.
+        const inspector = InspectorPanel.currentPanel;
+        const inspectorEventId = inspector?.getCurrentEventId();
+        const inspectorDrawCall = inspector?.getCurrentDrawCall();
+
+        const focusedEventId = inspectorEventId ?? selection.selectedDrawCall?.eventId;
+        const focusedDrawCall = inspectorDrawCall ?? selection.selectedDrawCall;
+
+        const context: any = {
+            captureLoaded: !!capturePath,
+            capturePath: capturePath ?? null,
+            hasNativeBridge: _bridge.hasNativeBridge(),
+            inspectorOpen: !!inspector,
+            focusedEventId: focusedEventId ?? null,
+            focusedDrawCall: focusedDrawCall ?? null,
+            sidebarSelectedResource: selection.selectedResource ?? null,
+        };
+
+        // Enrich with pipeline state and bound-shader summary for the focused event.
+        // We deliberately do NOT include full shader source here — the model should
+        // call renderdoc_getShaderSource explicitly when it needs to read code.
+        if (focusedEventId !== undefined && focusedEventId !== null && _bridge.hasNativeBridge()) {
+            try {
+                const pipelineState = await _bridge.nativeGetPipelineState(focusedEventId);
+                context.pipelineState = pipelineState;
+            } catch (e: any) {
+                context.pipelineStateError = e.message;
+            }
+        }
+
+        return new vscode.LanguageModelToolResult([
+            new vscode.LanguageModelTextPart(JSON.stringify(context, null, 2)),
+        ]);
+    }
+
+    async prepareInvocation(
+        _options: vscode.LanguageModelToolInvocationPrepareOptions<Record<string, never>>,
+        _token: vscode.CancellationToken,
+    ): Promise<vscode.PreparedToolInvocation> {
+        return { invocationMessage: 'Reading current selection context…' };
+    }
+}
+
 // ─── Registration ───────────────────────────────────────────────────────────
 export function registerAllTools(context: vscode.ExtensionContext) {
     context.subscriptions.push(
@@ -435,5 +495,6 @@ export function registerAllTools(context: vscode.ExtensionContext) {
         vscode.lm.registerTool('renderdoc_getShaderSource', new GetShaderSourceTool()),
         vscode.lm.registerTool('renderdoc_getTextureInfo', new GetTextureInfoTool()),
         vscode.lm.registerTool('renderdoc_analyzeFrame', new AnalyzeFrameTool()),
+        vscode.lm.registerTool('renderdoc_getSelectionContext', new GetSelectionContextTool()),
     );
 }

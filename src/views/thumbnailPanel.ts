@@ -55,7 +55,8 @@ export class ThumbnailPanel {
     }
 
     private getHtml(thumbnail: ThumbnailData, info: CaptureInfo): string {
-        const imgSrc = `data:image/${thumbnail.format};base64,${thumbnail.base64}`;
+        const mimeType = thumbnail.format === 'jpg' ? 'jpeg' : thumbnail.format;
+        const imgSrc = `data:image/${mimeType};base64,${thumbnail.base64}`;
 
         return `<!DOCTYPE html>
 <html lang="en">

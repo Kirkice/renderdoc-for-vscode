@@ -8,11 +8,13 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 add_executable(renderdoc_bridge
     src/main.cpp
     src/dll_loader.cpp
+    3rdparty/astc_dec/astc_decomp.cpp
 )
 
 target_include_directories(renderdoc_bridge PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/include
     ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${CMAKE_CURRENT_SOURCE_DIR}/3rdparty
 )
 
 # Windows-specific settings

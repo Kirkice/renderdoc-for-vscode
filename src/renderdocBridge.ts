@@ -6,6 +6,52 @@ import * as os from 'os';
 import { CaptureInfo, DrawCall, ResourceInfo, ResourceDetail, ThumbnailData } from './types';
 import { parseRdcFile } from './rdcParser';
 
+// ─────────────────────────────────────────────────────────────────────
+// Native ActionDescription → DrawCall converter (preserves hierarchy)
+// ─────────────────────────────────────────────────────────────────────
+// ActionFlags bitmask values (must match native/include/renderdoc/replay_enums.h)
+const ACTION_FLAG_CLEAR        = 0x0001;
+const ACTION_FLAG_DRAWCALL     = 0x0002;
+const ACTION_FLAG_DISPATCH     = 0x0004;
+const ACTION_FLAG_MESHDISPATCH = 0x0008;
+const ACTION_FLAG_SETMARKER    = 0x0020;
+const ACTION_FLAG_PUSHMARKER   = 0x0040;
+const ACTION_FLAG_PRESENT      = 0x0100;
+const ACTION_FLAG_COPY         = 0x0400;
+const ACTION_FLAG_RESOLVE      = 0x0800;
+const ACTION_FLAG_GENMIPS      = 0x1000;
+const ACTION_FLAG_PASSBOUNDARY = 0x2000;
+
+function flagsBitmaskToName(flags: number, hasChildren: boolean): string {
+    if (flags & ACTION_FLAG_DRAWCALL)     { return 'Drawcall'; }
+    if (flags & ACTION_FLAG_DISPATCH)     { return 'Dispatch'; }
+    if (flags & ACTION_FLAG_MESHDISPATCH) { return 'Dispatch'; }
+    if (flags & ACTION_FLAG_CLEAR)        { return 'Clear'; }
+    if (flags & ACTION_FLAG_COPY)         { return 'Copy'; }
+    if (flags & ACTION_FLAG_RESOLVE)      { return 'Resolve'; }
+    if (flags & ACTION_FLAG_GENMIPS)      { return 'GenMips'; }
+    if (flags & ACTION_FLAG_PRESENT)      { return 'Present'; }
+    if (flags & ACTION_FLAG_PASSBOUNDARY) { return 'PassBoundary'; }
+    if (flags & (ACTION_FLAG_PUSHMARKER | ACTION_FLAG_SETMARKER)) { return 'Marker'; }
+    return hasChildren ? 'Group' : '';
+}
+
+function convertNativeActionToDrawCall(a: any): DrawCall {
+    const children: DrawCall[] = Array.isArray(a.children)
+        ? a.children.map((c: any) => convertNativeActionToDrawCall(c))
+        : [];
+    const flagsNum = typeof a.flags === 'number' ? a.flags : 0;
+    return {
+        eventId:     typeof a.eventId === 'number' ? a.eventId : 0,
+        drawIndex:   typeof a.actionId === 'number' ? a.actionId : 0,
+        name:        typeof a.name === 'string' ? a.name : '',
+        flags:       flagsBitmaskToName(flagsNum, children.length > 0),
+        numIndices:  typeof a.numIndices === 'number' ? a.numIndices : 0,
+        numInstances:typeof a.numInstances === 'number' ? a.numInstances : 0,
+        children,
+    };
+}
+
 /**
  * Bridge between the VS Code extension and RenderDoc.
  * Uses native binary parsing for metadata + renderdoccmd for thumbnails and XML conversion.
@@ -93,8 +139,25 @@ export class RenderDocBridge {
         return parseRdcFile(filePath);
     }
 
-    /** Get draw calls by converting RDC → XML and parsing */
+    /** Get draw calls – prefer the native bridge (hierarchical tree); fall back to flat XML parse. */
     async getDrawCalls(filePath: string): Promise<DrawCall[]> {
+        if (this.hasNativeBridge()) {
+            try {
+                // NOTE: do NOT call nativeOpenCapture here — that tears down the
+                // active replay controller and for SuggestRemote (GLES etc.)
+                // captures it won't be re-established without a tryReplay call.
+                // loadCapture() already opened the capture; we just query it.
+                const native = await this.nativeGetRootActions();
+                if (native && Array.isArray(native.actions) && native.actions.length > 0) {
+                    console.log('[RenderDoc] getDrawCalls: using native tree,',
+                        native.actions.length, 'root action(s)');
+                    return native.actions.map((a: any) => convertNativeActionToDrawCall(a));
+                }
+                console.log('[RenderDoc] getDrawCalls: native returned empty, falling back to XML');
+            } catch (e: any) {
+                console.warn('[RenderDoc] native getDrawCalls failed, falling back to XML:', e?.message);
+            }
+        }
         const xml = await this.convertToXml(filePath);
         return this.parseDrawCallsFromXml(xml);
     }
@@ -565,8 +628,8 @@ export class RenderDocBridge {
     }
 
     /** Get texture data via native bridge (saves to temp PNG, returns base64) */
-    async nativeGetTextureData(textureId: string, mip?: number): Promise<any> {
-        return this.nativeCall('getTexturePreview', { resourceId: parseInt(textureId, 10) || 0, mip: mip ?? 0 });
+    async nativeGetTextureData(textureId: string, mip?: number, eventId?: number, channelExtract?: number): Promise<any> {
+        return this.nativeCall('getTexturePreview', { resourceId: parseInt(textureId, 10) || 0, mip: mip ?? 0, eventId: eventId ?? 0, channelExtract: channelExtract ?? -1 });
     }
 
     /** Get root actions (draw call tree) via native bridge */
