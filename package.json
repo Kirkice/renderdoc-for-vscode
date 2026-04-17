@@ -3,7 +3,15 @@
   "displayName": "RenderDoc for VS Code",
   "description": "View and analyze RenderDoc capture (.rdc) files in VS Code",
   "version": "0.0.1",
-  "publisher": "renderdoc-community",
+  "publisher": "Kirkice",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Kirkice/renderdoc-for-vscode.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Kirkice/renderdoc-for-vscode/issues"
+  },
+  "homepage": "https://github.com/Kirkice/renderdoc-for-vscode#readme",
   "engines": {
     "vscode": "^1.95.0"
   },
@@ -248,6 +256,12 @@
         "title": "Try Local Replay",
         "category": "RenderDoc",
         "icon": "$(debug-start)"
+      },
+      {
+        "command": "renderdoc.downloadNativeBridge",
+        "title": "Download Native Bridge…",
+        "category": "RenderDoc",
+        "icon": "$(cloud-download)"
       }
     ],
     "viewsContainers": {
@@ -420,6 +434,11 @@
           "type": "number",
           "default": 30000,
           "description": "Timeout in milliseconds for Python script execution."
+        },
+        "renderdoc.nativeBridge.path": {
+          "type": "string",
+          "default": "",
+          "description": "Override the path to renderdoc_bridge(.exe). If empty, the extension looks next to itself, in its download cache, or prompts you to download the prebuilt binary on first run."
         }
       }
     }

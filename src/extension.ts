@@ -9,6 +9,7 @@ import { ThumbnailPanel } from './views/thumbnailPanel';
 import { InspectorPanel } from './views/inspectorPanel';
 import { initTools, registerAllTools } from './copilot/tools';
 import { initChatParticipant, registerChatParticipant } from './copilot/chatParticipant';
+import { ensureNativeBridge } from './bridgeInstaller';
 
 let bridge: RenderDocBridge;
 let captureInfoProvider: CaptureInfoProvider;
@@ -40,6 +41,13 @@ export async function activate(context: vscode.ExtensionContext) {
     // Try to start the native bridge for advanced features
     bridge.tryStartNativeBridge();
     console.log('[RenderDoc] hasNativeBridge after start:', bridge.hasNativeBridge());
+
+    // First-run: if the bridge binary is missing, offer to download it from
+    // the latest GitHub Release (or guide the user to build from source).
+    // Runs asynchronously so it doesn't block the rest of activation.
+    ensureNativeBridge(context, bridge).catch((e) => {
+        console.warn('[RenderDoc] ensureNativeBridge failed:', e);
+    });
 
     // Register TreeView providers
     captureInfoProvider = new CaptureInfoProvider();
@@ -118,6 +126,11 @@ export async function activate(context: vscode.ExtensionContext) {
         vscode.commands.registerCommand('renderdoc.previewTexture', (item) => previewTexture(context, item)),
         vscode.commands.registerCommand('renderdoc.viewAllShaders', () => viewAllShaders(context)),
         vscode.commands.registerCommand('renderdoc.tryLocalReplay', () => tryLocalReplay()),
+        vscode.commands.registerCommand('renderdoc.downloadNativeBridge', async () => {
+            // Clear the "don't ask again" flag so the picker shows again.
+            await context.globalState.update('renderdoc.skipBridgePrompt', false);
+            await ensureNativeBridge(context, bridge);
+        }),
         vscode.commands.registerCommand('renderdoc.openInspector', () => openInspector(context))
     );
 

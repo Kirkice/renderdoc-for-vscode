@@ -60,8 +60,15 @@ function convertNativeActionToDrawCall(a: any): DrawCall {
 export class RenderDocBridge {
     private renderdocPath: string | undefined;
     private renderdocCmd: string | undefined;
+    /** Global-storage directory where we cache a downloaded renderdoc_bridge.exe. */
+    private downloadedBridgeDir: string | undefined;
 
     constructor() {}
+
+    /** Tell the bridge where it can look for (and save) a downloaded binary. */
+    setDownloadedBridgeDir(dir: string) {
+        this.downloadedBridgeDir = dir;
+    }
 
     /**
      * Detects if RenderDoc is available on the system.
@@ -477,6 +484,24 @@ export class RenderDocBridge {
         return !!this.nativeProcess && !this.nativeProcess.killed;
     }
 
+    /** Is the bridge binary present on disk (even if not yet spawned)? */
+    isNativeBridgeInstalled(): boolean {
+        return !!this.findNativeBridge();
+    }
+
+    /** Absolute path to an installed bridge binary, or undefined. */
+    getNativeBridgePath(): string | undefined {
+        return this.findNativeBridge();
+    }
+
+    /** Target platform asset name for the bridge binary on the current OS. */
+    static expectedBridgeAssetName(): string {
+        const arch = process.arch === 'arm64' ? 'arm64' : 'x64';
+        if (process.platform === 'win32')  { return `renderdoc_bridge-win32-${arch}.exe`; }
+        if (process.platform === 'darwin') { return `renderdoc_bridge-darwin-${arch}`; }
+        return `renderdoc_bridge-linux-${arch}`;
+    }
+
     /** Try to start the native bridge process */
     tryStartNativeBridge(): void {
         if (this.nativeProcess) { return; }
@@ -541,13 +566,25 @@ export class RenderDocBridge {
 
     /** Find the native bridge executable */
     private findNativeBridge(): string | undefined {
-        // Look next to the extension
+        const exeName = process.platform === 'win32' ? 'renderdoc_bridge.exe' : 'renderdoc_bridge';
+
+        // 1. User setting override
+        const override = vscode.workspace.getConfiguration('renderdoc').get<string>('nativeBridge.path');
+        if (override && fs.existsSync(override)) { return override; }
+
+        // 2. Next to the extension (dev build or VSIX-bundled)
         const extensionDir = path.dirname(path.dirname(__filename));
         const candidates = [
-            path.join(extensionDir, 'native', 'build', 'Release', 'renderdoc_bridge.exe'),
-            path.join(extensionDir, 'native', 'build', 'renderdoc_bridge.exe'),
-            path.join(extensionDir, 'renderdoc_bridge.exe'),
+            path.join(extensionDir, 'native', 'build', 'Release', exeName),
+            path.join(extensionDir, 'native', 'build', exeName),
+            path.join(extensionDir, exeName),
         ];
+
+        // 3. Downloaded copy in globalStorage (populated on first run)
+        if (this.downloadedBridgeDir) {
+            candidates.push(path.join(this.downloadedBridgeDir, exeName));
+        }
+
         for (const c of candidates) {
             if (fs.existsSync(c)) { return c; }
         }

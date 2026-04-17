@@ -100,9 +100,17 @@ Or in VS Code: `Extensions` panel → `···` menu → **Install from VSIX…**
 
 ### 2 · Installing RenderDoc (runtime dependency)
 
-The extension loads RenderDoc's replay library at runtime. Install it from
-[renderdoc.org/builds](https://renderdoc.org/builds) — the default install
-location is auto-detected:
+The extension loads RenderDoc's replay library (`renderdoc.dll` /
+`librenderdoc.so` / `librenderdoc.dylib`) at runtime. **Install the official
+build — no patched or custom fork is needed**; the extension ships its own
+lightweight native bridge on top of the stock RenderDoc API.
+
+Download and install from the official site:
+**👉 [renderdoc.org/builds](https://renderdoc.org/builds)**
+
+> 💡 Any recent stable version (**v1.30 or newer**) works. The default install
+> location is auto-detected, so if you accept the installer defaults there's
+> nothing else to configure.
 
 | Platform | Auto-detected path                       |
 | -------- | ---------------------------------------- |
@@ -110,8 +118,10 @@ location is auto-detected:
 | Linux    | `/usr/lib/x86_64-linux-gnu/librenderdoc` |
 | macOS    | `/Applications/RenderDoc.app/`           |
 
-If installed elsewhere, run **`RenderDoc: Configure RenderDoc Path`** from the
-command palette, or set `renderdoc.installPath` in Settings.
+If installed elsewhere (portable ZIP, custom path, etc.), run
+**`RenderDoc: Configure RenderDoc Path`** from the command palette, or set
+`renderdoc.installPath` in Settings to the folder containing
+`renderdoc.dll` / `librenderdoc.*`.
 
 ### 3 · Opening a capture
 

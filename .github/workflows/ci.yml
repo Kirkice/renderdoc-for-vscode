@@ -43,7 +43,7 @@ jobs:
           Get-Item "native\build\Release\renderdoc_bridge.exe" | Select-Object Name, Length
 
       - name: Package VSIX
-        run: npx --yes @vscode/vsce package --allow-missing-repository --skip-license --baseContentUrl https://github.com/${{ github.repository }} --baseImagesUrl https://github.com/${{ github.repository }}/raw/main
+        run: npx --yes @vscode/vsce package --skip-license
 
       - name: Upload VSIX artifact
         uses: actions/upload-artifact@v4
