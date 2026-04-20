@@ -23,14 +23,6 @@ No context switching. No external viewers. Just your capture, your editor, and y
 
 ---
 
-## 📸 Screenshots
-
-| D3D11 Capture — Shader Inspection & Copilot Chat | OpenGL ES Capture — Overview & Frame Analysis |
-| :---: | :---: |
-| ![D3D11 Shader Inspection](textures/00.jpg) | ![OpenGL ES Overview](textures/01.jpeg) |
-
----
-
 ## 🎯 Highlights
 
 <table>
@@ -166,6 +158,7 @@ Navigation shortcuts inside the Inspector:
 Open VS Code Chat (`Ctrl+Alt+I`) and mention `@renderdoc`:
 
 ```
+@renderdoc 你看下这个draw的开销
 @renderdoc Find all draw calls that render to the depth buffer
 @renderdoc Show the fragment shader for event 246
 @renderdoc Analyze this frame for potential optimization opportunities

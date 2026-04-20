@@ -1,8 +1,11 @@
-# TypeScript sources (compiled output lives in out/)
+# TypeScript sources (bundled output lives in dist/)
 src/**
+out/**
 **/*.ts
 **/*.map
 tsconfig.json
+esbuild.js
+scripts/**
 
 # Node / tooling
 node_modules/**

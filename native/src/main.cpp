@@ -258,32 +258,21 @@ static json handleOpenCapture(int id, const json &params) {
         return makeResult(id, result);
     }
 
-    // Open replay (localSupport == Supported)
-    ReplayOptions opts;
-    opts.apiValidation = false;
-    fprintf(stderr, "[bridge] Opening replay...\n");
+    // LocalReplaySupport == Supported.
+    //
+    // Do NOT auto-open the replay here. Re-opening a capture after tearing
+    // down a previous replay can crash some backends (notably GL/ANGLE on
+    // Windows when the first capture was Android GLES). Return capture info
+    // with canTryReplay=true and let the TS layer explicitly invoke
+    // `tryReplay` — that path is wrapped in a crash handler.
+    fprintf(stderr, "[bridge] LocalReplaySupport==Supported; deferring OpenCapture to explicit tryReplay.\n");
 
-    rdcpair<ResultDetails, IReplayController *> replayResult =
-        g_capFile->OpenCapture(opts, nullptr);
-
-    if (replayResult.first.code != ResultCode::Succeeded) {
-        fprintf(stderr, "[bridge] OpenCapture failed: code=%d\n", (int)replayResult.first.code);
-        g_replay = nullptr;
-        json result;
-        result["path"]   = path;
-        result["driver"] = rdcToStr(g_capFile->DriverName());
-        result["replay"] = false;
-        result["replayError"] = "OpenCapture failed with code " + std::to_string((int)replayResult.first.code);
-        return makeResult(id, result);
-    }
-
-    g_replay = replayResult.second;
-
-    // Gather basic info
     json result;
     result["path"]   = path;
     result["driver"] = rdcToStr(g_capFile->DriverName());
-    result["replay"] = true;
+    result["replay"] = false;
+    result["canTryReplay"] = true;
+    result["replayMessage"] = "Capture is supported locally. Use 'Try Local Replay' to start the replay.";
     return makeResult(id, result);
 }
 

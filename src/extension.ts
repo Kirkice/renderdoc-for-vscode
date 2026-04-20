@@ -2,6 +2,7 @@ import * as vscode from 'vscode';
 import * as fs from 'fs';
 import * as path from 'path';
 import { RenderDocBridge } from './renderdocBridge';
+import { CaptureInfo, DrawCall, ResourceInfo } from './types';
 import { CaptureInfoProvider } from './views/captureInfoProvider';
 import { DrawCallProvider } from './views/drawCallProvider';
 import { ResourceProvider } from './views/resourceProvider';
@@ -10,6 +11,16 @@ import { InspectorPanel } from './views/inspectorPanel';
 import { initTools, registerAllTools } from './copilot/tools';
 import { initChatParticipant, registerChatParticipant } from './copilot/chatParticipant';
 import { ensureNativeBridge } from './bridgeInstaller';
+import {
+    checkAngleAvailability,
+    findAngleSources,
+    installAngleDlls,
+} from './commands/angle';
+import {
+    getShaderPanelHtml,
+    getPipelineStateHtml,
+    getTexturePreviewHtml,
+} from './views/panelHtml';
 
 let bridge: RenderDocBridge;
 let captureInfoProvider: CaptureInfoProvider;
@@ -20,6 +31,12 @@ let currentCapturePath: string | undefined;
 // ── Selection tracking (for Copilot context) ──
 let currentSelectedDrawCall: any | undefined;
 let currentSelectedResource: any | undefined;
+
+// Path of the capture currently known to the native bridge process.
+// Used to force-restart the bridge before loading a different capture,
+// because some backends (GL/ANGLE) crash when a second capture is opened
+// in the same process after a prior replay was torn down.
+let bridgeLoadedCapturePath: string | undefined;
 
 export async function activate(context: vscode.ExtensionContext) {
     bridge = new RenderDocBridge();
@@ -199,12 +216,36 @@ async function loadCapture(context: vscode.ExtensionContext, filePath: string, s
     console.log('[RenderDoc] loadCapture called:', filePath, 'silent:', silent);
     console.log('[RenderDoc] hasNativeBridge:', bridge.hasNativeBridge());
 
+    // Only one capture can be replayed at a time. If the bridge already has a
+    // different capture loaded (potentially with an active replay), restart it
+    // so the previous replay is cleanly shut down before opening the new one.
+    // Re-opening a GL/ANGLE capture in the same bridge process after a prior
+    // replay was torn down reliably crashes with an access violation, so a
+    // fresh process is the safe choice.
+    if (bridge.hasNativeBridge()
+        && bridgeLoadedCapturePath
+        && bridgeLoadedCapturePath !== filePath) {
+        console.log('[RenderDoc] Different capture already loaded in bridge; restarting process to close previous replay.');
+        bridge.restartNativeBridge();
+        bridgeLoadedCapturePath = undefined;
+        captureInfoProvider.setReplayStatus('unavailable');
+    }
+
+    // If the bridge isn't running (first open, previous crash, or just killed
+    // above), try to (re)spawn it so advanced features are available.
+    if (!bridge.hasNativeBridge()) {
+        console.log('[RenderDoc] Native bridge not running; attempting to start it.');
+        bridge.tryStartNativeBridge();
+        console.log('[RenderDoc] hasNativeBridge after tryStart:', bridge.hasNativeBridge());
+    }
+
     // Open in native bridge if available
     let nativeResult: any;
     if (bridge.hasNativeBridge()) {
         try {
             nativeResult = await bridge.nativeOpenCapture(filePath);
             console.log('[RenderDoc] nativeOpenCapture result:', JSON.stringify(nativeResult));
+            bridgeLoadedCapturePath = filePath;
         } catch (err: any) {
             console.error('[RenderDoc] nativeOpenCapture error:', err.message);
         }
@@ -221,9 +262,13 @@ async function loadCapture(context: vscode.ExtensionContext, filePath: string, s
         captureInfoProvider.setReplayStatus('failed');
     }
 
-    // Silent auto-restore: try local replay automatically (best-effort) so
-    // shader/pipeline tabs actually have data. Users never clicked the modal.
-    if (silent && nativeResult && nativeResult.canTryReplay && !nativeResult.replay) {
+    // Auto-start local replay for natively supported captures (both silent
+    // auto-restore and explicit user opens). The native bridge no longer
+    // auto-opens the replay in `openCapture` because re-opening GL/ANGLE
+    // captures after tear-down can crash — so we must always call tryReplay
+    // here. Cross-OS (SuggestRemote) captures still go through the modal
+    // below so the user can decide whether to attempt the risky local replay.
+    if (nativeResult && nativeResult.canTryReplay && !nativeResult.replay && !nativeResult.suggestRemote) {
         try {
             const tryResult = await bridge.nativeTryReplay();
             if (tryResult && tryResult.replay) {
@@ -232,7 +277,7 @@ async function loadCapture(context: vscode.ExtensionContext, filePath: string, s
                 captureInfoProvider.setReplayStatus('failed');
             }
         } catch (err: any) {
-            console.warn('[RenderDoc] silent tryReplay crashed:', err?.message);
+            console.warn('[RenderDoc] tryReplay crashed:', err?.message);
             captureInfoProvider.setReplayStatus('failed');
             bridge.restartNativeBridge();
             if (bridge.hasNativeBridge()) {
@@ -242,7 +287,7 @@ async function loadCapture(context: vscode.ExtensionContext, filePath: string, s
     }
 
     // If the capture is from a different OS (SuggestRemote), show a modal dialog
-    if (!silent && nativeResult && nativeResult.canTryReplay && !nativeResult.replay) {
+    if (!silent && nativeResult && nativeResult.canTryReplay && !nativeResult.replay && nativeResult.suggestRemote) {
         // Check ANGLE availability for GLES captures
         const angleStatus = checkAngleAvailability();
         const angleSources = !angleStatus.available ? findAngleSources() : null;
@@ -329,39 +374,60 @@ async function loadCapture(context: vscode.ExtensionContext, filePath: string, s
             cancellable: false
         },
         async (progress) => {
+            // Step 1: Capture info — reads RDC binary directly, always works.
+            let captureInfo: CaptureInfo | undefined;
             try {
-                // Step 1: Get capture info
                 progress.report({ message: 'Reading capture info...', increment: 0 });
-                const captureInfo = await bridge.getCaptureInfo(filePath);
+                captureInfo = await bridge.getCaptureInfo(filePath);
                 captureInfoProvider.update(captureInfo);
+            } catch (err: any) {
+                vscode.window.showErrorMessage(`RenderDoc: Failed to read capture header - ${err.message}`);
+                return;
+            }
 
-                // Step 2: Get draw calls
+            // Step 2 & 3: Draw calls and resources — require an active replay.
+            let drawCalls: DrawCall[] = [];
+            let resources: ResourceInfo[] = [];
+            let replayErr: Error | undefined;
+            try {
                 progress.report({ message: 'Loading draw calls...', increment: 33 });
-                const drawCalls = await bridge.getDrawCalls(filePath);
+                drawCalls = await bridge.getDrawCalls(filePath);
                 drawCallProvider.update(drawCalls);
 
-                // Step 3: Get resources
                 progress.report({ message: 'Loading resources...', increment: 33 });
-                const resources = await bridge.getResources(filePath);
+                resources = await bridge.getResources(filePath);
                 resourceProvider.update(resources);
+            } catch (err: any) {
+                replayErr = err;
+                drawCallProvider.update([]);
+                resourceProvider.update([]);
+            }
 
-                // Push data into Inspector (if it's open) — user-controlled via command
-                if (InspectorPanel.currentPanel) {
-                    InspectorPanel.currentPanel.setCapture(captureInfo, drawCalls, resources);
-                }
+            // Push whatever we have into an open Inspector
+            if (InspectorPanel.currentPanel && captureInfo) {
+                InspectorPanel.currentPanel.setCapture(captureInfo, drawCalls, resources);
+            }
 
-                // Step 4: Show thumbnail
+            // Step 4: Thumbnail — uses renderdoccmd binary, no replay needed.
+            try {
                 progress.report({ message: 'Loading thumbnail...', increment: 34 });
                 const thumbnail = await bridge.getThumbnail(filePath);
                 if (thumbnail && !silent) {
                     ThumbnailPanel.createOrShow(context, thumbnail, captureInfo);
                 }
-
-                if (!silent) {
-                    vscode.window.showInformationMessage(`RenderDoc: Loaded ${filePath}`);
-                }
             } catch (err: any) {
-                vscode.window.showErrorMessage(`RenderDoc: Failed to load capture - ${err.message}`);
+                console.warn('[RenderDoc] thumbnail load failed:', err?.message);
+            }
+
+            if (replayErr && !silent) {
+                vscode.window.showWarningMessage(
+                    `RenderDoc: this capture cannot be inspected without an active local replay. ` +
+                    `Draw calls, resources, shader source and pipeline state are unavailable. ` +
+                    `(${replayErr.message})`,
+                    { modal: true }
+                );
+            } else if (!silent) {
+                vscode.window.showInformationMessage(`RenderDoc: Loaded ${filePath}`);
             }
         }
     );
@@ -469,43 +535,27 @@ async function viewShaderSource(context: vscode.ExtensionContext, item: any) {
     // item can come from DrawCallItem (has drawCall.eventId) or ResourceItem (has resourceId)
     const eventId = item.drawCall?.eventId ?? item.eventId;
 
+    if (!bridge.hasNativeBridge() || eventId === undefined) {
+        vscode.window.showWarningMessage(
+            'Shader source requires an active local replay. Open a capture that can replay on this machine, or select a draw call first.'
+        );
+        return;
+    }
+
     await vscode.window.withProgress(
         { location: vscode.ProgressLocation.Notification, title: 'RenderDoc: Loading shader source...' },
         async () => {
             try {
-                if (bridge.hasNativeBridge() && eventId !== undefined) {
-                    const result = await bridge.nativeGetShaderSource(eventId);
-                    if (result && result.shaders && Object.keys(result.shaders).length > 0) {
-                        // Convert new format {shaders: {vertex: {source:...}, fragment: {source:...}}}
-                        // to the format showShaderPanel expects {vertex: "source", fragment: "source"}
-                        const panelData: Record<string, string> = {};
-                        for (const [stage, info] of Object.entries(result.shaders) as [string, any][]) {
-                            panelData[stage] = info.source || info.disassembly || '// No source available';
-                        }
-                        showShaderPanel(context, panelData, eventId);
-                        return;
-                    }
-                }
-                // Fallback: extract shaders from XML
-                const shaders = await bridge.getShaderSourcesFromXml(currentCapturePath!);
-                if (shaders.length === 0) {
-                    vscode.window.showInformationMessage('No shader sources found in this capture. Local replay may not be supported.');
+                const result = await bridge.nativeGetShaderSource(eventId);
+                if (!result || !result.shaders || Object.keys(result.shaders).length === 0) {
+                    vscode.window.showInformationMessage('No shader sources returned by the native bridge for this event.');
                     return;
                 }
-                // Show as a quick-pick then open in editor
-                if (shaders.length === 1) {
-                    const doc = await vscode.workspace.openTextDocument({ content: shaders[0].source, language: 'glsl' });
-                    await vscode.window.showTextDocument(doc);
-                } else {
-                    const pick = await vscode.window.showQuickPick(
-                        shaders.map((s, i) => ({ label: s.name, index: i })),
-                        { placeHolder: 'Select shader to view' }
-                    );
-                    if (pick) {
-                        const doc = await vscode.workspace.openTextDocument({ content: shaders[pick.index].source, language: 'glsl' });
-                        await vscode.window.showTextDocument(doc);
-                    }
+                const panelData: Record<string, string> = {};
+                for (const [stage, info] of Object.entries(result.shaders) as [string, any][]) {
+                    panelData[stage] = info.source || info.disassembly || '// No source available';
                 }
+                showShaderPanel(context, panelData, eventId);
             } catch (err: any) {
                 vscode.window.showErrorMessage(`Failed to get shader source: ${err.message}`);
             }
@@ -518,14 +568,20 @@ async function viewAllShaders(context: vscode.ExtensionContext) {
         vscode.window.showWarningMessage('No capture file loaded.');
         return;
     }
+    if (!bridge.hasNativeBridge()) {
+        vscode.window.showWarningMessage(
+            'Listing all shaders requires an active local replay. The RenderDoc native bridge is not running.'
+        );
+        return;
+    }
 
     await vscode.window.withProgress(
         { location: vscode.ProgressLocation.Notification, title: 'RenderDoc: Extracting all shaders...' },
         async () => {
             try {
-                const shaders = await bridge.getShaderSourcesFromXml(currentCapturePath!);
+                const shaders = await bridge.getAllShaders();
                 if (shaders.length === 0) {
-                    vscode.window.showInformationMessage('No shader sources found in this capture file.');
+                    vscode.window.showInformationMessage('No shader sources found in this capture.');
                     return;
                 }
                 const pick = await vscode.window.showQuickPick(
@@ -543,103 +599,7 @@ async function viewAllShaders(context: vscode.ExtensionContext) {
     );
 }
 
-// ── ANGLE (libEGL) detection and installation helpers ──────────────────────
-
-function getRenderDocDir(): string {
-    const config = vscode.workspace.getConfiguration('renderdoc');
-    const configuredPath = config.get<string>('installPath');
-    if (configuredPath) { return configuredPath; }
-    // Default Windows path
-    return path.join(process.env['ProgramFiles'] || 'C:\\Program Files', 'RenderDoc');
-}
-
-function checkAngleAvailability(): { available: boolean; targetDir: string } {
-    const rdcDir = getRenderDocDir();
-    const pluginDir = path.join(rdcDir, 'plugins', 'gles');
-    const eglPath = path.join(pluginDir, 'libEGL.dll');
-    const glesPath = path.join(pluginDir, 'libGLESv2.dll');
-    return {
-        available: fs.existsSync(eglPath) && fs.existsSync(glesPath),
-        targetDir: pluginDir,
-    };
-}
-
-function findAngleSources(): { egl: string; gles: string; source: string } | null {
-    // Search for ANGLE DLLs in common locations
-    const candidates: Array<{ dir: string; source: string }> = [];
-
-    // Chrome
-    const chromeDirs = [
-        path.join(process.env['ProgramFiles'] || '', 'Google', 'Chrome', 'Application'),
-        path.join(process.env['ProgramFiles(x86)'] || '', 'Google', 'Chrome', 'Application'),
-        path.join(process.env['LOCALAPPDATA'] || '', 'Google', 'Chrome', 'Application'),
-    ];
-    for (const chromeBase of chromeDirs) {
-        try {
-            if (!fs.existsSync(chromeBase)) { continue; }
-            const entries = fs.readdirSync(chromeBase).filter(e => /^\d+\./.test(e)).sort().reverse();
-            for (const ver of entries) {
-                const dir = path.join(chromeBase, ver);
-                candidates.push({ dir, source: `Chrome ${ver}` });
-            }
-        } catch { /* ignore */ }
-    }
-
-    // Edge
-    const edgeDirs = [
-        path.join(process.env['ProgramFiles'] || '', 'Microsoft', 'Edge', 'Application'),
-        path.join(process.env['ProgramFiles(x86)'] || '', 'Microsoft', 'Edge', 'Application'),
-    ];
-    for (const edgeBase of edgeDirs) {
-        try {
-            if (!fs.existsSync(edgeBase)) { continue; }
-            const entries = fs.readdirSync(edgeBase).filter(e => /^\d+\./.test(e)).sort().reverse();
-            for (const ver of entries) {
-                const dir = path.join(edgeBase, ver);
-                candidates.push({ dir, source: `Edge ${ver}` });
-            }
-        } catch { /* ignore */ }
-    }
-
-    for (const { dir, source } of candidates) {
-        const egl = path.join(dir, 'libEGL.dll');
-        const gles = path.join(dir, 'libGLESv2.dll');
-        if (fs.existsSync(egl) && fs.existsSync(gles)) {
-            return { egl, gles, source };
-        }
-    }
-    return null;
-}
-
-async function installAngleDlls(sources: { egl: string; gles: string; source: string }): Promise<boolean> {
-    const { targetDir } = checkAngleAvailability();
-    try {
-        // Try direct copy first (may fail without admin)
-        if (!fs.existsSync(targetDir)) {
-            fs.mkdirSync(targetDir, { recursive: true });
-        }
-        fs.copyFileSync(sources.egl, path.join(targetDir, 'libEGL.dll'));
-        fs.copyFileSync(sources.gles, path.join(targetDir, 'libGLESv2.dll'));
-        return true;
-    } catch {
-        // Need admin elevation on Windows
-        if (process.platform === 'win32') {
-            try {
-                const cp = await import('child_process');
-                const psCmd = `New-Item '${targetDir}' -ItemType Directory -Force | Out-Null; ` +
-                    `Copy-Item '${sources.egl}' '${path.join(targetDir, 'libEGL.dll')}' -Force; ` +
-                    `Copy-Item '${sources.gles}' '${path.join(targetDir, 'libGLESv2.dll')}' -Force`;
-                cp.execSync(`powershell -Command "Start-Process powershell -Verb RunAs -Wait -ArgumentList '-NoProfile','-Command',\\"${psCmd.replace(/"/g, '`"')}\\""`, { timeout: 30000 });
-                // Verify
-                return fs.existsSync(path.join(targetDir, 'libEGL.dll')) && fs.existsSync(path.join(targetDir, 'libGLESv2.dll'));
-            } catch (adminErr: any) {
-                vscode.window.showErrorMessage(`Failed to install ANGLE (admin privileges required): ${adminErr.message}`);
-                return false;
-            }
-        }
-        return false;
-    }
-}
+// ANGLE helpers live in ./commands/angle.ts
 
 async function openInspector(context: vscode.ExtensionContext) {
     const info = captureInfoProvider.getCaptureInfo();
@@ -667,9 +627,38 @@ async function tryLocalReplay() {
         vscode.window.showWarningMessage('No capture file loaded.');
         return;
     }
+    // Auto-recover: the bridge process may have died (e.g. from a previous
+    // replay crash). If the binary is installed, transparently restart it
+    // and re-open the capture before proceeding.
     if (!bridge.hasNativeBridge()) {
-        vscode.window.showWarningMessage('Native bridge not available.');
-        return;
+        if (!bridge.isNativeBridgeInstalled()) {
+            const action = await vscode.window.showWarningMessage(
+                'Native bridge binary is not installed. Local replay requires it.',
+                'Download Prebuilt',
+                'Build from Source',
+            );
+            if (action === 'Download Prebuilt' || action === 'Build from Source') {
+                vscode.commands.executeCommand('renderdoc.downloadNativeBridge')
+                    .then(undefined, () => { /* command may not exist */ });
+            }
+            return;
+        }
+        console.log('[RenderDoc] Native bridge not running; attempting restart before replay...');
+        bridge.restartNativeBridge();
+        bridgeLoadedCapturePath = undefined;
+        // Give the process a moment to spawn; hasNativeBridge() flips synchronously on spawn.
+        if (!bridge.hasNativeBridge()) {
+            vscode.window.showWarningMessage(
+                'Failed to start the native bridge process. Check the Extension Host log for [RenderDoc] errors.'
+            );
+            return;
+        }
+        try { await bridge.nativeOpenCapture(currentCapturePath); }
+        catch (err: any) {
+            vscode.window.showWarningMessage(`Native bridge restarted but failed to open capture: ${err.message}`);
+            return;
+        }
+        bridgeLoadedCapturePath = currentCapturePath;
     }
 
     // Check if ANGLE is needed but missing (GLES capture without libEGL.dll)
@@ -733,52 +722,19 @@ async function tryLocalReplay() {
         }
         vscode.window.showWarningMessage(
             'Local replay crashed — this capture cannot be replayed on this GPU. ' +
-            'Shader sources can still be viewed via XML extraction (View All Shaders).'
+            'Inspection features are disabled for this capture.'
         );
     }
 }
 
-function showShaderPanel(context: vscode.ExtensionContext, result: any, eventId: number) {
+function showShaderPanel(_context: vscode.ExtensionContext, result: any, eventId: number) {
     const panel = vscode.window.createWebviewPanel(
         'renderdoc-shader',
         `Shader @ EID ${eventId}`,
         vscode.ViewColumn.One,
         { enableScripts: true }
     );
-
-    const stages: Array<{ name: string; source: string }> = [];
-    for (const [stage, src] of Object.entries(result)) {
-        if (typeof src === 'string' && src.trim().length > 0) {
-            stages.push({ name: stage, source: src });
-        }
-    }
-
-    const tabs = stages.map((s, i) =>
-        `<button class="tab${i === 0 ? ' active' : ''}" onclick="showTab(${i})">${escapeHtml(s.name)}</button>`
-    ).join('');
-    const contents = stages.map((s, i) =>
-        `<pre class="tabcontent" id="tab${i}" style="${i === 0 ? '' : 'display:none'}">${escapeHtml(s.source)}</pre>`
-    ).join('');
-
-    panel.webview.html = `<!DOCTYPE html>
-<html><head><style>
-  body { font-family: var(--vscode-editor-font-family); color: var(--vscode-foreground); padding: 8px; }
-  .tabs { display: flex; gap: 4px; margin-bottom: 8px; }
-  .tab { padding: 6px 16px; border: 1px solid var(--vscode-panel-border); background: var(--vscode-editor-background);
-         color: var(--vscode-foreground); cursor: pointer; border-radius: 4px 4px 0 0; }
-  .tab.active { background: var(--vscode-editor-selectionBackground); font-weight: bold; }
-  pre { background: var(--vscode-editor-background); padding: 12px; overflow: auto;
-        border: 1px solid var(--vscode-panel-border); font-size: var(--vscode-editor-font-size); white-space: pre-wrap; }
-</style></head><body>
-  <div class="tabs">${tabs}</div>
-  ${contents}
-  <script>
-    function showTab(idx) {
-      document.querySelectorAll('.tabcontent').forEach((el, i) => el.style.display = i === idx ? '' : 'none');
-      document.querySelectorAll('.tab').forEach((el, i) => el.className = i === idx ? 'tab active' : 'tab');
-    }
-  </script>
-</body></html>`;
+    panel.webview.html = getShaderPanelHtml(result);
 }
 
 async function viewPipelineState(context: vscode.ExtensionContext, item: any) {
@@ -810,31 +766,7 @@ async function viewPipelineState(context: vscode.ExtensionContext, item: any) {
     );
 }
 
-function getPipelineStateHtml(state: any, eventId: number): string {
-    const json = JSON.stringify(state, null, 2);
-    // Build a structured view for known keys
-    let sections = '';
-    if (typeof state === 'object' && state !== null) {
-        for (const [key, value] of Object.entries(state)) {
-            const content = typeof value === 'object' ? JSON.stringify(value, null, 2) : String(value);
-            sections += `<details open><summary>${escapeHtml(key)}</summary><pre>${escapeHtml(content)}</pre></details>`;
-        }
-    } else {
-        sections = `<pre>${escapeHtml(json)}</pre>`;
-    }
-    return `<!DOCTYPE html>
-<html><head><style>
-  body { font-family: var(--vscode-font-family); color: var(--vscode-foreground); padding: 16px; }
-  details { margin-bottom: 8px; border: 1px solid var(--vscode-panel-border); border-radius: 4px; }
-  summary { cursor: pointer; padding: 8px; background: var(--vscode-editor-selectionBackground); font-weight: bold; }
-  pre { padding: 8px 12px; margin: 0; overflow: auto; font-family: var(--vscode-editor-font-family);
-        font-size: var(--vscode-editor-font-size); white-space: pre-wrap; }
-  .header { font-size: 1.2em; margin-bottom: 12px; }
-</style></head><body>
-  <div class="header">Pipeline State @ Event ${eventId}</div>
-  ${sections}
-</body></html>`;
-}
+// getPipelineStateHtml lives in ./views/panelHtml.ts
 
 async function exportTexture(item: any) {
     if (!item) { return; }
@@ -907,154 +839,4 @@ async function previewTexture(context: vscode.ExtensionContext, item: any) {
     );
 }
 
-function getTexturePreviewHtml(result: any, resourceId: string): string {
-    return `<!DOCTYPE html>
-<html><head>
-<meta charset="UTF-8">
-<meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src data: blob:; style-src 'unsafe-inline'; script-src 'unsafe-inline';">
-<style>
-  body { margin: 0; padding: 16px; background: var(--vscode-editor-background); display: flex; flex-direction: column; align-items: center; font-family: var(--vscode-font-family); }
-  .canvas-wrap {
-    background-image: linear-gradient(45deg, #808080 25%, transparent 25%),
-                      linear-gradient(-45deg, #808080 25%, transparent 25%),
-                      linear-gradient(45deg, transparent 75%, #808080 75%),
-                      linear-gradient(-45deg, transparent 75%, #808080 75%);
-    background-size: 16px 16px;
-    background-position: 0 0, 0 8px, 8px -8px, -8px 0px;
-    background-color: #c0c0c0;
-    display: inline-block;
-    border: 1px solid var(--vscode-panel-border);
-    line-height: 0;
-  }
-  canvas { display: block; max-width: 90vw; max-height: 80vh; image-rendering: pixelated; }
-  .info { color: var(--vscode-descriptionForeground); margin-top: 8px; font-size: 0.85em; }
-  .channel-bar { display: flex; gap: 6px; margin-top: 12px; }
-  .channel-btn {
-    padding: 4px 14px; border: 1px solid var(--vscode-button-border, var(--vscode-panel-border));
-    border-radius: 4px; cursor: pointer; font-family: var(--vscode-font-family); font-size: 0.85em;
-    font-weight: 600; background: var(--vscode-button-secondaryBackground); color: var(--vscode-button-secondaryForeground);
-  }
-  .channel-btn:hover { background: var(--vscode-button-secondaryHoverBackground); }
-  .channel-btn.active { background: var(--vscode-button-background); color: var(--vscode-button-foreground); }
-</style></head><body>
-  <div class="canvas-wrap"><canvas id="texCanvas"></canvas></div>
-  <div class="info" id="infoLine">${result.width ?? '?'}x${result.height ?? '?'} &mdash; ${result.texFormat ?? ''} &mdash; Resource ID: ${resourceId}</div>
-  <div class="channel-bar">
-    <button class="channel-btn active" data-ch="rgb">RGB</button>
-    <button class="channel-btn" data-ch="r">R</button>
-    <button class="channel-btn" data-ch="g">G</button>
-    <button class="channel-btn" data-ch="b">B</button>
-    <button class="channel-btn" data-ch="a">A</button>
-  </div>
-  <script>
-  (function(){
-    var canvas = document.getElementById('texCanvas');
-    var ctx = canvas.getContext('2d');
-    var pixels = null;
-    var w = 0, h = 0;
-
-    // Decode PNG base64 → Blob → createImageBitmap with NO premultiply
-    var b64 = '${result.base64}';
-    var bin = atob(b64);
-    var bytes = new Uint8Array(bin.length);
-    for (var i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
-    var blob = new Blob([bytes], { type: 'image/png' });
-
-    createImageBitmap(blob, { premultiplyAlpha: 'none', colorSpaceConversion: 'none' }).then(function(bmp) {
-      w = bmp.width; h = bmp.height;
-      canvas.width = w; canvas.height = h;
-      // Draw the bitmap and read raw (non-premultiplied) pixel data
-      ctx.drawImage(bmp, 0, 0);
-      pixels = ctx.getImageData(0, 0, w, h).data;
-      showChannel('rgb');
-    }).catch(function(err) {
-      document.getElementById('infoLine').textContent = 'Failed to decode texture: ' + err.message;
-    });
-
-    function showChannel(ch) {
-      if (!pixels) return;
-      var out = ctx.createImageData(w, h);
-      var d = out.data;
-      var s = pixels;
-      var len = s.length;
-      var i, v;
-      if (ch === 'rgb') {
-        for (i = 0; i < len; i += 4) {
-          d[i] = s[i]; d[i+1] = s[i+1]; d[i+2] = s[i+2]; d[i+3] = 255;
-        }
-      } else if (ch === 'r') {
-        for (i = 0; i < len; i += 4) {
-          v = s[i]; d[i] = v; d[i+1] = v; d[i+2] = v; d[i+3] = 255;
-        }
-      } else if (ch === 'g') {
-        for (i = 0; i < len; i += 4) {
-          v = s[i+1]; d[i] = v; d[i+1] = v; d[i+2] = v; d[i+3] = 255;
-        }
-      } else if (ch === 'b') {
-        for (i = 0; i < len; i += 4) {
-          v = s[i+2]; d[i] = v; d[i+1] = v; d[i+2] = v; d[i+3] = 255;
-        }
-      } else if (ch === 'a') {
-        for (i = 0; i < len; i += 4) {
-          v = s[i+3]; d[i] = v; d[i+1] = v; d[i+2] = v; d[i+3] = 255;
-        }
-      }
-      ctx.putImageData(out, 0, 0);
-    }
-
-    document.querySelectorAll('.channel-btn').forEach(function(btn) {
-      btn.addEventListener('click', function() {
-        document.querySelectorAll('.channel-btn').forEach(function(b){ b.classList.remove('active'); });
-        btn.classList.add('active');
-        showChannel(btn.getAttribute('data-ch'));
-      });
-    });
-  })();
-  </script>
-</body></html>`;
-}
-
-function escapeHtml(text: string): string {
-    return text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
-}
-
-function getDrawCallDetailHtml(item: any): string {
-    return `<!DOCTYPE html>
-<html><head><style>
-  body { font-family: var(--vscode-font-family); color: var(--vscode-foreground); padding: 16px; }
-  table { border-collapse: collapse; width: 100%; }
-  th, td { text-align: left; padding: 8px; border-bottom: 1px solid var(--vscode-panel-border); }
-  th { color: var(--vscode-descriptionForeground); }
-  .header { font-size: 1.2em; margin-bottom: 16px; }
-</style></head><body>
-  <div class="header">Draw Call #${item.eventId ?? ''}</div>
-  <table>
-    <tr><th>Name</th><td>${item.label ?? ''}</td></tr>
-    <tr><th>Event ID</th><td>${item.eventId ?? ''}</td></tr>
-    <tr><th>Draw Index</th><td>${item.drawIndex ?? ''}</td></tr>
-    <tr><th>Num Indices</th><td>${item.numIndices ?? ''}</td></tr>
-    <tr><th>Num Instances</th><td>${item.numInstances ?? ''}</td></tr>
-    <tr><th>Flags</th><td>${item.flags ?? ''}</td></tr>
-  </table>
-</body></html>`;
-}
-
-function getResourceDetailHtml(detail: any): string {
-    if (!detail) {
-        return '<html><body>No detail available.</body></html>';
-    }
-    const rows = Object.entries(detail)
-        .map(([k, v]) => `<tr><th>${k}</th><td>${v}</td></tr>`)
-        .join('');
-    return `<!DOCTYPE html>
-<html><head><style>
-  body { font-family: var(--vscode-font-family); color: var(--vscode-foreground); padding: 16px; }
-  table { border-collapse: collapse; width: 100%; }
-  th, td { text-align: left; padding: 8px; border-bottom: 1px solid var(--vscode-panel-border); }
-  th { color: var(--vscode-descriptionForeground); width: 200px; }
-</style></head><body>
-  <table>${rows}</table>
-</body></html>`;
-}
-
-export function deactivate() {}
+// getTexturePreviewHtml lives in ./views/panelHtml.ts

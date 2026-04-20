@@ -24,8 +24,11 @@ jobs:
       - name: Install npm dependencies
         run: npm ci
 
-      - name: Compile TypeScript
-        run: npm run compile
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Bundle extension (production)
+        run: npm run package
 
       - name: Configure native bridge (CMake)
         working-directory: native

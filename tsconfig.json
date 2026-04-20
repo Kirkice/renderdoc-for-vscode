@@ -11,12 +11,12 @@
     "skipLibCheck": true,
     "forceConsistentCasingInFileNames": true,
     "resolveJsonModule": true,
-    "declaration": true,
-    "declarationMap": true
+    "noEmit": true
   },
   "exclude": [
     "node_modules",
     "out",
+    "dist",
     ".vscode-test",
     "scripts"
   ]

@@ -79,7 +79,16 @@ export class GetDrawCallsTool implements vscode.LanguageModelTool<GetDrawCallsIn
 }
 
 // ─── Tool: Get Resources ────────────────────────────────────────────────────
-interface GetResourcesInput { type?: string }
+interface GetResourcesInput {
+    type?: string;
+    /** Max entries to return. Defaults to 500. Set to 0 for unlimited (discouraged for large captures). */
+    limit?: number;
+    /** Offset for pagination. Defaults to 0. */
+    offset?: number;
+}
+
+/** Default cap — prevents dumping thousands of entries into a tool response. */
+const RESOURCES_DEFAULT_LIMIT = 500;
 
 export class GetResourcesTool implements vscode.LanguageModelTool<GetResourcesInput> {
     async invoke(
@@ -94,8 +103,25 @@ export class GetResourcesTool implements vscode.LanguageModelTool<GetResourcesIn
             resources = resources.filter(r => r.type.toLowerCase() === t);
         }
 
+        const total = resources.length;
+        const offset = Math.max(0, options.input?.offset ?? 0);
+        const rawLimit = options.input?.limit;
+        const limit = rawLimit === 0 ? total : (rawLimit ?? RESOURCES_DEFAULT_LIMIT);
+        const page = resources.slice(offset, offset + limit);
+        const truncated = page.length < total - offset;
+
+        const payload = {
+            total,
+            offset,
+            limit,
+            returned: page.length,
+            truncated,
+            nextOffset: truncated ? offset + page.length : null,
+            resources: page,
+        };
+
         return new vscode.LanguageModelToolResult([
-            new vscode.LanguageModelTextPart(JSON.stringify(resources, null, 2)),
+            new vscode.LanguageModelTextPart(JSON.stringify(payload, null, 2)),
         ]);
     }
 
@@ -187,8 +213,7 @@ export class GetPipelineStateTool implements vscode.LanguageModelTool<GetPipelin
         if (!_bridge.hasNativeBridge()) {
             return new vscode.LanguageModelToolResult([
                 new vscode.LanguageModelTextPart(
-                    'Pipeline state inspection requires the native RenderDoc bridge (renderdoc_bridge.exe). ' +
-                    'It is not yet available. Falling back to partial information from XML conversion.',
+                    'Pipeline state inspection requires an active local replay via the RenderDoc native bridge.',
                 ),
             ]);
         }
@@ -215,16 +240,10 @@ export class GetShaderSourceTool implements vscode.LanguageModelTool<GetShaderSo
         _token: vscode.CancellationToken,
     ): Promise<vscode.LanguageModelToolResult> {
         if (!_bridge.hasNativeBridge()) {
-            // Fallback: try to extract shaders from XML
-            const filePath = requireCapturePath();
-            const shaders = await _bridge.getShaderSourcesFromXml(filePath);
-            if (shaders.length === 0) {
-                return new vscode.LanguageModelToolResult([
-                    new vscode.LanguageModelTextPart('No shader sources found in the capture XML. Native bridge required for full shader access.'),
-                ]);
-            }
             return new vscode.LanguageModelToolResult([
-                new vscode.LanguageModelTextPart(JSON.stringify(shaders, null, 2)),
+                new vscode.LanguageModelTextPart(
+                    'Shader source requires an active local replay. The RenderDoc native bridge is not running.'
+                ),
             ]);
         }
 

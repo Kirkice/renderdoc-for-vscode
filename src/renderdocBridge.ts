@@ -3,8 +3,39 @@ import * as cp from 'child_process';
 import * as path from 'path';
 import * as fs from 'fs';
 import * as os from 'os';
+import { z } from 'zod';
 import { CaptureInfo, DrawCall, ResourceInfo, ResourceDetail, ThumbnailData } from './types';
 import { parseRdcFile } from './rdcParser';
+import { withTimeout } from './util/async';
+import {
+    GetRootActionsResponse,
+    GetResourcesResponse,
+    GetTexturesResponse,
+    GetShaderEntryPointsResponse,
+    GetShaderSourceResponse,
+    GetShaderSourceForEventResponse,
+    GetPipelineStateResponse,
+    GetTexturePreviewResponse,
+    OpenCaptureResponse,
+    TryReplayResponse,
+    validateResponse,
+    type TGetRootActionsResponse,
+    type TGetResourcesResponse,
+    type TGetTexturesResponse,
+    type TGetShaderEntryPointsResponse,
+    type TGetShaderSourceResponse,
+    type TGetShaderSourceForEventResponse,
+    type TGetPipelineStateResponse,
+    type TGetTexturePreviewResponse,
+    type TOpenCaptureResponse,
+    type TTryReplayResponse,
+} from './ipc/schemas';
+import { BridgeError } from './ipc/bridgeError';
+
+/** Default per-call timeout (ms) for native bridge requests. */
+const DEFAULT_NATIVE_CALL_TIMEOUT_MS = 30_000;
+/** Shorter timeout used for the lightweight `ping` health check. */
+const NATIVE_PING_TIMEOUT_MS = 2_000;
 
 // ─────────────────────────────────────────────────────────────────────
 // Native ActionDescription → DrawCall converter (preserves hierarchy)
@@ -53,8 +84,68 @@ function convertNativeActionToDrawCall(a: any): DrawCall {
 }
 
 /**
+ * Error message shown whenever a replay-dependent query is attempted but
+ * the native bridge / replay controller is not available. Kept as a single
+ * constant so the extension UI layer can match on it for user-facing hints.
+ */
+export const NATIVE_REPLAY_REQUIRED_MSG =
+    'Local replay is required for this operation. The RenderDoc native bridge ' +
+    'must be running and the capture must have been successfully replayed on this machine.';
+
+/**
+ * Mapping from RenderDoc's ResourceType enum (uint32) to the string labels
+ * used by `ResourceInfo.type`. Must stay in sync with
+ * native/include/renderdoc/replay_enums.h — enum class ResourceType.
+ */
+const RESOURCE_TYPE_NAMES: Record<number, string> = {
+    0: 'Unknown',
+    1: 'Device',
+    2: 'Queue',
+    3: 'CommandBuffer',
+    4: 'Texture',
+    5: 'Buffer',
+    6: 'View',
+    7: 'Sampler',
+    8: 'SwapchainImage',
+    9: 'Memory',
+    10: 'Shader',
+    11: 'ShaderBinding',
+    12: 'PipelineState',
+    13: 'StateObject',
+    14: 'RenderPass',
+    15: 'Query',
+    16: 'Sync',
+    17: 'Pool',
+    18: 'AccelerationStructure',
+    19: 'DescriptorStore',
+};
+
+/** Convert a native `ResourceDescription` (+ optional matching texture detail) to our `ResourceInfo`. */
+function nativeResourceToInfo(r: any, textures: Map<string, any>): ResourceInfo {
+    const id = String(r.resourceId ?? '');
+    const typeNum = typeof r.type === 'number' ? r.type : 0;
+    let typeStr = RESOURCE_TYPE_NAMES[typeNum] ?? 'Unknown';
+    const tex = textures.get(id);
+    if (tex) { typeStr = 'Texture'; }
+    return {
+        resourceId: id,
+        name: typeof r.name === 'string' ? r.name : '',
+        type: typeStr,
+        format: tex?.format ?? '',
+        width: tex?.width ?? 0,
+        height: tex?.height ?? 0,
+        depth: tex?.depth ?? 0,
+        arraySize: tex?.arraysize ?? 0,
+        mipLevels: tex?.mips ?? 0,
+        byteSize: 0,
+    };
+}
+
+/**
  * Bridge between the VS Code extension and RenderDoc.
- * Uses native binary parsing for metadata + renderdoccmd for thumbnails and XML conversion.
+ * Uses native binary parsing for RDC metadata and renderdoccmd for thumbnail
+ * extraction. All draw-call / resource / shader / pipeline queries require a
+ * live replay via the native bridge (renderdoc_bridge.exe + renderdoc.dll).
  * No Python dependency required.
  */
 export class RenderDocBridge {
@@ -146,33 +237,30 @@ export class RenderDocBridge {
         return parseRdcFile(filePath);
     }
 
-    /** Get draw calls – prefer the native bridge (hierarchical tree); fall back to flat XML parse. */
-    async getDrawCalls(filePath: string): Promise<DrawCall[]> {
-        if (this.hasNativeBridge()) {
-            try {
-                // NOTE: do NOT call nativeOpenCapture here — that tears down the
-                // active replay controller and for SuggestRemote (GLES etc.)
-                // captures it won't be re-established without a tryReplay call.
-                // loadCapture() already opened the capture; we just query it.
-                const native = await this.nativeGetRootActions();
-                if (native && Array.isArray(native.actions) && native.actions.length > 0) {
-                    console.log('[RenderDoc] getDrawCalls: using native tree,',
-                        native.actions.length, 'root action(s)');
-                    return native.actions.map((a: any) => convertNativeActionToDrawCall(a));
-                }
-                console.log('[RenderDoc] getDrawCalls: native returned empty, falling back to XML');
-            } catch (e: any) {
-                console.warn('[RenderDoc] native getDrawCalls failed, falling back to XML:', e?.message);
-            }
+    /** Get draw calls — requires the native bridge with an active replay. */
+    async getDrawCalls(_filePath: string): Promise<DrawCall[]> {
+        if (!this.hasNativeBridge()) {
+            throw new Error(NATIVE_REPLAY_REQUIRED_MSG);
         }
-        const xml = await this.convertToXml(filePath);
-        return this.parseDrawCallsFromXml(xml);
+        const native = await this.nativeGetRootActions();
+        return native.actions.map((a: any) => convertNativeActionToDrawCall(a));
     }
 
-    /** Get resource list by converting RDC → XML and parsing */
-    async getResources(filePath: string): Promise<ResourceInfo[]> {
-        const xml = await this.convertToXml(filePath);
-        return this.parseResourcesFromXml(xml);
+    /** Get resource list — requires the native bridge with an active replay. */
+    async getResources(_filePath: string): Promise<ResourceInfo[]> {
+        if (!this.hasNativeBridge()) {
+            throw new Error(NATIVE_REPLAY_REQUIRED_MSG);
+        }
+        const [resRes, texRes] = await Promise.all([
+            this.nativeCallT('getResources', GetResourcesResponse, {}),
+            this.nativeCallT('getTextures', GetTexturesResponse, {})
+                .catch((): TGetTexturesResponse => ({ textures: [], count: 0 })),
+        ]);
+        const textures = new Map<string, TGetTexturesResponse['textures'][number]>();
+        for (const t of texRes.textures) {
+            textures.set(String(t.resourceId), t);
+        }
+        return resRes.resources.map((r) => nativeResourceToInfo(r, textures));
     }
 
     /** Get capture thumbnail using renderdoccmd thumb */
@@ -205,200 +293,9 @@ export class RenderDocBridge {
         }
     }
 
-    /** Get detailed resource info (from XML) */
+    /** Get detailed resource info — requires native bridge. */
     async getResourceDetail(filePath: string, resourceId: string): Promise<ResourceDetail> {
-        const xml = await this.convertToXml(filePath);
-        return this.parseResourceDetailFromXml(xml, resourceId);
-    }
-
-    // --- XML conversion and parsing ---
-
-    /** Cache for XML conversion (avoid re-converting the same file) */
-    private xmlCache: { filePath: string; xml: string } | undefined;
-
-    /** Convert RDC to XML via renderdoccmd convert */
-    private async convertToXml(filePath: string): Promise<string> {
-        // Return cached if same file
-        if (this.xmlCache && this.xmlCache.filePath === filePath) {
-            return this.xmlCache.xml;
-        }
-
-        const tmpFile = path.join(os.tmpdir(), `rdcxml_${Date.now()}.xml`);
-        try {
-            await this.runCmd(['convert', '-f', filePath, '-o', tmpFile, '-c', 'xml']);
-            const xml = await fs.promises.readFile(tmpFile, 'utf-8');
-            this.xmlCache = { filePath, xml };
-            return xml;
-        } finally {
-            try { await fs.promises.unlink(tmpFile); } catch {}
-        }
-    }
-
-    /** Parse draw calls from the XML output */
-    private parseDrawCallsFromXml(xml: string): DrawCall[] {
-        const drawCalls: DrawCall[] = [];
-        // Match chunk elements that are draw/clear/dispatch calls
-        const chunkRegex = /<chunk\s[^>]*name="([^"]*)"[^>]*chunkIndex="(\d+)"[^>]*>([\s\S]*?)<\/chunk>/g;
-        const chunkRegex2 = /<chunk\s[^>]*chunkIndex="(\d+)"[^>]*name="([^"]*)"[^>]*>([\s\S]*?)<\/chunk>/g;
-
-        // Collect all chunks
-        const allChunks: Array<{ chunkIndex: number; name: string; body: string }> = [];
-        let match: RegExpExecArray | null;
-
-        // Handle varying attribute order
-        const genericChunkRegex = /<chunk\s([^>]*)>([\s\S]*?)<\/chunk>/g;
-        while ((match = genericChunkRegex.exec(xml)) !== null) {
-            const attrs = match[1];
-            const body = match[2];
-            const nameMatch = attrs.match(/name="([^"]*)"/);
-            const indexMatch = attrs.match(/chunkIndex="(\d+)"/);
-            if (nameMatch && indexMatch) {
-                allChunks.push({
-                    chunkIndex: parseInt(indexMatch[1], 10),
-                    name: nameMatch[1],
-                    body,
-                });
-            }
-        }
-
-        // Filter for draw/clear/dispatch/present-related calls
-        const drawCallPatterns = /^(gl|vk|ID3D|dx|Draw|Clear|Dispatch|Present|cmdDraw|cmdClear|cmdDispatch|CmdDraw|CmdClear|CmdDispatch)/i;
-        const isDrawLike = (name: string): boolean => {
-            const lower = name.toLowerCase();
-            return lower.includes('draw') ||
-                   lower.includes('clear') ||
-                   lower.includes('dispatch') ||
-                   lower.includes('present') ||
-                   lower.includes('blit');
-        };
-
-        let eventId = 0;
-        let drawIndex = 0;
-        for (const chunk of allChunks) {
-            if (!isDrawLike(chunk.name)) { continue; }
-
-            // Extract count/indices info from body
-            let numIndices = 0;
-            let numInstances = 1;
-            const countMatch = chunk.body.match(/name="count"[^>]*>(\d+)</);
-            if (countMatch) { numIndices = parseInt(countMatch[1], 10); }
-            const instanceMatch = chunk.body.match(/name="instancecount"[^>]*>(\d+)</i) ||
-                                  chunk.body.match(/name="primcount"[^>]*>(\d+)</i);
-            if (instanceMatch) { numInstances = parseInt(instanceMatch[1], 10); }
-
-            // Determine flags
-            let flags = '';
-            const nameLower = chunk.name.toLowerCase();
-            if (nameLower.includes('draw')) { flags = 'Drawcall'; }
-            else if (nameLower.includes('clear')) { flags = 'Clear'; }
-            else if (nameLower.includes('dispatch')) { flags = 'Dispatch'; }
-            else if (nameLower.includes('present') || nameLower.includes('blit')) { flags = 'Present'; }
-
-            drawCalls.push({
-                eventId: chunk.chunkIndex,
-                drawIndex: drawIndex++,
-                name: chunk.name,
-                flags,
-                numIndices,
-                numInstances,
-                children: [],
-            });
-        }
-
-        return drawCalls;
-    }
-
-    /** Parse resources from the XML output */
-    private parseResourcesFromXml(xml: string): ResourceInfo[] {
-        const resources: ResourceInfo[] = [];
-        const seenIds = new Set<string>();
-
-        // Parse all chunks
-        const genericChunkRegex = /<chunk\s([^>]*)>([\s\S]*?)<\/chunk>/g;
-        let match: RegExpExecArray | null;
-
-        // Track texture/buffer creation
-        const textures = new Map<string, ResourceInfo>();
-        const buffers = new Map<string, ResourceInfo>();
-
-        while ((match = genericChunkRegex.exec(xml)) !== null) {
-            const attrs = match[1];
-            const body = match[2];
-            const nameMatch = attrs.match(/name="([^"]*)"/);
-            if (!nameMatch) { continue; }
-            const chunkName = nameMatch[1].toLowerCase();
-
-            // Texture creation (glTexStorage2D, glTexStorage3D, etc.)
-            if (chunkName.includes('texstorage') || chunkName.includes('teximage')) {
-                const idMatch = body.match(/<ResourceId[^>]*>(\d+)<\/ResourceId>/);
-                if (idMatch && !seenIds.has(idMatch[1])) {
-                    seenIds.add(idMatch[1]);
-                    const width = this.extractXmlValue(body, 'width', 'int|uint') || 0;
-                    const height = this.extractXmlValue(body, 'height', 'int|uint') || 0;
-                    const depth = this.extractXmlValue(body, 'depth', 'int|uint') || 1;
-                    const format = this.extractXmlStringValue(body, 'internalformat') ||
-                                   this.extractXmlStringValue(body, 'internalFormat') || '';
-
-                    textures.set(idMatch[1], {
-                        resourceId: idMatch[1],
-                        name: '',
-                        type: 'Texture',
-                        format,
-                        width,
-                        height,
-                        depth,
-                        arraySize: 1,
-                        mipLevels: this.extractXmlValue(body, 'levels', 'int|uint') || 1,
-                        byteSize: 0,
-                    });
-                }
-            }
-
-            // Buffer creation (glBufferData, etc.)
-            if (chunkName.includes('bufferdata') || chunkName.includes('bufferstorage')) {
-                const idMatch = body.match(/<ResourceId[^>]*>(\d+)<\/ResourceId>/);
-                if (idMatch && !seenIds.has(idMatch[1])) {
-                    seenIds.add(idMatch[1]);
-                    const size = this.extractXmlValue(body, 'size', 'int|uint') || 0;
-
-                    buffers.set(idMatch[1], {
-                        resourceId: idMatch[1],
-                        name: '',
-                        type: 'Buffer',
-                        format: '',
-                        width: 0,
-                        height: 0,
-                        depth: 0,
-                        arraySize: 0,
-                        mipLevels: 0,
-                        byteSize: size,
-                    });
-                }
-            }
-
-            // Object labels (glObjectLabel)
-            if (chunkName.includes('objectlabel') || chunkName.includes('debugname')) {
-                const idMatch = body.match(/<ResourceId[^>]*>(\d+)<\/ResourceId>/);
-                const labelMatch = body.match(/<string[^>]*name="Label"[^>]*>([^<]*)<\/string>/i) ||
-                                   body.match(/<string[^>]*name="[^"]*"[^>]*>([^<]*)<\/string>/);
-                if (idMatch && labelMatch) {
-                    const rid = idMatch[1];
-                    const label = labelMatch[1];
-                    if (textures.has(rid)) { textures.get(rid)!.name = label; }
-                    if (buffers.has(rid)) { buffers.get(rid)!.name = label; }
-                }
-            }
-        }
-
-        resources.push(...textures.values());
-        resources.push(...buffers.values());
-        return resources;
-    }
-
-    /** Parse resource detail from XML */
-    private parseResourceDetailFromXml(xml: string, resourceId: string): ResourceDetail {
-        // First get the basic resource info
-        const resources = this.parseResourcesFromXml(xml);
+        const resources = await this.getResources(filePath);
         const resource = resources.find(r => r.resourceId === resourceId);
         if (!resource) {
             throw new Error(`Resource ${resourceId} not found.`);
@@ -409,20 +306,6 @@ export class RenderDocBridge {
             usage: [],
             bindFlags: [],
         };
-    }
-
-    /** Extract a numeric value from XML body */
-    private extractXmlValue(body: string, name: string, typePattern: string): number {
-        const regex = new RegExp(`<(?:${typePattern})[^>]*name="${name}"[^>]*>(\\d+)<`, 'i');
-        const match = body.match(regex);
-        return match ? parseInt(match[1], 10) : 0;
-    }
-
-    /** Extract a string attribute value from XML enum body */
-    private extractXmlStringValue(body: string, name: string): string {
-        const regex = new RegExp(`name="${name}"[^>]*string="([^"]*)"`, 'i');
-        const match = body.match(regex);
-        return match ? match[1] : '';
     }
 
     // --- renderdoccmd execution ---
@@ -476,7 +359,7 @@ export class RenderDocBridge {
 
     private nativeProcess: cp.ChildProcess | undefined;
     private nativeRequestId = 0;
-    private nativePendingRequests = new Map<number, { resolve: (v: any) => void; reject: (e: Error) => void }>();
+    private nativePendingRequests = new Map<number, { method: string; resolve: (v: unknown) => void; reject: (e: BridgeError) => void }>();
     private nativeOutputBuffer = '';
 
     /** Check if native bridge is running */
@@ -511,33 +394,45 @@ export class RenderDocBridge {
         if (!bridgePath) { return; }
 
         try {
-            this.nativeProcess = cp.spawn(bridgePath, [], {
+            const child = cp.spawn(bridgePath, [], {
                 stdio: ['pipe', 'pipe', 'pipe'],
                 env: { ...process.env },
             });
-            console.log('[RenderDoc] Native bridge spawned, pid:', this.nativeProcess.pid);
+            this.nativeProcess = child;
+            console.log('[RenderDoc] Native bridge spawned, pid:', child.pid);
 
-            this.nativeProcess.stdout?.on('data', (data: Buffer) => {
+            child.stdout?.on('data', (data: Buffer) => {
+                // Only process output from the current bridge. Stale data from
+                // a previously-killed bridge (during a restart) must be ignored
+                // so it doesn't corrupt the new bridge's response stream.
+                if (this.nativeProcess !== child) { return; }
                 this.nativeOutputBuffer += data.toString();
                 this.processNativeOutput();
             });
 
-            this.nativeProcess.stderr?.on('data', (data: Buffer) => {
+            child.stderr?.on('data', (data: Buffer) => {
                 console.log('[RenderDoc] bridge stderr:', data.toString().trim());
             });
 
-            this.nativeProcess.on('exit', (code) => {
-                console.log('[RenderDoc] Native bridge exited with code:', code);
+            child.on('exit', (code) => {
+                console.log('[RenderDoc] Native bridge exited with code:', code, 'pid:', child.pid);
+                // Only clear state if this is still the active process.
+                // During a restart the old process's exit fires AFTER the new
+                // one has already been spawned — without this guard it would
+                // clobber the new `nativeProcess` reference and any pending
+                // requests queued against the new bridge.
+                if (this.nativeProcess !== child) { return; }
                 this.nativeProcess = undefined;
                 // Reject all pending requests
                 for (const [, pending] of this.nativePendingRequests) {
-                    pending.reject(new Error('Native bridge process exited'));
+                    pending.reject(new BridgeError('exited', 'Native bridge process exited', { method: pending.method }));
                 }
                 this.nativePendingRequests.clear();
             });
 
-            this.nativeProcess.on('error', (err) => {
+            child.on('error', (err) => {
                 console.error('[RenderDoc] Native bridge spawn error:', err.message);
+                if (this.nativeProcess !== child) { return; }
                 this.nativeProcess = undefined;
             });
 
@@ -557,7 +452,7 @@ export class RenderDocBridge {
             this.nativeProcess = undefined;
         }
         for (const [, pending] of this.nativePendingRequests) {
-            pending.reject(new Error('Native bridge restarting'));
+            pending.reject(new BridgeError('restarting', 'Native bridge restarting', { method: pending.method }));
         }
         this.nativePendingRequests.clear();
         this.nativeOutputBuffer = '';
@@ -606,7 +501,11 @@ export class RenderDocBridge {
                     const pending = this.nativePendingRequests.get(msg.id)!;
                     this.nativePendingRequests.delete(msg.id);
                     if (msg.error) {
-                        pending.reject(new Error(msg.error.message || 'Unknown native bridge error'));
+                        pending.reject(new BridgeError(
+                            'remote',
+                            msg.error.message || 'Unknown native bridge error',
+                            { method: pending.method, code: msg.error.code },
+                        ));
                     } else {
                         pending.resolve(msg.result);
                     }
@@ -618,30 +517,91 @@ export class RenderDocBridge {
     }
 
     /** Send a JSON-RPC style request to the native bridge */
-    private nativeCall(method: string, params: any = {}): Promise<any> {
-        return new Promise((resolve, reject) => {
+    private nativeCall(method: string, params: any = {}, timeoutMs?: number): Promise<unknown> {
+        return new Promise<unknown>((resolve, reject) => {
             if (!this.nativeProcess || !this.nativeProcess.stdin) {
-                reject(new Error('Native bridge not available'));
+                reject(new BridgeError('unavailable', 'Native bridge not available', { method }));
                 return;
             }
             const id = ++this.nativeRequestId;
             const msg = JSON.stringify({ id, method, params }) + '\n';
-            this.nativePendingRequests.set(id, { resolve, reject });
-            this.nativeProcess.stdin.write(msg, (err) => {
-                if (err) {
-                    this.nativePendingRequests.delete(id);
-                    reject(err);
-                }
-            });
 
-            // Timeout after 30 seconds
-            setTimeout(() => {
+            // Resolve timeout: explicit arg > user setting > default.
+            const configured = vscode.workspace.getConfiguration('renderdoc')
+                .get<number>('nativeBridge.callTimeoutMs');
+            const ms = timeoutMs
+                ?? (typeof configured === 'number' && configured > 0 ? configured : DEFAULT_NATIVE_CALL_TIMEOUT_MS);
+
+            // Wire up the timeout first so we can cancel it on success.
+            const timer = setTimeout(() => {
                 if (this.nativePendingRequests.has(id)) {
                     this.nativePendingRequests.delete(id);
-                    reject(new Error(`Native bridge call '${method}' timed out`));
+                    reject(new BridgeError(
+                        'timeout',
+                        `Native bridge call '${method}' timed out after ${ms}ms`,
+                        { method },
+                    ));
                 }
-            }, 30000);
+            }, ms);
+
+            this.nativePendingRequests.set(id, {
+                method,
+                resolve: (v) => { clearTimeout(timer); resolve(v); },
+                reject:  (e) => { clearTimeout(timer); reject(e); },
+            });
+
+            this.nativeProcess.stdin.write(msg, (err) => {
+                if (err) {
+                    clearTimeout(timer);
+                    this.nativePendingRequests.delete(id);
+                    reject(new BridgeError('io', `stdin write failed: ${err.message}`, { method, cause: err }));
+                }
+            });
         });
+    }
+
+    /**
+     * Typed + validated variant of `nativeCall`. The response is parsed
+     * against a Zod schema before being returned; malformed responses throw
+     * with a message that names the failing path(s). Use this in preference
+     * to the raw `nativeCall` anywhere the response shape is known.
+     */
+    private async nativeCallT<T>(
+        method: string,
+        schema: z.ZodType<T>,
+        params: any = {},
+        timeoutMs?: number,
+    ): Promise<T> {
+        const raw = await this.nativeCall(method, params, timeoutMs);
+        return validateResponse(schema, raw, method);
+    }
+
+    /**
+     * Lightweight health check for the native bridge.
+     *
+     * `hasNativeBridge()` only checks process liveness, which doesn't catch
+     * a deadlocked replay controller. `ping()` issues a real round-trip with
+     * a short timeout so callers can verify the bridge is actually responsive.
+     *
+     * Treats ANY response from the bridge as "alive" (including an error
+     * response for unknown methods) — we only need a round-trip. Only a
+     * timeout or a dead process count as unhealthy.
+     */
+    async nativePing(): Promise<boolean> {
+        if (!this.hasNativeBridge()) { return false; }
+        try {
+            await this.nativeCall('ping', {}, NATIVE_PING_TIMEOUT_MS);
+            return true;
+        } catch (e: any) {
+            const msg = String(e?.message ?? '');
+            // Timeout or process-gone mean the bridge is unhealthy. Any other
+            // error (e.g. "Unknown method 'ping'") still proves the bridge
+            // responded and is therefore alive.
+            if (msg.includes('timed out') || msg.includes('not available') || msg.includes('exited')) {
+                return false;
+            }
+            return true;
+        }
     }
 
     /** Open a capture in the native replay controller */
@@ -675,36 +635,56 @@ export class RenderDocBridge {
     }
 
     // ═══════════════════════════════════════════════════════════════════
-    //  XML-based shader source extraction (fallback without native)
+    //  High-level: list every shader resource in the capture (name + source).
+    //  Requires a live replay — iterates native getResources → filter Shaders
+    //  → getShaderEntryPoints → getShaderSource for each entry.
     // ═══════════════════════════════════════════════════════════════════
 
-    /** Extract shader sources from XML conversion (e.g. glShaderSource chunks) */
-    async getShaderSourcesFromXml(filePath: string): Promise<Array<{ name: string; source: string }>> {
-        const xml = await this.convertToXml(filePath);
-        const shaders: Array<{ name: string; source: string }> = [];
+    async getAllShaders(): Promise<Array<{ name: string; source: string }>> {
+        if (!this.hasNativeBridge()) {
+            throw new Error(NATIVE_REPLAY_REQUIRED_MSG);
+        }
+        const resRes = await this.nativeCallT('getResources', GetResourcesResponse, {});
+        const shaders = resRes.resources.filter((r) => RESOURCE_TYPE_NAMES[r.type] === 'Shader');
 
-        const genericChunkRegex = /<chunk\s([^>]*)>([\s\S]*?)<\/chunk>/g;
-        let match: RegExpExecArray | null;
-
-        while ((match = genericChunkRegex.exec(xml)) !== null) {
-            const attrs = match[1];
-            const body = match[2];
-            const nameMatch = attrs.match(/name="([^"]*)"/);
-            if (!nameMatch) { continue; }
-
-            const chunkName = nameMatch[1].toLowerCase();
-            if (chunkName.includes('shadersource') || chunkName.includes('createshader')) {
-                // Extract the source string
-                const sourceMatch = body.match(/<string[^>]*>([\s\S]*?)<\/string>/);
-                if (sourceMatch && sourceMatch[1].trim().length > 10) {
-                    shaders.push({
-                        name: nameMatch[1],
-                        source: sourceMatch[1].trim(),
-                    });
+        const out: Array<{ name: string; source: string }> = [];
+        for (const s of shaders) {
+            const rid = s.resourceId;
+            if (rid === undefined || rid === null) { continue; }
+            let entries: TGetShaderEntryPointsResponse['entryPoints'] = [];
+            try {
+                const epRes = await this.nativeCallT('getShaderEntryPoints', GetShaderEntryPointsResponse, { resourceId: rid });
+                entries = epRes.entryPoints;
+            } catch {
+                continue;
+            }
+            if (entries.length === 0) {
+                // Some APIs have no explicit entry points; try a default one.
+                entries = [{ name: 'main', stage: 0 }];
+            }
+            for (const ep of entries) {
+                try {
+                    const src: TGetShaderSourceResponse = await this.nativeCallT(
+                        'getShaderSource',
+                        GetShaderSourceResponse,
+                        { resourceId: rid, entryPoint: ep.name, stage: ep.stage },
+                    );
+                    // Prefer reflection source files; fall back to disassembly if present.
+                    let source = '';
+                    if (src.sourceFiles && src.sourceFiles.length > 0) {
+                        source = src.sourceFiles.map((f) => f.contents ?? '').join('\n\n');
+                    } else if (typeof src.disassembly === 'string') {
+                        source = src.disassembly;
+                    }
+                    if (source.trim().length > 0) {
+                        const label = s.name || `shader_${rid}`;
+                        out.push({ name: `${label} [${ep.name}]`, source });
+                    }
+                } catch {
+                    // Skip shaders we can't decode.
                 }
             }
         }
-
-        return shaders;
+        return out;
     }
 }
