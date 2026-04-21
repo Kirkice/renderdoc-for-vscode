@@ -4,6 +4,11 @@
   "description": "View and analyze RenderDoc capture (.rdc) files in VS Code",
   "version": "0.0.1",
   "publisher": "Kirkice",
+  "icon": "logo.png",
+  "galleryBanner": {
+    "color": "#1E1E1E",
+    "theme": "dark"
+  },
   "repository": {
     "type": "git",
     "url": "https://github.com/Kirkice/renderdoc-for-vscode.git"
@@ -261,6 +266,12 @@
         "icon": "$(window)"
       },
       {
+        "command": "renderdoc.showDrawcallOverlay",
+        "title": "Highlight Draw Call",
+        "category": "RenderDoc",
+        "icon": "$(eye)"
+      },
+      {
         "command": "renderdoc.showDrawCallDetails",
         "title": "Show Draw Call Details",
         "category": "RenderDoc"
@@ -311,6 +322,12 @@
         "title": "Download Native Bridge…",
         "category": "RenderDoc",
         "icon": "$(cloud-download)"
+      },
+      {
+        "command": "renderdoc.clearCache",
+        "title": "Clear Capture Cache",
+        "category": "RenderDoc",
+        "icon": "$(clear-all)"
       }
     ],
     "viewsContainers": {
@@ -330,7 +347,11 @@
         },
         {
           "id": "renderdoc-drawCalls",
-          "name": "Draw Calls"
+          "name": "Event Browser"
+        },
+        {
+          "id": "renderdoc-apiInspector",
+          "name": "API Inspector"
         },
         {
           "id": "renderdoc-resources",
@@ -367,9 +388,19 @@
           "group": "navigation"
         },
         {
+          "command": "renderdoc.clearCache",
+          "when": "view == renderdoc-captureInfo",
+          "group": "navigation@9"
+        },
+        {
           "command": "renderdoc.openInspector",
           "when": "view == renderdoc-drawCalls",
           "group": "navigation@0"
+        },
+        {
+          "command": "renderdoc.showDrawcallOverlay",
+          "when": "view == renderdoc-drawCalls",
+          "group": "navigation@1"
         },
         {
           "command": "renderdoc.viewAllShaders",

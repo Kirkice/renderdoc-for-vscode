@@ -53,6 +53,14 @@ export interface MsgShowResourceDetails {
     label?: string;
 }
 
+export interface MsgRequestMesh {
+    type: 'requestMesh';
+    eventId: number;
+    stage: 'vsin' | 'vsout' | 'gsout';
+    maxVertices?: number;
+    instance?: number;
+}
+
 export type WebviewToExtensionMessage =
     | MsgReady
     | MsgSelectEvent
@@ -60,7 +68,8 @@ export type WebviewToExtensionMessage =
     | MsgOpenShaderInEditor
     | MsgCopyToClipboard
     | MsgExportTexture
-    | MsgShowResourceDetails;
+    | MsgShowResourceDetails
+    | MsgRequestMesh;
 
 // ───────────────────────────── Extension → Webview ─────────────────────────────
 
@@ -112,9 +121,17 @@ export interface MsgTexturePreview {
     error?: string;
 }
 
+export interface MsgMeshLoaded {
+    type: 'meshLoaded';
+    key: string;
+    data?: unknown;
+    error?: string;
+}
+
 export type ExtensionToWebviewMessage =
     | MsgCaptureLoaded
     | MsgEventChanged
     | MsgShadersLoaded
     | MsgPipelineLoaded
-    | MsgTexturePreview;
+    | MsgTexturePreview
+    | MsgMeshLoaded;

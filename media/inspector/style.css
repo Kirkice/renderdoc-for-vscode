@@ -247,6 +247,12 @@
             color: var(--vscode-tab-activeForeground);
             border-color: var(--vscode-panel-border);
         }
+        .shader-file-tabs {
+            flex-wrap: wrap;
+            padding: 2px 6px 4px;
+            border-bottom: 1px solid var(--vscode-panel-border);
+        }
+        .shader-file-tab { font-size: 0.78em; padding: 2px 8px; }
         .code-view {
             font-family: var(--vscode-editor-font-family);
             font-size: var(--vscode-editor-font-size, 13px);
@@ -267,6 +273,59 @@
             gap: 12px;
         }
         .tex-grid.empty-state { display: flex; }
+
+        /* Current-draw RT preview (on top of Texture Viewer tab) */
+        .tex-current {
+            background: var(--vscode-sideBar-background);
+            border: 1px solid var(--vscode-panel-border);
+            border-radius: 4px;
+            margin-bottom: 12px;
+            overflow: hidden;
+        }
+        .tex-current.empty-state {
+            padding: 24px 12px;
+            color: var(--vscode-descriptionForeground);
+            text-align: center;
+        }
+        .tex-current-header {
+            display: flex; align-items: center; gap: 10px;
+            padding: 6px 10px;
+            background: var(--vscode-editorGroupHeader-tabsBackground, var(--vscode-sideBar-background));
+            border-bottom: 1px solid var(--vscode-panel-border);
+            font-size: 0.9em;
+        }
+        .tex-current-label {
+            font-weight: 600;
+            color: var(--vscode-textLink-foreground);
+        }
+        .tex-current-name {
+            font-family: var(--vscode-editor-font-family);
+            overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+            flex: 1;
+        }
+        .tex-current-meta {
+            color: var(--vscode-descriptionForeground);
+            font-family: var(--vscode-editor-font-family);
+            font-size: 0.9em;
+        }
+        .tex-current-open { margin-left: auto; }
+        .tex-current-preview {
+            min-height: 180px;
+            max-height: 480px;
+            display: flex; align-items: center; justify-content: center;
+            padding: 8px;
+            background:
+                linear-gradient(45deg, #1e1e1e 25%, transparent 25%) 0 0 / 16px 16px,
+                linear-gradient(-45deg, #1e1e1e 25%, transparent 25%) 0 8px / 16px 16px,
+                linear-gradient(45deg, transparent 75%, #1e1e1e 75%) 8px -8px / 16px 16px,
+                linear-gradient(-45deg, transparent 75%, #1e1e1e 75%) 8px 0 / 16px 16px,
+                #2a2a2a;
+        }
+        .tex-current-preview img {
+            max-width: 100%; max-height: 460px;
+            object-fit: contain;
+            image-rendering: pixelated;
+        }
         .tex-card {
             background: var(--vscode-sideBar-background);
             border: 1px solid var(--vscode-panel-border);
@@ -361,5 +420,93 @@
             border-right: 1px solid var(--vscode-panel-border);
         }
         .channel-toggle .ch:last-child { border-right: none; }
+
+        /* Mesh View */
+        .mesh-table-wrap {
+            overflow: auto;
+            height: 100%;
+            padding: 0;
+        }
+        .mesh-table {
+            border-collapse: collapse;
+            font-family: var(--vscode-editor-font-family, monospace);
+            font-size: 0.82em;
+            white-space: nowrap;
+            min-width: 100%;
+        }
+        .mesh-table th, .mesh-table td {
+            padding: 2px 8px;
+            border-right: 1px solid var(--vscode-panel-border);
+            border-bottom: 1px solid var(--vscode-panel-border);
+            text-align: right;
+        }
+        .mesh-table thead th {
+            position: sticky; top: 0; z-index: 1;
+            background: var(--vscode-editorWidget-background, var(--vscode-sideBar-background));
+            font-weight: normal;
+        }
+        .mesh-table thead th.mesh-col-attr {
+            text-align: center;
+            color: var(--vscode-textLink-foreground);
+        }
+        .mesh-table thead th.mesh-col-sub { color: var(--vscode-descriptionForeground); font-size: 0.92em; }
+        .mesh-table thead th.mesh-col-num { background: var(--vscode-sideBar-background); }
+        .mesh-table tbody tr:nth-child(even) { background: rgba(255,255,255,0.025); }
+        .mesh-table tbody tr:hover { background: var(--vscode-list-hoverBackground); }
+        .mesh-table tbody tr.restart td { color: var(--vscode-descriptionForeground); font-style: italic; }
+        .mesh-table td.num { color: var(--vscode-descriptionForeground); }
+
+        /* Mesh preview */
+        .mesh-split {
+            display: flex;
+            flex-direction: row;
+            height: 100%;
+            min-height: 0;
+        }
+        #tab-mesh { display: flex; flex-direction: column; }
+        #tab-mesh .mesh-split { flex: 1; min-height: 0; }
+        .mesh-split .mesh-table-wrap {
+            flex: 1 1 55%;
+            min-width: 0;
+            border-right: 1px solid var(--vscode-panel-border);
+        }
+        .mesh-preview-pane {
+            flex: 1 1 45%;
+            min-width: 0;
+            position: relative;
+            background: #111;
+            overflow: hidden;
+        }
+        .mesh-preview-pane.hidden { display: none; }
+        .mesh-preview-pane canvas {
+            display: block;
+            width: 100%;
+            height: 100%;
+            cursor: grab;
+        }
+        .mesh-preview-pane canvas:active { cursor: grabbing; }
+        .mesh-preview-hint {
+            position: absolute;
+            left: 8px; bottom: 6px;
+            font-size: 0.75em;
+            color: var(--vscode-descriptionForeground);
+            pointer-events: none;
+            background: rgba(0,0,0,0.35);
+            padding: 2px 6px;
+            border-radius: 3px;
+        }
         .channel-toggle .ch.active { background: var(--vscode-button-background); color: var(--vscode-button-foreground); }
     
+        /* Resource Inspector */
+        .resource-list { padding: 8px 12px; }
+        .resource-list.empty-state { display: flex; align-items: center; justify-content: center; color: var(--vscode-descriptionForeground); }
+        .res-table { width: 100%; border-collapse: collapse; font-size: 0.88em; }
+        .res-table thead th {
+            text-align: left; padding: 6px 8px;
+            border-bottom: 1px solid var(--vscode-panel-border);
+            color: var(--vscode-descriptionForeground); font-weight: 600;
+            position: sticky; top: 0; background: var(--vscode-editor-background); z-index: 1;
+        }
+        .res-table tbody td { padding: 4px 8px; border-bottom: 1px solid var(--vscode-panel-border); }
+        .res-table tbody tr:hover { background: var(--vscode-list-hoverBackground); cursor: pointer; }
+        .res-table .mono { font-family: var(--vscode-editor-font-family); }

@@ -5,17 +5,15 @@ import { RenderDocBridge } from './renderdocBridge';
 import { CaptureInfo, DrawCall, ResourceInfo } from './types';
 import { CaptureInfoProvider } from './views/captureInfoProvider';
 import { DrawCallProvider } from './views/drawCallProvider';
+import { ApiInspectorProvider } from './views/apiInspectorProvider';
 import { ResourceProvider } from './views/resourceProvider';
 import { ThumbnailPanel } from './views/thumbnailPanel';
 import { InspectorPanel } from './views/inspectorPanel';
+import { DrawOverlayPanel } from './views/drawOverlayPanel';
 import { initTools, registerAllTools } from './copilot/tools';
 import { initChatParticipant, registerChatParticipant } from './copilot/chatParticipant';
 import { ensureNativeBridge } from './bridgeInstaller';
-import {
-    checkAngleAvailability,
-    findAngleSources,
-    installAngleDlls,
-} from './commands/angle';
+import { CaptureCache, formatBytes } from './util/captureCache';
 import {
     getShaderPanelHtml,
     getPipelineStateHtml,
@@ -23,8 +21,10 @@ import {
 } from './views/panelHtml';
 
 let bridge: RenderDocBridge;
+let captureCache: CaptureCache;
 let captureInfoProvider: CaptureInfoProvider;
 let drawCallProvider: DrawCallProvider;
+let apiInspectorProvider: ApiInspectorProvider;
 let resourceProvider: ResourceProvider;
 let currentCapturePath: string | undefined;
 
@@ -40,6 +40,7 @@ let bridgeLoadedCapturePath: string | undefined;
 
 export async function activate(context: vscode.ExtensionContext) {
     bridge = new RenderDocBridge();
+    captureCache = new CaptureCache(context);
 
     // Check RenderDoc availability on startup
     const available = await bridge.checkAvailability();
@@ -69,6 +70,7 @@ export async function activate(context: vscode.ExtensionContext) {
     // Register TreeView providers
     captureInfoProvider = new CaptureInfoProvider();
     drawCallProvider = new DrawCallProvider();
+    apiInspectorProvider = new ApiInspectorProvider(bridge);
     resourceProvider = new ResourceProvider();
 
     // Use createTreeView to get selection change events for Copilot context
@@ -92,6 +94,17 @@ export async function activate(context: vscode.ExtensionContext) {
             if (InspectorPanel.currentPanel && typeof currentSelectedDrawCall?.eventId === 'number') {
                 InspectorPanel.currentPanel.setEvent(currentSelectedDrawCall.eventId, item.drawCall);
             }
+            // Populate the sidebar API Inspector with this event's chunks.
+            if (typeof currentSelectedDrawCall?.eventId === 'number') {
+                const label = typeof item.label === 'string' ? item.label : item.label?.label;
+                apiInspectorProvider.setEvent(currentSelectedDrawCall.eventId, label).catch(() => {});
+            }
+            // Drive the drawcall-overlay panel too, so clicking a draw call
+            // reveals its geometry highlight just like RenderDoc desktop.
+            if (DrawOverlayPanel.currentPanel && typeof currentSelectedDrawCall?.eventId === 'number') {
+                const label = typeof item.label === 'string' ? item.label : item.label?.label;
+                DrawOverlayPanel.currentPanel.showEvent(currentSelectedDrawCall.eventId, label).catch(() => {});
+            }
         }
     });
     resourceTreeView.onDidChangeSelection(e => {
@@ -108,6 +121,7 @@ export async function activate(context: vscode.ExtensionContext) {
 
     context.subscriptions.push(
         vscode.window.registerTreeDataProvider('renderdoc-captureInfo', captureInfoProvider),
+        vscode.window.registerTreeDataProvider('renderdoc-apiInspector', apiInspectorProvider),
         drawCallTreeView,
         resourceTreeView
     );
@@ -148,10 +162,16 @@ export async function activate(context: vscode.ExtensionContext) {
             await context.globalState.update('renderdoc.skipBridgePrompt', false);
             await ensureNativeBridge(context, bridge);
         }),
-        vscode.commands.registerCommand('renderdoc.openInspector', () => openInspector(context))
-    );
-
-    // ── Copilot integration (non-critical, don't break extension if unavailable) ──
+        vscode.commands.registerCommand('renderdoc.clearCache', () => clearCaptureCache()),
+        vscode.commands.registerCommand('renderdoc.openInspector', () => openInspector(context)),
+        vscode.commands.registerCommand('renderdoc.showDrawcallOverlay', async () => {
+            await DrawOverlayPanel.createOrShow(context, bridge);
+            const sel = currentSelectedDrawCall;
+            if (DrawOverlayPanel.currentPanel && sel && typeof sel.eventId === 'number') {
+                DrawOverlayPanel.currentPanel.showEvent(sel.eventId, sel.label).catch(() => {});
+            }
+        }),
+    );    // ── Copilot integration (non-critical, don't break extension if unavailable) ──
     try {
         const getCapturePath = () => currentCapturePath;
         const getSelectionContext = () => ({
@@ -216,6 +236,38 @@ async function loadCapture(context: vscode.ExtensionContext, filePath: string, s
     console.log('[RenderDoc] loadCapture called:', filePath, 'silent:', silent);
     console.log('[RenderDoc] hasNativeBridge:', bridge.hasNativeBridge());
 
+    // ── Fast path: serve from cache ──────────────────────────────────────
+    // If we've previously loaded this exact rdc (same path, mtime, size),
+    // the draw-call tree and resource list are on disk. Populate the UI
+    // instantly and skip the 50+ s replay init. The user can still click
+    // "Try Local Replay" to upgrade to a live replay when they want to
+    // inspect shaders / pipeline state / textures.
+    const cached = captureCache.get(filePath);
+    if (cached) {
+        console.log('[RenderDoc] loadCapture: cache hit, skipping replay init.');
+        captureInfoProvider.update(cached.captureInfo);
+        drawCallProvider.update(cached.drawCalls);
+        resourceProvider.update(cached.resources);
+        apiInspectorProvider.clear();
+        captureInfoProvider.setReplayStatus('unavailable');
+        if (InspectorPanel.currentPanel) {
+            InspectorPanel.currentPanel.setCapture(cached.captureInfo, cached.drawCalls, cached.resources);
+        }
+        // Thumbnail is cheap (renderdoccmd, no replay), load it in the
+        // background so the panel still shows the preview.
+        bridge.getThumbnail(filePath).then(thumbnail => {
+            if (thumbnail && !silent) {
+                ThumbnailPanel.createOrShow(context, thumbnail, cached.captureInfo);
+            }
+        }).catch(() => { /* best-effort */ });
+        if (!silent) {
+            vscode.window.showInformationMessage(
+                `RenderDoc: Loaded ${path.basename(filePath)} from cache. Click "Try Local Replay" for live shader/pipeline inspection.`
+            );
+        }
+        return;
+    }
+
     // Only one capture can be replayed at a time. If the bridge already has a
     // different capture loaded (potentially with an active replay), restart it
     // so the previous replay is cleanly shut down before opening the new one.
@@ -262,118 +314,108 @@ async function loadCapture(context: vscode.ExtensionContext, filePath: string, s
         captureInfoProvider.setReplayStatus('failed');
     }
 
-    // Auto-start local replay for natively supported captures (both silent
-    // auto-restore and explicit user opens). The native bridge no longer
-    // auto-opens the replay in `openCapture` because re-opening GL/ANGLE
-    // captures after tear-down can crash — so we must always call tryReplay
-    // here. Cross-OS (SuggestRemote) captures still go through the modal
-    // below so the user can decide whether to attempt the risky local replay.
-    if (nativeResult && nativeResult.canTryReplay && !nativeResult.replay && !nativeResult.suggestRemote) {
-        try {
-            const tryResult = await bridge.nativeTryReplay();
-            if (tryResult && tryResult.replay) {
-                captureInfoProvider.setReplayStatus('active');
-            } else {
-                captureInfoProvider.setReplayStatus('failed');
-            }
-        } catch (err: any) {
-            console.warn('[RenderDoc] tryReplay crashed:', err?.message);
-            captureInfoProvider.setReplayStatus('failed');
-            bridge.restartNativeBridge();
-            if (bridge.hasNativeBridge()) {
-                try { await bridge.nativeOpenCapture(filePath); } catch { /* ignore */ }
-            }
-        }
-    }
-
-    // If the capture is from a different OS (SuggestRemote), show a modal dialog
-    if (!silent && nativeResult && nativeResult.canTryReplay && !nativeResult.replay && nativeResult.suggestRemote) {
-        // Check ANGLE availability for GLES captures
-        const angleStatus = checkAngleAvailability();
-        const angleSources = !angleStatus.available ? findAngleSources() : null;
-        const hasAngle = angleStatus.available;
-
-        let message = nativeResult.replayMessage || 'This capture was made on a different OS. Local replay may be unstable.';
-        if (!hasAngle) {
-            message += '\n\nNote: ANGLE (libEGL.dll) is not installed. GLES captures require ANGLE for desktop replay.';
-            if (angleSources) {
-                message += ` Found ANGLE in ${angleSources.source} — can be installed automatically.`;
-            }
-        }
-
-        const buttons = hasAngle
-            ? ['Try Local Replay', 'Skip Replay'] as const
-            : angleSources
-                ? ['Install ANGLE & Replay', 'Skip Replay'] as const
-                : ['Try Local Replay', 'Skip Replay'] as const;
-
-        const action = await vscode.window.showWarningMessage(
-            message,
-            { modal: true },
-            ...buttons
-        );
-        if (action === 'Install ANGLE & Replay' && angleSources) {
-            const installed = await installAngleDlls(angleSources);
-            if (installed) {
-                vscode.window.showInformationMessage('ANGLE installed! Restarting bridge and attempting replay...');
-                bridge.restartNativeBridge();
-                if (bridge.hasNativeBridge()) {
-                    try {
-                        await bridge.nativeOpenCapture(filePath);
-                        const tryResult = await bridge.nativeTryReplay();
-                        if (tryResult && tryResult.replay) {
-                            captureInfoProvider.setReplayStatus('active');
-                            vscode.window.showInformationMessage('Local replay started successfully! All advanced features are now available.');
-                        } else {
-                            captureInfoProvider.setReplayStatus('failed');
-                            vscode.window.showWarningMessage(`Replay failed: ${tryResult?.replayError || 'Unknown error'}`);
-                        }
-                    } catch (err: any) {
-                        captureInfoProvider.setReplayStatus('failed');
-                        console.log('[RenderDoc] tryReplay crashed after ANGLE install, restarting bridge...');
-                        bridge.restartNativeBridge();
-                        if (bridge.hasNativeBridge()) {
-                            try { await bridge.nativeOpenCapture(filePath); } catch { /* ignore */ }
-                        }
-                        vscode.window.showWarningMessage(
-                            'Replay still crashed even with ANGLE. The capture may use unsupported GLES features.'
-                        );
-                    }
-                }
-            }
-        } else if (action === 'Try Local Replay') {
-            try {
-                const tryResult = await bridge.nativeTryReplay();
-                if (tryResult && tryResult.replay) {
-                    captureInfoProvider.setReplayStatus('active');
-                    vscode.window.showInformationMessage('Local replay started successfully! Shader/pipeline/texture features are now available.');
-                } else {
-                    captureInfoProvider.setReplayStatus('failed');
-                    vscode.window.showWarningMessage(`Replay failed: ${tryResult?.replayError || 'Unknown error'}`);
-                }
-            } catch (err: any) {
-                captureInfoProvider.setReplayStatus('failed');
-                // Bridge likely crashed — restart it so file info still works
-                console.log('[RenderDoc] tryReplay crashed, restarting bridge...');
-                bridge.tryStartNativeBridge();
-                if (bridge.hasNativeBridge()) {
-                    try { await bridge.nativeOpenCapture(filePath); } catch { /* ignore */ }
-                }
-                vscode.window.showWarningMessage(
-                    'Local replay crashed — this capture cannot be replayed on this GPU. ' +
-                    'Basic file info (draw calls, resources, thumbnail) is still available.'
-                );
-            }
-        }
-    }
-
+    // Auto-start local replay for any capture the native bridge says we can
+    // try — including cross-OS (SuggestRemote) captures. RenderDoc's own GUI
+    // does not block on SuggestRemote; it just attempts the local replay and
+    // reports whatever error comes back. We mirror that behaviour here so the
+    // user isn't forced through an ANGLE-install modal that is often wrong
+    // (many GLES captures replay fine on desktop GL without ANGLE at all).
+    //
+    // A single large progress notification spans BOTH the replay-init phase
+    // (0–70%, driven by RenderDoc's OpenCapture progress callback) and the
+    // subsequent capture-analysis phase (70–100%, our own steps). This gives
+    // the user one visible popup for the whole loading sequence — more
+    // prominent than a tiny status-bar entry.
     await vscode.window.withProgress(
         {
             location: vscode.ProgressLocation.Notification,
-            title: 'RenderDoc: Analyzing capture...',
-            cancellable: false
+            title: `RenderDoc — Loading ${path.basename(filePath)}`,
+            cancellable: true,
         },
-        async (progress) => {
+        async (progress, token) => {
+            // ───── Phase 1: replay driver init (0–70%) ─────
+            if (nativeResult && nativeResult.canTryReplay && !nativeResult.replay) {
+                progress.report({ message: 'Initialising local replay...', increment: 0 });
+                let lastPct = 0;
+                let cancelled = false;
+                const unsubscribe = bridge.onNativeNotification('tryReplayProgress', (params) => {
+                    const p = Math.max(0, Math.min(1, Number(params?.progress ?? 0)));
+                    const pct = Math.round(p * 70); // reserve 30% for analysis
+                    const delta = pct - lastPct;
+                    if (delta > 0) {
+                        lastPct = pct;
+                        progress.report({ message: `Initialising local replay... ${Math.round(p * 100)}%`, increment: delta });
+                    }
+                });
+                // Cancel handler: renderdoc.dll's OpenCapture can't be aborted
+                // cleanly from the outside, so the only reliable way to stop
+                // it is to kill the bridge process. We then restart it so
+                // basic capture info (header/thumbnail) still works.
+                const cancelSub = token.onCancellationRequested(() => {
+                    cancelled = true;
+                    console.log('[RenderDoc] User cancelled replay init — killing bridge.');
+                    bridge.restartNativeBridge();
+                });
+                try {
+                    const tryResult = await bridge.nativeTryReplay();
+                    if (cancelled) {
+                        captureInfoProvider.setReplayStatus('unavailable');
+                    } else if (tryResult && tryResult.replay) {
+                        captureInfoProvider.setReplayStatus('active');
+                        if (!silent && nativeResult.suggestRemote) {
+                            vscode.window.showInformationMessage('RenderDoc: local replay started (cross-OS capture).');
+                        }
+                    } else {
+                        captureInfoProvider.setReplayStatus('failed');
+                        if (!silent) {
+                            const msg = tryResult?.replayError || nativeResult.replayMessage || 'Unknown error';
+                            vscode.window.showWarningMessage(`RenderDoc: local replay failed — ${msg}`);
+                        }
+                    }
+                } catch (err: any) {
+                    if (cancelled) {
+                        captureInfoProvider.setReplayStatus('unavailable');
+                        console.log('[RenderDoc] tryReplay aborted by user cancel.');
+                    } else {
+                        console.warn('[RenderDoc] tryReplay crashed:', err?.message);
+                        captureInfoProvider.setReplayStatus('failed');
+                        bridge.restartNativeBridge();
+                        if (!silent) {
+                            vscode.window.showWarningMessage(
+                                `RenderDoc: local replay crashed — ${err?.message || err}. ` +
+                                `Basic capture info (draw calls, resources, thumbnail) is still available.`
+                            );
+                        }
+                    }
+                } finally {
+                    unsubscribe();
+                    cancelSub.dispose();
+                }
+
+                // If the user cancelled, try to re-open the capture in the
+                // fresh bridge so subsequent UI actions (thumbnail, header)
+                // still work, then stop here — no point running the analysis
+                // phase which would all fail with "No replay active".
+                if (cancelled) {
+                    if (bridge.hasNativeBridge()) {
+                        try { await bridge.nativeOpenCapture(filePath); } catch { /* ignore */ }
+                    }
+                    if (!silent) {
+                        vscode.window.showInformationMessage('RenderDoc: replay loading cancelled.');
+                    }
+                    return;
+                }
+
+                // Make sure we end phase 1 at exactly 70%
+                if (lastPct < 70) {
+                    progress.report({ increment: 70 - lastPct });
+                }
+            } else {
+                progress.report({ increment: 70 });
+            }
+
+            // ───── Phase 2: capture analysis (70–100%) ─────
+            if (token.isCancellationRequested) { return; }
             // Step 1: Capture info — reads RDC binary directly, always works.
             let captureInfo: CaptureInfo | undefined;
             try {
@@ -390,17 +432,30 @@ async function loadCapture(context: vscode.ExtensionContext, filePath: string, s
             let resources: ResourceInfo[] = [];
             let replayErr: Error | undefined;
             try {
-                progress.report({ message: 'Loading draw calls...', increment: 33 });
+                if (token.isCancellationRequested) { return; }
+                progress.report({ message: 'Loading draw calls...', increment: 10 });
                 drawCalls = await bridge.getDrawCalls(filePath);
                 drawCallProvider.update(drawCalls);
 
-                progress.report({ message: 'Loading resources...', increment: 33 });
+                if (token.isCancellationRequested) { return; }
+                progress.report({ message: 'Loading resources...', increment: 10 });
                 resources = await bridge.getResources(filePath);
                 resourceProvider.update(resources);
             } catch (err: any) {
                 replayErr = err;
                 drawCallProvider.update([]);
                 resourceProvider.update([]);
+            }
+            apiInspectorProvider.clear();
+
+            // Persist successful results so the next open of this capture
+            // is instant (skips the expensive replay init).
+            if (!replayErr && captureInfo && drawCalls.length > 0) {
+                try {
+                    captureCache.put(filePath, captureInfo, drawCalls, resources);
+                } catch (e: any) {
+                    console.warn('[RenderDoc] captureCache.put failed:', e?.message);
+                }
             }
 
             // Push whatever we have into an open Inspector
@@ -410,7 +465,8 @@ async function loadCapture(context: vscode.ExtensionContext, filePath: string, s
 
             // Step 4: Thumbnail — uses renderdoccmd binary, no replay needed.
             try {
-                progress.report({ message: 'Loading thumbnail...', increment: 34 });
+                if (token.isCancellationRequested) { return; }
+                progress.report({ message: 'Loading thumbnail...', increment: 10 });
                 const thumbnail = await bridge.getThumbnail(filePath);
                 if (thumbnail && !silent) {
                     ThumbnailPanel.createOrShow(context, thumbnail, captureInfo);
@@ -661,42 +717,6 @@ async function tryLocalReplay() {
         bridgeLoadedCapturePath = currentCapturePath;
     }
 
-    // Check if ANGLE is needed but missing (GLES capture without libEGL.dll)
-    const angleStatus = checkAngleAvailability();
-    if (!angleStatus.available) {
-        const angleSources = findAngleSources();
-        if (angleSources) {
-            const action = await vscode.window.showWarningMessage(
-                'This GLES capture needs ANGLE (libEGL.dll) for local replay, but it is not installed in RenderDoc plugins. ' +
-                `Found ANGLE DLLs in: ${angleSources.source}. Install them now?`,
-                { modal: true },
-                'Install ANGLE',
-                'Try Anyway'
-            );
-            if (action === 'Install ANGLE') {
-                const installed = await installAngleDlls(angleSources);
-                if (installed) {
-                    vscode.window.showInformationMessage('ANGLE installed! The native bridge must be restarted. Restarting...');
-                    bridge.restartNativeBridge();
-                    if (bridge.hasNativeBridge() && currentCapturePath) {
-                        try { await bridge.nativeOpenCapture(currentCapturePath); } catch { /* ignore */ }
-                    }
-                }
-            } else if (action !== 'Try Anyway') {
-                return;
-            }
-        } else {
-            const action = await vscode.window.showWarningMessage(
-                'This GLES capture needs ANGLE (libEGL.dll + libGLESv2.dll) for desktop replay. ' +
-                'ANGLE was not found on this system. Install Google Chrome or copy ANGLE DLLs to:\n' +
-                `${angleStatus.targetDir}`,
-                { modal: true },
-                'Try Anyway'
-            );
-            if (action !== 'Try Anyway') { return; }
-        }
-    }
-
     const confirm = await vscode.window.showWarningMessage(
         'Attempting local replay may crash if the capture is from a different platform. Continue?',
         { modal: true },
@@ -725,6 +745,24 @@ async function tryLocalReplay() {
             'Inspection features are disabled for this capture.'
         );
     }
+}
+
+async function clearCaptureCache() {
+    const stats = captureCache.stats();
+    if (stats.files === 0) {
+        vscode.window.showInformationMessage('RenderDoc: cache is already empty.');
+        return;
+    }
+    const pick = await vscode.window.showWarningMessage(
+        `Clear ${stats.files} cached capture${stats.files === 1 ? '' : 's'} (${formatBytes(stats.bytes)})? The next open of each capture will re-run the full replay init.`,
+        { modal: true },
+        'Clear'
+    );
+    if (pick !== 'Clear') { return; }
+    const removed = captureCache.clear();
+    vscode.window.showInformationMessage(
+        `RenderDoc: cleared ${removed.files} cached capture${removed.files === 1 ? '' : 's'} (${formatBytes(removed.bytes)}).`
+    );
 }
 
 function showShaderPanel(_context: vscode.ExtensionContext, result: any, eventId: number) {

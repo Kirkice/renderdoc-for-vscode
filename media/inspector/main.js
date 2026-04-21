@@ -9,14 +9,23 @@
         drawCall: null,
         shaders: null,
         pipeline: null,
-        activeTab: 'overview',
+        activeTab: 'textures',
         activeShaderStage: null,
+        activeShaderFile: {}, // map: stage -> file index (or -1 for disassembly)
         eventFilter: '',
         texFilter: '',
+        resFilter: '',
+        resTypeFilter: 'all',
         modalResource: null,
         modalChannel: -1,
         eventScope: 'all',   // 'all' | 'group'
-        texScope: 'all',     // 'all' | 'draw'
+        texScope: 'output',  // 'output' | 'input'
+        meshStage: 'vsin',   // 'vsin' | 'vsout'
+        meshMax: 256,
+        meshCache: {},       // key -> { data } | { error }
+        meshPending: {},
+        meshShowPreview: true,
+        meshCam: { yaw: 0.6, pitch: 0.4, zoom: 1.0, panX: 0, panY: 0, auto: true },
     };
 
     // Build resourceId -> resource info lookup (strings for consistent key match)
@@ -84,13 +93,13 @@
     }
 
     // ── Filters ────────────────────────────────────────────────────
-    document.getElementById('evt-filter').addEventListener('input', e => {
-        state.eventFilter = e.target.value.toLowerCase();
-        if (state.activeTab === 'events') renderEvents();
-    });
     document.getElementById('tex-filter').addEventListener('input', e => {
         state.texFilter = e.target.value.toLowerCase();
         if (state.activeTab === 'textures') renderTextures();
+    });
+    document.getElementById('res-filter').addEventListener('input', e => {
+        state.resFilter = e.target.value.toLowerCase();
+        if (state.activeTab === 'resources') renderResources();
     });
 
     // ── Scope toggles ─────────────────────────────────────────────
@@ -100,7 +109,7 @@
                 group.querySelectorAll('.scope').forEach(b => b.classList.toggle('active', b === btn));
                 const kind = group.dataset.scope;
                 if (kind === 'tex') { state.texScope = btn.dataset.val; renderTextures(); }
-                else if (kind === 'evt') { state.eventScope = btn.dataset.val; renderEvents(); }
+                else if (kind === 'res') { state.resTypeFilter = btn.dataset.val; renderResources(); }
             });
         });
     });
@@ -124,6 +133,9 @@
                     if (!sameEvent) {
                         state.shaders = null;
                         state.pipeline = null;
+                        state.meshCache = {};
+                        state.meshPending = {};
+                        state.meshCam.auto = true;
                     }
                     updateHeader();
                     render();
@@ -143,6 +155,13 @@
                 break;
             case 'texturePreview':
                 handleTexturePreview(m);
+                break;
+            case 'meshLoaded':
+                if (m.key) {
+                    state.meshCache[m.key] = m.error ? { error: m.error } : { data: m.data };
+                    delete state.meshPending[m.key];
+                    if (state.activeTab === 'mesh') renderMesh();
+                }
                 break;
         }
     });
@@ -402,14 +421,52 @@
 
         const info = shaders[state.activeShaderStage];
         body.className = 'code-view';
-        // Header shows shader resource name + id. Prefer the explicit name the
-        // native bridge attaches to the shader source response; fall back to
-        // the pipeline-state shaders entry; finally fall back to resource-list
-        // lookup (which is a no-op for shaders that never appear in the
-        // texture/buffer XML resource list).
+        // Header shows shader resource name + id.
         const pipeStage = state.pipeline && state.pipeline.shaders && state.pipeline.shaders[state.activeShaderStage];
         const rid = (info && info.resourceId) || (pipeStage && pipeStage.resourceId);
         const shaderName = (info && info.name) || (pipeStage && pipeStage.name) || (rid ? resName(rid) : '');
+
+        // File sub-tabs — mirror RenderDoc desktop's file switcher inside a
+        // shader stage. Each source file is a distinct tab; disassembly (if
+        // available) is appended as a virtual last tab.
+        const fileBar = document.getElementById('shader-file-tabs');
+        if (fileBar) {
+            fileBar.innerHTML = '';
+            const files = Array.isArray(info.sourceFiles) ? info.sourceFiles : [];
+            const hasDisasm = typeof info.disassembly === 'string' && info.disassembly.length > 0;
+            const defaultIdx = (typeof info.entryFileIndex === 'number' && info.entryFileIndex >= 0) ? info.entryFileIndex : 0;
+
+            // Resolve current selection (stored per-stage).
+            let cur = state.activeShaderFile[state.activeShaderStage];
+            const maxIdx = files.length - 1;
+            if (cur === undefined || cur === null || (cur >= 0 && cur > maxIdx) || (cur === -1 && !hasDisasm)) {
+                cur = files.length > 0 ? defaultIdx : (hasDisasm ? -1 : 0);
+                state.activeShaderFile[state.activeShaderStage] = cur;
+            }
+
+            const makeTab = (label, idx) => {
+                const b = document.createElement('button');
+                b.className = 'stage-tab shader-file-tab' + (idx === cur ? ' active' : '');
+                b.textContent = label;
+                b.title = label;
+                b.addEventListener('click', () => {
+                    state.activeShaderFile[state.activeShaderStage] = idx;
+                    renderShaders();
+                });
+                fileBar.appendChild(b);
+            };
+            for (let i = 0; i < files.length; i++) {
+                const fn = (files[i] && files[i].filename) || ('file ' + i);
+                const label = fn + (i === defaultIdx ? ' *' : '');
+                makeTab(label, i);
+            }
+            if (hasDisasm) {
+                const tgt = info.disassemblyTarget || 'Disassembly';
+                makeTab(tgt, -1);
+            }
+            fileBar.hidden = (files.length + (hasDisasm ? 1 : 0)) <= 0;
+        }
+
         let header;
         if (rid) {
             const nameStr = shaderName && shaderName !== ('Resource ' + rid) ? shaderName : ('Shader ' + rid);
@@ -417,46 +474,65 @@
         } else {
             header = '// ' + state.activeShaderStage + ' shader\\n';
         }
-        const code = info.source || info.disassembly || '// No source available for ' + state.activeShaderStage;
+
+        const files = Array.isArray(info.sourceFiles) ? info.sourceFiles : [];
+        const hasDisasm = typeof info.disassembly === 'string' && info.disassembly.length > 0;
+        const cur = state.activeShaderFile[state.activeShaderStage];
+        let code;
+        if (cur === -1 && hasDisasm) {
+            code = info.disassembly;
+            header += '// [disassembly: ' + (info.disassemblyTarget || '?') + ']\\n';
+        } else if (cur >= 0 && cur < files.length) {
+            code = files[cur].contents || '';
+            header += '// [' + (files[cur].filename || ('file ' + cur)) + ']\\n';
+        } else {
+            code = info.source || info.disassembly || '// No source available for ' + state.activeShaderStage;
+        }
         body.textContent = header + '\\n' + code;
     }
 
     // ── Textures ───────────────────────────────────────────────────
+    // Current-draw RT preview (top) + grid of Input (sampled) or Output (RT)
+    // textures for the currently selected event.
     function renderTextures() {
+        renderCurrentRTPreview();
         const body = document.getElementById('textures-body');
-        let textures = state.resources.filter(r => r.type === 'Texture');
+        const allTex = state.resources.filter(r => r.type === 'Texture');
 
-        // Scope to resources used by the current draw: render targets + any
-        // textures the shader sampled from (native bridge collects these via
-        // DescriptorAccess → GetDescriptors when pipelineState is queried).
-        let scopeLabel = '';
-        if (state.texScope === 'draw') {
-            const pipe = state.pipeline || {};
-            const fb = pipe.framebuffer || {};
-            const ids = new Set();
-            (fb.colorTargets || []).forEach(id => ids.add(String(id)));
-            if (fb.depthTarget)   ids.add(String(fb.depthTarget));
-            if (fb.stencilTarget) ids.add(String(fb.stencilTarget));
-            (pipe.boundTextures || []).forEach(id => ids.add(String(id)));
-            textures = textures.filter(t => ids.has(String(t.resourceId)));
-            scopeLabel = '(current draw)';
-        }
+        const pipe = state.pipeline || {};
+        const fb = pipe.framebuffer || {};
+        const outputIds = new Set();
+        (fb.colorTargets || []).forEach(id => outputIds.add(String(id)));
+        if (fb.depthTarget)   outputIds.add(String(fb.depthTarget));
+        if (fb.stencilTarget) outputIds.add(String(fb.stencilTarget));
+        const inputIds = new Set();
+        (pipe.boundTextures || []).forEach(id => inputIds.add(String(id)));
+
+        const scopeIds = state.texScope === 'input' ? inputIds : outputIds;
+        let textures = allTex.filter(t => scopeIds.has(String(t.resourceId)));
+        const scopeLabel = state.texScope === 'input' ? '(sampled by draw)' : '(render targets)';
 
         const f = state.texFilter;
-        const filtered = f ? textures.filter(t => (t.name || '').toLowerCase().includes(f) || (t.format || '').toLowerCase().includes(f)) : textures;
+        const filtered = f
+            ? textures.filter(t => (t.name || '').toLowerCase().includes(f) || (t.format || '').toLowerCase().includes(f))
+            : textures;
         document.getElementById('tex-count').textContent = filtered.length + ' / ' + textures.length + ' ' + scopeLabel;
+
         if (filtered.length === 0) {
             body.innerHTML = '';
             body.className = 'tex-grid empty-state';
-            if (state.texScope === 'draw' && state.eventId == null) {
-                body.textContent = 'Select an event to see its bound textures.';
-            } else if (state.texScope === 'draw') {
-                const pipeReady = state.pipeline && !state.pipeline.error;
-                body.textContent = pipeReady
-                    ? 'This draw did not sample any textures or bind render targets.'
-                    : 'Loading pipeline state for this draw…';
+            if (state.eventId == null) {
+                body.textContent = 'Select an event.';
+            } else if (!state.pipeline || state.pipeline.error) {
+                body.textContent = 'Loading pipeline state for this draw…';
+            } else if (state.texScope === 'input') {
+                body.textContent = textures.length === 0
+                    ? 'This draw did not sample any textures.'
+                    : 'No textures match filter.';
             } else {
-                body.textContent = textures.length === 0 ? 'No textures in this capture.' : 'No textures match filter.';
+                body.textContent = textures.length === 0
+                    ? 'This draw has no bound render targets.'
+                    : 'No textures match filter.';
             }
             return;
         }
@@ -466,11 +542,73 @@
             card.addEventListener('click', () => openTextureModal(card.dataset.resid));
         });
 
-        // Auto-request thumbnails for every visible card (RenderDoc-style —
-        // the user asked for immediate loading on tab open instead of a
-        // per-card click). Dedupe by key to avoid a storm on re-renders.
         for (const t of filtered) {
             requestThumbnail(String(t.resourceId));
+        }
+    }
+
+    // Render the large "current draw output" preview panel on top of the
+    // Texture Viewer tab — mirrors RenderDoc's "Cur Output" header image.
+    const rtPreviewCache = new Map();   // key → base64 PNG
+    const rtPreviewPending = new Set(); // key currently in flight
+    function rtKey(resId) {
+        return String(resId) + ':0:' + (state.eventId || 0) + ':-1';
+    }
+    function renderCurrentRTPreview() {
+        const area = document.getElementById('tex-current');
+        if (!area) return;
+        if (state.eventId == null) {
+            area.className = 'tex-current empty-state';
+            area.textContent = 'Select an event to preview its render target.';
+            return;
+        }
+        const pipe = state.pipeline;
+        if (!pipe || pipe.error) {
+            area.className = 'tex-current empty-state';
+            area.textContent = pipe && pipe.error
+                ? ('Pipeline unavailable: ' + pipe.error)
+                : 'Loading render target…';
+            return;
+        }
+        const fb = pipe.framebuffer || {};
+        const rtId = (fb.colorTargets && fb.colorTargets[0]) || fb.depthTarget;
+        if (!rtId) {
+            area.className = 'tex-current empty-state';
+            area.textContent = 'No render target bound for this draw.';
+            return;
+        }
+        const tex = state.resources.find(r => String(r.resourceId) === String(rtId));
+        const name = (tex && tex.name) || ('Resource ' + rtId);
+        const fmt = (tex && tex.format) || '';
+        const dim = tex && tex.width ? (tex.width + '×' + tex.height) : '';
+
+        area.className = 'tex-current';
+        const key = rtKey(rtId);
+        const cached = rtPreviewCache.get(key);
+        const body = cached
+            ? '<img src="data:image/png;base64,' + cached + '" alt="current RT">'
+            : '<div class="muted">Loading…</div>';
+        area.innerHTML =
+            '<div class="tex-current-header">' +
+                '<span class="tex-current-label">Cur Output 0</span>' +
+                '<span class="tex-current-name" title="' + esc(name) + '">' + esc(name) + '</span>' +
+                '<span class="tex-current-meta">' + esc(dim) + ' ' + esc(fmt) + '</span>' +
+                '<button class="icon-btn tex-current-open" data-resid="' + esc(rtId) + '">Open</button>' +
+            '</div>' +
+            '<div class="tex-current-preview">' + body + '</div>';
+
+        const btn = area.querySelector('.tex-current-open');
+        if (btn) btn.addEventListener('click', () => openTextureModal(String(rtId)));
+
+        if (!cached && !rtPreviewPending.has(key)) {
+            rtPreviewPending.add(key);
+            vscode.postMessage({
+                type: 'requestTexture',
+                resourceId: String(rtId),
+                mip: 0,
+                eventId: state.eventId || 0,
+                channelExtract: -1,
+            });
         }
     }
 
@@ -550,6 +688,17 @@
         });
     }
     function handleTexturePreview(m) {
+        // Route to the large "Cur Output" RT preview on the Textures tab, if
+        // this response was requested for it.
+        if (rtPreviewPending.has(m.key)) {
+            rtPreviewPending.delete(m.key);
+            if (!m.error && m.base64) {
+                rtPreviewCache.set(m.key, m.base64);
+            }
+            if (state.activeTab === 'textures') renderCurrentRTPreview();
+            // The same key may also satisfy a thumbnail card (RT is shown
+            // both at top and in the grid) — fall through to that path too.
+        }
         // Is this response destined for a thumbnail card (auto-loaded on tab
         // open) rather than the modal? Match by key — thumbnails always use
         // mip=0, channel=-1, so they share the same key shape we computed in
@@ -633,15 +782,469 @@
             '</div>';
     }
 
+    // ── Resource Inspector ─────────────────────────────────────────
+    // Flat list of every resource in the capture, filterable by type + name.
+    // Clicking a row opens it in the texture modal (for textures), or the
+    // shaders tab (for shaders), or just copies the ID (for buffers).
+    function renderResources() {
+        const body = document.getElementById('resources-body');
+        const all = state.resources || [];
+        let list = all;
+        if (state.resTypeFilter && state.resTypeFilter !== 'all') {
+            list = list.filter(r => r.type === state.resTypeFilter);
+        }
+        const f = state.resFilter;
+        if (f) {
+            list = list.filter(r =>
+                (r.name || '').toLowerCase().includes(f) ||
+                String(r.resourceId).includes(f) ||
+                (r.format || '').toLowerCase().includes(f) ||
+                (r.type || '').toLowerCase().includes(f)
+            );
+        }
+        document.getElementById('res-count').textContent = list.length + ' / ' + all.length;
+        if (list.length === 0) {
+            body.className = 'resource-list empty-state';
+            body.textContent = all.length === 0 ? 'No resources in this capture.' : 'No resources match filter.';
+            return;
+        }
+        body.className = 'resource-list';
+        let html = '<table class="res-table"><thead><tr>'
+            + '<th>Type</th><th>ID</th><th>Name</th><th>Format</th><th>Size</th><th>Bytes</th>'
+            + '</tr></thead><tbody>';
+        for (const r of list) {
+            const dim = (r.width && r.height)
+                ? (r.width + '\u00d7' + r.height + (r.depth > 1 ? ('\u00d7' + r.depth) : ''))
+                : '';
+            html += '<tr class="res-row" data-type="' + esc(r.type) + '" data-resid="' + esc(r.resourceId) + '">'
+                + '<td>' + esc(r.type || '') + '</td>'
+                + '<td class="mono">' + esc(r.resourceId) + '</td>'
+                + '<td>' + esc(r.name || '') + '</td>'
+                + '<td>' + esc(r.format || '') + '</td>'
+                + '<td>' + esc(dim) + '</td>'
+                + '<td class="mono">' + esc(r.byteSize != null ? r.byteSize : '') + '</td>'
+                + '</tr>';
+        }
+        html += '</tbody></table>';
+        body.innerHTML = html;
+        body.querySelectorAll('.res-row').forEach(el => {
+            el.addEventListener('click', () => {
+                if (el.dataset.type === 'Texture') {
+                    openTextureModal(el.dataset.resid);
+                }
+            });
+        });
+    }
+
     // ── Render dispatch ────────────────────────────────────────────
     function render() {
         if (state.activeTab === 'overview') renderOverview();
         else if (state.activeTab === 'pipeline') renderPipeline();
         else if (state.activeTab === 'shaders') renderShaders();
         else if (state.activeTab === 'textures') renderTextures();
-        else if (state.activeTab === 'events') renderEvents();
+        else if (state.activeTab === 'resources') renderResources();
+        else if (state.activeTab === 'mesh') renderMesh();
         updateHeader();
     }
+
+    // ── Mesh View ──────────────────────────────────────────────────
+    // Canonical CompType table → label + integer-display flag. Matches
+    // RenderDoc's enum order (see replay_enums.h).
+    const COMP_TYPE_INFO = [
+        { label: 'typeless', int: true },
+        { label: 'float',    int: false },
+        { label: 'unorm',    int: false },
+        { label: 'snorm',    int: false },
+        { label: 'uint',     int: true  },
+        { label: 'sint',     int: true  },
+        { label: 'uscaled',  int: true  },
+        { label: 'sscaled',  int: true  },
+        { label: 'depth',    int: false },
+        { label: 'unormSRGB',int: false },
+    ];
+
+    function fmtComp(attr) {
+        const ci = COMP_TYPE_INFO[attr.compType] || COMP_TYPE_INFO[0];
+        const bits = (attr.compByteWidth || 0) * 8;
+        return ci.label + bits + 'x' + (attr.compCount || 1);
+    }
+
+    function formatValue(v, isInt) {
+        if (v === null || v === undefined) return '';
+        if (typeof v !== 'number') return String(v);
+        if (isInt) return String(Math.trunc(v));
+        if (!isFinite(v)) return String(v);
+        // RenderDoc-style: up to 6 significant digits, trim trailing zeros.
+        let s = v.toFixed(4);
+        s = s.replace(/\.?0+$/, '');
+        return s === '' || s === '-' ? '0' : s;
+    }
+
+    function meshRequestKey() {
+        return state.eventId + ':' + state.meshStage + ':' + state.meshMax + ':0';
+    }
+
+    function ensureMeshLoaded() {
+        if (state.eventId == null) return null;
+        const key = meshRequestKey();
+        if (state.meshCache[key]) return state.meshCache[key];
+        if (!state.meshPending[key]) {
+            state.meshPending[key] = true;
+            vscode.postMessage({
+                type: 'requestMesh',
+                eventId: state.eventId,
+                stage: state.meshStage,
+                maxVertices: state.meshMax,
+                instance: 0,
+            });
+        }
+        return null;
+    }
+
+    function renderMesh() {
+        const body = document.getElementById('mesh-body');
+        const info = document.getElementById('mesh-info');
+        if (state.eventId == null) {
+            body.textContent = 'Select an event.';
+            body.className = 'mesh-table-wrap empty-state';
+            info.textContent = '';
+            return;
+        }
+        const entry = ensureMeshLoaded();
+        if (!entry) {
+            body.textContent = 'Loading mesh data…';
+            body.className = 'mesh-table-wrap empty-state';
+            info.textContent = '';
+            return;
+        }
+        if (entry.error) {
+            body.textContent = 'Mesh unavailable: ' + entry.error;
+            body.className = 'mesh-table-wrap empty-state';
+            info.textContent = '';
+            return;
+        }
+        const data = entry.data || {};
+        const attrs = data.attributes || [];
+        const rows = data.rows || [];
+        info.textContent = (data.returnedIndices != null ? data.returnedIndices + ' / ' + (data.totalIndices || 0) + ' indices' : '')
+            + (attrs.length ? ' · ' + attrs.length + ' attributes' : '');
+
+        if (attrs.length === 0 || rows.length === 0) {
+            body.textContent = 'No mesh data at this event.';
+            body.className = 'mesh-table-wrap empty-state';
+            return;
+        }
+
+        body.className = 'mesh-table-wrap';
+        // Build header: VTX | IDX | per-attribute columns (each attribute gets
+        // compCount sub-columns like .x .y .z .w).
+        let html = '<table class="mesh-table"><thead><tr>';
+        html += '<th rowspan="2" class="mesh-col-num">VTX</th>';
+        const hasIdx = rows[0].idx !== undefined;
+        if (hasIdx) html += '<th rowspan="2" class="mesh-col-num">IDX</th>';
+        for (const a of attrs) {
+            const cc = Math.max(1, a.compCount || 1);
+            html += '<th colspan="' + cc + '" class="mesh-col-attr" title="' + esc(fmtComp(a)) + '">'
+                + esc(a.name || '(unnamed)') + '</th>';
+        }
+        html += '</tr><tr>';
+        for (const a of attrs) {
+            const cc = Math.max(1, a.compCount || 1);
+            const labels = ['x', 'y', 'z', 'w'];
+            for (let c = 0; c < cc; c++) {
+                html += '<th class="mesh-col-sub">.' + (labels[c] || ('c' + c)) + '</th>';
+            }
+        }
+        html += '</tr></thead><tbody>';
+        for (const row of rows) {
+            const isRestart = row.restart;
+            html += '<tr' + (isRestart ? ' class="restart"' : '') + '>';
+            html += '<td class="mono num">' + row.vtx + '</td>';
+            if (hasIdx) html += '<td class="mono num">' + (isRestart ? '—' : row.idx) + '</td>';
+            const cols = row.cols || [];
+            for (let i = 0; i < attrs.length; i++) {
+                const a = attrs[i];
+                const isInt = (COMP_TYPE_INFO[a.compType] || {}).int;
+                const vals = cols[i] || [];
+                const cc = Math.max(1, a.compCount || 1);
+                for (let c = 0; c < cc; c++) {
+                    html += '<td class="mono">' + esc(formatValue(vals[c], isInt)) + '</td>';
+                }
+            }
+            html += '</tr>';
+        }
+        html += '</tbody></table>';
+        body.innerHTML = html;
+
+        // Also refresh the 3D preview.
+        renderMeshPreview();
+    }
+
+    // ── Mesh 3D Preview ────────────────────────────────────────────
+    // Canvas 2D wire-frame renderer with a simple orbit camera. For VSOut we
+    // apply the perspective divide (x/w,y/w,z/w) so that clip-space output
+    // lands in NDC; for VSIn we just auto-fit the AABB.
+    function findPositionAttr(data) {
+        const attrs = data.attributes || [];
+        const prefer = ['gl_position','sv_position','position','pos','apos','vpos','vposition','in_position','a_position'];
+        for (let i = 0; i < attrs.length; i++) {
+            const n = (attrs[i].name || '').toLowerCase();
+            if (prefer.some(p => n === p || n.includes(p))) return i;
+        }
+        // First attribute with 2+ components we can interpret as coords.
+        for (let i = 0; i < attrs.length; i++) {
+            if ((attrs[i].compCount || 0) >= 2) return i;
+        }
+        return 0;
+    }
+
+    function renderMeshPreview() {
+        const pane = document.getElementById('mesh-preview-pane');
+        const canvas = document.getElementById('mesh-canvas');
+        if (!pane || !canvas) return;
+        if (!state.meshShowPreview) { pane.classList.add('hidden'); return; }
+        pane.classList.remove('hidden');
+
+        const dpr = window.devicePixelRatio || 1;
+        const cssW = Math.max(1, pane.clientWidth);
+        const cssH = Math.max(1, pane.clientHeight);
+        if (canvas.width !== Math.round(cssW * dpr) || canvas.height !== Math.round(cssH * dpr)) {
+            canvas.width = Math.round(cssW * dpr);
+            canvas.height = Math.round(cssH * dpr);
+        }
+        const W = canvas.width, H = canvas.height;
+        const ctx = canvas.getContext('2d');
+        ctx.fillStyle = '#111';
+        ctx.fillRect(0, 0, W, H);
+
+        const entry = state.meshCache[meshRequestKey()];
+        if (!entry || entry.error || !entry.data) return;
+        const data = entry.data;
+        const rows = data.rows || [];
+        if (rows.length === 0) return;
+
+        const pi = findPositionAttr(data);
+        const posAttr = (data.attributes || [])[pi];
+        if (!posAttr) return;
+        const cc = posAttr.compCount || 0;
+        const isClip = state.meshStage !== 'vsin';
+
+        // Extract positions, compute AABB.
+        const pts = new Array(rows.length);
+        let minX=Infinity,minY=Infinity,minZ=Infinity;
+        let maxX=-Infinity,maxY=-Infinity,maxZ=-Infinity;
+        let anyFinite = false;
+        for (let i = 0; i < rows.length; i++) {
+            if (rows[i].restart) { pts[i] = null; continue; }
+            const v = (rows[i].cols && rows[i].cols[pi]) || [];
+            let x = +v[0] || 0;
+            let y = +v[1] || 0;
+            let z = cc >= 3 ? (+v[2] || 0) : 0;
+            let wv = cc >= 4 ? (+v[3] || 1) : 1;
+            if (isClip && wv !== 0 && isFinite(wv)) { x /= wv; y /= wv; z /= wv; }
+            if (!isFinite(x) || !isFinite(y) || !isFinite(z)) { pts[i] = null; continue; }
+            pts[i] = [x, y, z];
+            anyFinite = true;
+            if (x<minX) minX=x; if (y<minY) minY=y; if (z<minZ) minZ=z;
+            if (x>maxX) maxX=x; if (y>maxY) maxY=y; if (z>maxZ) maxZ=z;
+        }
+        if (!anyFinite) return;
+
+        let cx=(minX+maxX)/2, cy=(minY+maxY)/2, cz=(minZ+maxZ)/2;
+        let extent = Math.max(maxX-minX, maxY-minY, maxZ-minZ);
+        if (!isFinite(extent) || extent <= 0) extent = 1;
+
+        const cam = state.meshCam;
+        const viewMin = Math.min(W, H);
+        const s = (viewMin / extent) * 0.42 * cam.zoom;
+
+        const ca = Math.cos(cam.yaw),  sa = Math.sin(cam.yaw);
+        const cb = Math.cos(cam.pitch), sb = Math.sin(cam.pitch);
+
+        function project(p) {
+            let x = p[0] - cx, y = p[1] - cy, z = p[2] - cz;
+            // yaw around Y
+            let x1 = ca * x + sa * z;
+            let z1 = -sa * x + ca * z;
+            // pitch around X
+            let y2 = cb * y - sb * z1;
+            // z2 = sb*y + cb*z1;   // unused (no perspective in preview)
+            const sx = W * 0.5 + x1 * s + cam.panX * dpr;
+            const sy = H * 0.5 - y2 * s + cam.panY * dpr;
+            return [sx, sy];
+        }
+
+        // Axes (origin marker).
+        ctx.lineWidth = 1 * dpr;
+        const axLen = viewMin * 0.04;
+        const ax = project([cx, cy, cz]);
+        ctx.strokeStyle = '#ff5050'; ctx.beginPath();
+        const axx = project([cx + extent*0.15, cy, cz]);
+        ctx.moveTo(ax[0], ax[1]); ctx.lineTo(axx[0], axx[1]); ctx.stroke();
+        ctx.strokeStyle = '#50c050'; ctx.beginPath();
+        const axy = project([cx, cy + extent*0.15, cz]);
+        ctx.moveTo(ax[0], ax[1]); ctx.lineTo(axy[0], axy[1]); ctx.stroke();
+        ctx.strokeStyle = '#5080ff'; ctx.beginPath();
+        const axz = project([cx, cy, cz + extent*0.15]);
+        ctx.moveTo(ax[0], ax[1]); ctx.lineTo(axz[0], axz[1]); ctx.stroke();
+
+        // Topology enum (RenderDoc Topology):
+        //  0 Unknown, 1 PointList, 2 LineList, 3 LineStrip, 4 LineLoop,
+        //  5 TriangleList, 6 TriangleStrip, 7 TriangleFan,
+        //  8 LineList_Adj, 9 LineStrip_Adj, 10 TriangleList_Adj, 11 TriangleStrip_Adj,
+        //  12+ PatchList (treat as points).
+        const topo = data.topology;
+
+        ctx.strokeStyle = '#7fb4ff';
+        ctx.lineWidth = 1 * dpr;
+        ctx.beginPath();
+        function segment(a, b) {
+            const pa = pts[a], pb = pts[b];
+            if (!pa || !pb) return;
+            const p1 = project(pa), p2 = project(pb);
+            ctx.moveTo(p1[0], p1[1]); ctx.lineTo(p2[0], p2[1]);
+        }
+
+        const N = rows.length;
+        if (topo === 1) {
+            // PointList — drawn below.
+        } else if (topo === 2) {
+            for (let i = 0; i + 1 < N; i += 2) segment(i, i+1);
+        } else if (topo === 3 || topo === 9) {
+            for (let i = 0; i + 1 < N; i++) segment(i, i+1);
+        } else if (topo === 4) {
+            for (let i = 0; i + 1 < N; i++) segment(i, i+1);
+            if (N >= 2) segment(N-1, 0);
+        } else if (topo === 5 || topo === 10) {
+            const step = topo === 10 ? 6 : 3;
+            const take = topo === 10 ? [0, 2, 4] : [0, 1, 2];
+            for (let i = 0; i + step - 1 < N; i += step) {
+                const a = i + take[0], b = i + take[1], c = i + take[2];
+                segment(a, b); segment(b, c); segment(c, a);
+            }
+        } else if (topo === 6 || topo === 11) {
+            // triangle strip — each new vertex forms a triangle with previous two
+            const stride = topo === 11 ? 2 : 1;
+            for (let i = 0; i + 2 * stride < N; i++) {
+                const a = i * stride, b = (i + 1) * stride, c = (i + 2) * stride;
+                if (c >= N) break;
+                if (!pts[a] || !pts[b] || !pts[c]) continue;
+                segment(a, b); segment(b, c); segment(a, c);
+            }
+        } else if (topo === 7) {
+            for (let i = 1; i + 1 < N; i++) { segment(0, i); segment(i, i+1); }
+            if (N >= 3) segment(N-1, 0);
+        } else if (topo === 8) {
+            for (let i = 0; i + 3 < N; i += 4) segment(i+1, i+2);
+        } else {
+            // Fallback: connect consecutive.
+            for (let i = 0; i + 1 < N; i++) segment(i, i+1);
+        }
+        ctx.stroke();
+
+        // Points.
+        if (topo === 1 || N <= 64) {
+            ctx.fillStyle = '#cfe3ff';
+            for (let i = 0; i < N; i++) {
+                if (!pts[i]) continue;
+                const p = project(pts[i]);
+                ctx.fillRect(p[0] - 1.5 * dpr, p[1] - 1.5 * dpr, 3 * dpr, 3 * dpr);
+            }
+        }
+    }
+
+    // Mesh toolbar wiring (once at load).
+    (function wireMeshToolbar() {
+        const tb = document.getElementById('mesh-toolbar');
+        if (!tb) return;
+        tb.querySelectorAll('.scope-toggle[data-scope="mesh"] .scope').forEach(btn => {
+            btn.addEventListener('click', () => {
+                tb.querySelectorAll('.scope-toggle[data-scope="mesh"] .scope').forEach(b => b.classList.remove('active'));
+                btn.classList.add('active');
+                state.meshStage = btn.dataset.val;
+                state.meshCam.auto = true;
+                renderMesh();
+            });
+        });
+        const maxInput = document.getElementById('mesh-max');
+        if (maxInput) {
+            maxInput.addEventListener('change', () => {
+                const n = parseInt(maxInput.value, 10);
+                if (!isNaN(n) && n > 0) {
+                    state.meshMax = Math.min(65536, Math.max(1, n));
+                    renderMesh();
+                }
+            });
+        }
+        const reload = document.getElementById('mesh-refresh');
+        if (reload) {
+            reload.addEventListener('click', () => {
+                const key = meshRequestKey();
+                delete state.meshCache[key];
+                delete state.meshPending[key];
+                renderMesh();
+            });
+        }
+        const reset = document.getElementById('mesh-reset-view');
+        if (reset) {
+            reset.addEventListener('click', () => {
+                state.meshCam = { yaw: 0.6, pitch: 0.4, zoom: 1.0, panX: 0, panY: 0, auto: true };
+                renderMeshPreview();
+            });
+        }
+        const previewChk = document.getElementById('mesh-show-preview');
+        if (previewChk) {
+            previewChk.addEventListener('change', () => {
+                state.meshShowPreview = previewChk.checked;
+                renderMeshPreview();
+            });
+        }
+
+        // Pointer camera on the canvas.
+        const canvas = document.getElementById('mesh-canvas');
+        if (canvas) {
+            let dragging = false, sx = 0, sy = 0, panMode = false;
+            canvas.addEventListener('pointerdown', e => {
+                dragging = true;
+                panMode = e.shiftKey || e.button === 1 || e.button === 2;
+                sx = e.clientX; sy = e.clientY;
+                canvas.setPointerCapture(e.pointerId);
+            });
+            canvas.addEventListener('pointermove', e => {
+                if (!dragging) return;
+                const dx = e.clientX - sx;
+                const dy = e.clientY - sy;
+                sx = e.clientX; sy = e.clientY;
+                if (panMode) {
+                    state.meshCam.panX += dx;
+                    state.meshCam.panY += dy;
+                } else {
+                    state.meshCam.yaw   += dx * 0.01;
+                    state.meshCam.pitch += dy * 0.01;
+                    const limit = Math.PI / 2 - 0.01;
+                    if (state.meshCam.pitch >  limit) state.meshCam.pitch =  limit;
+                    if (state.meshCam.pitch < -limit) state.meshCam.pitch = -limit;
+                }
+                renderMeshPreview();
+            });
+            canvas.addEventListener('pointerup', e => {
+                dragging = false;
+                try { canvas.releasePointerCapture(e.pointerId); } catch {}
+            });
+            canvas.addEventListener('contextmenu', e => e.preventDefault());
+            canvas.addEventListener('wheel', e => {
+                e.preventDefault();
+                const f = Math.exp(-e.deltaY * 0.001);
+                state.meshCam.zoom = Math.max(0.05, Math.min(50, state.meshCam.zoom * f));
+                renderMeshPreview();
+            }, { passive: false });
+        }
+
+        // Redraw on resize.
+        window.addEventListener('resize', () => {
+            if (state.activeTab === 'mesh') renderMeshPreview();
+        });
+    })();
 
     // ── Utils ──────────────────────────────────────────────────────
     function esc(s) {

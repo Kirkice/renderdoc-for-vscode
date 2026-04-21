@@ -51,6 +51,9 @@ export class InspectorPanel {
     // Each entry can be hundreds of KB so we keep a tighter cap.
     private texturePreviewCache = new LruCache<string, { base64: string; width: number; height: number; texFormat: string }>(128);
 
+    // Mesh decode cache keyed by "eventId:stage:maxVerts:instance".
+    private meshCache = new LruCache<string, any>(64);
+
     private disposables: vscode.Disposable[] = [];
 
     public static createOrShow(context: vscode.ExtensionContext, bridge: RenderDocBridge) {
@@ -313,6 +316,29 @@ export class InspectorPanel {
         }
     }
 
+    private async loadMesh(eventId: number, stage: 'vsin' | 'vsout' | 'gsout', maxVertices: number, instance: number) {
+        const key = `${eventId}:${stage}:${maxVertices}:${instance}`;
+        if (this.meshCache.has(key)) {
+            this.panel.webview.postMessage({ type: 'meshLoaded', key, data: this.meshCache.get(key) });
+            return;
+        }
+        if (!this.bridge.hasNativeBridge()) {
+            this.panel.webview.postMessage({ type: 'meshLoaded', key, error: 'Native bridge not available (replay required).' });
+            return;
+        }
+        try {
+            const data = await withTimeout(
+                this.bridge.nativeGetMeshData(eventId, stage, { maxVertices, instance }),
+                30000,
+                'Mesh fetch timed out after 30s.',
+            );
+            this.meshCache.set(key, data);
+            this.panel.webview.postMessage({ type: 'meshLoaded', key, data });
+        } catch (e: any) {
+            this.panel.webview.postMessage({ type: 'meshLoaded', key, error: e?.message ?? String(e) });
+        }
+    }
+
     private async loadTexturePreview(resourceId: string, mip: number, eventId: number, channelExtract: number) {
         const key = `${resourceId}:${mip}:${eventId}:${channelExtract}`;
         if (this.texturePreviewCache.has(key)) {
@@ -388,6 +414,14 @@ export class InspectorPanel {
                 break;
             case 'requestTexture':
                 this.loadTexturePreview(msg.resourceId, msg.mip ?? 0, msg.eventId ?? this.currentEventId ?? 0, msg.channelExtract ?? -1);
+                break;
+            case 'requestMesh':
+                this.loadMesh(
+                    msg.eventId,
+                    msg.stage,
+                    msg.maxVertices ?? 256,
+                    msg.instance ?? 0,
+                );
                 break;
             case 'openShaderInEditor': {
                 const source = msg.source ?? '';

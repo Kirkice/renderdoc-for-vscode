@@ -21,6 +21,10 @@
 #include <vector>
 #include <map>
 #include <set>
+#include <chrono>
+#include <cmath>
+#include <thread>
+#include <atomic>
 
 // Third-party: ASTC LDR software decoder (BSD/Apache from ANGLE via basis_universal)
 #include "astc_dec/astc_decomp.h"
@@ -45,6 +49,23 @@ static DllLoader         g_dll;
 static ICaptureFile     *g_capFile    = nullptr;
 static IReplayController*g_replay     = nullptr;
 static bool              g_replayInit = false;
+
+// Guards all writes to stdout. The replay worker thread can emit progress
+// notifications while the main thread is also writing responses/logs, so
+// every `std::cout` write must hold this lock to avoid interleaved JSON
+// lines (which would make TS-side JSON.parse silently drop the message).
+static std::mutex        g_stdoutMutex;
+
+static inline void writeJsonLine(const json &j) {
+    std::lock_guard<std::mutex> lock(g_stdoutMutex);
+    std::cout << j.dump() << "\n" << std::flush;
+}
+
+// Cached headless replay output for drawcall-overlay rendering.
+// Reused across events as long as the backing dimensions don't change.
+static IReplayOutput    *g_overlayOut  = nullptr;
+static int32_t           g_overlayW    = 0;
+static int32_t           g_overlayH    = 0;
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -174,6 +195,19 @@ static json handleInit(int id, const json &params) {
     if (rdocPath.empty())
         return makeError(id, -1, "renderdocPath is required");
 
+#ifdef _WIN32
+    // Point the Windows DLL loader at the RenderDoc install dir BEFORE
+    // loading renderdoc.dll. The replay backends (GLES, Vulkan, etc.) live
+    // next to renderdoc.dll and in its plugins/ subfolder. Without this,
+    // OpenCapture can hang for minutes searching for missing dependencies.
+    {
+        std::wstring wpath(rdocPath.begin(), rdocPath.end());
+        SetDllDirectoryW(wpath.c_str());
+        // Also chdir so any relative-path lookups (plugins/<api>/...) work.
+        SetCurrentDirectoryW(wpath.c_str());
+    }
+#endif
+
     if (!g_dll.load(rdocPath))
         return makeError(id, -2, "Failed to load renderdoc.dll from: " + rdocPath);
 
@@ -208,7 +242,9 @@ static json handleOpenCapture(int id, const json &params) {
     if (path.empty())
         return makeError(id, -2, "path is required");
 
-    // Close previous capture if any
+    // Close previous capture if any. The overlay output is owned by the
+    // replay controller, so Shutdown() tears it down — just null our cache.
+    g_overlayOut = nullptr; g_overlayW = 0; g_overlayH = 0;
     if (g_replay) { g_replay->Shutdown(); g_replay = nullptr; }
     if (g_capFile) { g_capFile->Shutdown(); g_capFile = nullptr; }
 
@@ -277,6 +313,7 @@ static json handleOpenCapture(int id, const json &params) {
 }
 
 static json handleCloseCapture(int id) {
+    g_overlayOut = nullptr; g_overlayW = 0; g_overlayH = 0;
     if (g_replay) { g_replay->Shutdown(); g_replay = nullptr; }
     if (g_capFile) { g_capFile->Shutdown(); g_capFile = nullptr; }
     return makeResult(id, {{"closed", true}});
@@ -306,8 +343,61 @@ static json handleTryReplay(int id) {
     });
 #endif
 
+    // Emit periodic progress notifications so the TS side can drive a
+    // progress bar while OpenCapture crunches. RenderDoc calls this
+    // callback from its replay-worker thread, so we emit at most ~20 fps
+    // and only when the value changes meaningfully (>=1%). The notification
+    // has no `id` field; the TS dispatcher treats such messages as events.
+    auto lastEmitNs = std::chrono::steady_clock::now();
+    float lastProgress = -1.0f;
+    std::atomic<float> sharedProgress{0.0f};
+    std::atomic<bool>  openCaptureDone{false};
+    RENDERDOC_ProgressCallback progressCb = [&](float p) {
+        sharedProgress.store(p, std::memory_order_relaxed);
+        auto now = std::chrono::steady_clock::now();
+        auto sinceMs = std::chrono::duration_cast<std::chrono::milliseconds>(now - lastEmitNs).count();
+        if (sinceMs < 50 && std::abs(p - lastProgress) < 0.01f) return;
+        lastEmitNs = now;
+        lastProgress = p;
+        fprintf(stderr, "[bridge] OpenCapture progress: %.3f\n", p);
+        fflush(stderr);
+        json note = {
+            {"method", "tryReplayProgress"},
+            {"params", {{"progress", p}}},
+        };
+        writeJsonLine(note);
+    };
+
+    // Watchdog: RenderDoc's ProgressCallback is not monotonic and for some
+    // phases (e.g. shader compilation) it can be silent for tens of seconds.
+    // Print a heartbeat every 5s with the last-seen progress value so the
+    // user can tell we're alive and waiting for renderdoc.dll, rather than
+    // the bridge being hung on our side.
+    std::thread watchdog([&]() {
+        auto start = std::chrono::steady_clock::now();
+        while (!openCaptureDone.load(std::memory_order_acquire)) {
+            std::this_thread::sleep_for(std::chrono::seconds(5));
+            if (openCaptureDone.load(std::memory_order_acquire)) break;
+            auto secs = std::chrono::duration_cast<std::chrono::seconds>(
+                std::chrono::steady_clock::now() - start).count();
+            fprintf(stderr,
+                "[bridge] OpenCapture still running: elapsed=%llds, lastProgress=%.3f\n",
+                (long long)secs, sharedProgress.load(std::memory_order_relaxed));
+            fflush(stderr);
+        }
+    });
+
+    fprintf(stderr, "[bridge] Calling g_capFile->OpenCapture() ...\n");
+    fflush(stderr);
+
     rdcpair<ResultDetails, IReplayController *> replayResult =
-        g_capFile->OpenCapture(opts, nullptr);
+        g_capFile->OpenCapture(opts, progressCb);
+
+    openCaptureDone.store(true, std::memory_order_release);
+    if (watchdog.joinable()) watchdog.join();
+
+    fprintf(stderr, "[bridge] OpenCapture() returned, code=%d\n", (int)replayResult.first.code);
+    fflush(stderr);
 
     if (replayResult.first.code != ResultCode::Succeeded) {
         fprintf(stderr, "[bridge] tryReplay failed: code=%d\n", (int)replayResult.first.code);
@@ -568,40 +658,84 @@ static json handleGetShaderSourceForEvent(int id, const json &params) {
         stageResult["name"] = resNameLookup(si.resourceId);
         stageResult["entryPoint"] = rdcToStr(refl->entryPoint);
 
-        // Get source from debug info files
-        if (!refl->debugInfo.files.empty()) {
-            std::string combinedSource;
+        // Mirror RenderDoc desktop: expose every source file as its own tab
+        // instead of concatenating, and mark which file is the entry point.
+        // files[0] is always the entry file per the API contract; editBaseFile
+        // may override, and LineColumnInfo::fileIndex is another fallback.
+        const ShaderDebugInfo &dbg = refl->debugInfo;
+        int32_t entryFile = -1;
+        if (!dbg.files.empty()) {
+            if (dbg.editBaseFile >= 0 && (size_t)dbg.editBaseFile < dbg.files.size())
+                entryFile = dbg.editBaseFile;
+            else if (dbg.entryLocation.fileIndex >= 0 &&
+                     (size_t)dbg.entryLocation.fileIndex < dbg.files.size())
+                entryFile = dbg.entryLocation.fileIndex;
+            else
+                entryFile = 0;
+
             json files = json::array();
-            for (size_t i = 0; i < refl->debugInfo.files.size(); i++) {
+            for (size_t i = 0; i < dbg.files.size(); i++) {
                 files.push_back({
-                    {"filename", rdcToStr(refl->debugInfo.files[i].filename)},
-                    {"contents", rdcToStr(refl->debugInfo.files[i].contents)}
+                    {"filename", rdcToStr(dbg.files[i].filename)},
+                    {"contents", rdcToStr(dbg.files[i].contents)}
                 });
-                if (!combinedSource.empty()) combinedSource += "\n\n";
-                combinedSource += rdcToStr(refl->debugInfo.files[i].contents);
             }
             stageResult["sourceFiles"] = files;
-            stageResult["source"] = combinedSource;
+            stageResult["entryFileIndex"] = entryFile;
+            // Back-compat `source` field: return ONLY the entry file (matches
+            // RenderDoc's default tab) instead of a concat of everything.
+            stageResult["source"] = rdcToStr(dbg.files[entryFile].contents);
+            stageResult["sourceEncoding"] = (uint32_t)dbg.encoding;
         }
 
-        // Also try disassembly if no source files available or if target requested
-        if (refl->debugInfo.files.empty() || !targetDisasm.empty()) {
+        // Disassembly: pick a target that matches what RenderDoc's UI shows
+        // by default for this API, instead of blindly taking targets[0].
+        if (entryFile < 0 || !targetDisasm.empty()) {
             rdcarray<rdcstr> targets = g_replay->GetDisassemblyTargets(true);
             rdcstr tgt;
             if (!targetDisasm.empty()) {
                 tgt = targetDisasm.c_str();
             } else if (!targets.empty()) {
-                tgt = targets[0];
+                // Preferred default per API — matches the initial selection
+                // in the RenderDoc Shader Viewer dropdown.
+                const char *preferred[] = {
+                    // Pick in order: if the capture API had GLSL source then
+                    // disassembly isn't usually shown as default; otherwise:
+                    gl  ? "GLSL" :
+                    vk  ? "SPIR-V (RenderDoc)" :
+                    d11 ? "DXBC" :
+                    d12 ? "DXIL" : "",
+                    // Vulkan sometimes advertises plain "SPIR-V".
+                    vk  ? "SPIR-V" : "",
+                    // Generic fallback list — first match wins.
+                    "GLSL", "DXIL", "DXBC", "SPIR-V"
+                };
+                for (const char *p : preferred) {
+                    if (!p || !*p) continue;
+                    for (size_t i = 0; i < targets.size(); i++) {
+                        if (targets[i] == p) { tgt = targets[i]; break; }
+                    }
+                    if (!tgt.empty()) break;
+                }
+                if (tgt.empty()) tgt = targets[0];
             }
             if (!tgt.empty()) {
                 rdcstr disasm = g_replay->DisassembleShader(si.resourceId, refl, tgt);
                 std::string disasmStr = rdcToStr(disasm);
                 if (!disasmStr.empty()) {
                     stageResult["disassembly"] = disasmStr;
-                    if (!stageResult.contains("source") || stageResult["source"].get<std::string>().empty()) {
+                    stageResult["disassemblyTarget"] = rdcToStr(tgt);
+                    if (entryFile < 0) {
+                        // No sources at all — surface the disassembly in the
+                        // `source` field so existing UI paths keep working.
                         stageResult["source"] = disasmStr;
                     }
                 }
+                // Also expose the list of targets so the UI can offer a dropdown.
+                json tgtList = json::array();
+                for (size_t i = 0; i < targets.size(); i++)
+                    tgtList.push_back(rdcToStr(targets[i]));
+                stageResult["disassemblyTargets"] = tgtList;
             }
         }
 
@@ -1092,7 +1226,811 @@ static json handleGetPipelineState(int id, const json &params) {
     return makeResult(id, result);
 }
 
+// ────────────────────────────────────────────────────────────────────────────
+// Drawcall overlay — mirrors RenderDoc desktop's "Highlight Drawcall" feature.
+// Renders the active color RT at `eventId` with DebugOverlay::Drawcall, reads
+// the result back and returns it as a base64 PNG so the webview can display
+// the draw call location on top of the scene.
+// ────────────────────────────────────────────────────────────────────────────
+
+// Return the first bound color render target ResourceId at the current event,
+// or a default-constructed ResourceId() if nothing is bound.
+static ResourceId getCurrentColorTargetId() {
+    if (!g_replay) return ResourceId();
+
+    const auto *gl = g_replay->GetGLPipelineState();
+    if (gl) {
+        for (const auto &att : gl->framebuffer.drawFBO.colorAttachments) {
+            if (att.resource != ResourceId()) return att.resource;
+        }
+    }
+    const auto *vk = g_replay->GetVulkanPipelineState();
+    if (vk) {
+        for (const auto &att : vk->currentPass.framebuffer.attachments) {
+            if (att.resource != ResourceId()) return att.resource;
+        }
+    }
+    const auto *d11 = g_replay->GetD3D11PipelineState();
+    if (d11) {
+        for (const auto &rt : d11->outputMerger.renderTargets) {
+            if (rt.resource != ResourceId()) return rt.resource;
+        }
+    }
+    const auto *d12 = g_replay->GetD3D12PipelineState();
+    if (d12) {
+        for (const auto &rt : d12->outputMerger.renderTargets) {
+            if (rt.resource != ResourceId()) return rt.resource;
+        }
+    }
+    return ResourceId();
+}
+
+static json handleGetDrawcallOverlay(int id, const json &params) {
+    if (!g_replay)
+        return makeError(id, -1, "No replay active");
+
+    uint32_t eventId = params.value("eventId", (uint32_t)0);
+    if (eventId == 0)
+        return makeError(id, -2, "eventId is required");
+
+    fprintf(stderr, "[bridge] getDrawcallOverlay: eventId=%u\n", eventId);
+
+    // Seek to the requested event so pipeline state reflects the draw.
+    g_replay->SetFrameEvent(eventId, true);
+
+    // Locate the first bound color render target at this event.
+    ResourceId rtId = getCurrentColorTargetId();
+    if (rtId == ResourceId())
+        return makeError(id, -3, "No color render target bound at this event");
+
+    // Look up dimensions/samples of the RT.
+    const rdcarray<TextureDescription> &textures = g_replay->GetTextures();
+    uint32_t width = 0, height = 0;
+    uint32_t samples = 1;
+    for (size_t i = 0; i < textures.size(); i++) {
+        if (textures[i].resourceId == rtId) {
+            width   = textures[i].width;
+            height  = textures[i].height;
+            samples = textures[i].msSamp > 0 ? textures[i].msSamp : 1;
+            break;
+        }
+    }
+    if (width == 0 || height == 0)
+        return makeError(id, -4, "Color render target has zero dimensions");
+
+    // (Re)create the headless output to match the RT dimensions.
+    if (!g_overlayOut || g_overlayW != (int32_t)width || g_overlayH != (int32_t)height) {
+        if (g_overlayOut) {
+            g_overlayOut->Shutdown();
+            g_overlayOut = nullptr;
+        }
+        WindowingData win = CreateHeadlessWindowingData((int32_t)width, (int32_t)height);
+        g_overlayOut = g_replay->CreateOutput(win, ReplayOutputType::Texture);
+        if (!g_overlayOut)
+            return makeError(id, -5, "CreateOutput(headless) returned null");
+        g_overlayW = (int32_t)width;
+        g_overlayH = (int32_t)height;
+    }
+
+    // Configure the texture display with the drawcall overlay enabled.
+    TextureDisplay disp;
+    disp.resourceId           = rtId;
+    disp.typeCast             = CompType::Typeless;
+    disp.scale                = 1.0f;
+    disp.red = disp.green = disp.blue = true;
+    disp.alpha                = false;
+    disp.flipY                = false;
+    disp.hdrMultiplier        = -1.0f;
+    disp.linearDisplayAsGamma = true;
+    disp.rangeMin             = 0.0f;
+    disp.rangeMax             = 1.0f;
+    disp.subresource          = {0, 0, samples > 1 ? TextureDisplay::ResolveSamples : 0u};
+    disp.overlay              = DebugOverlay::Drawcall;
+
+    g_overlayOut->SetTextureDisplay(disp);
+    g_overlayOut->Display();
+
+    bytebuf pixels = g_overlayOut->ReadbackOutputTexture();
+    if (pixels.empty())
+        return makeError(id, -6, "ReadbackOutputTexture returned empty buffer");
+
+    // ReadbackOutputTexture returns tightly packed RGB 3-byte data.
+    const int comp = 3;
+    const int stride = (int)width * comp;
+    if ((size_t)stride * height != pixels.size()) {
+        fprintf(stderr, "[bridge] overlay readback size mismatch: got %zu, expected %d\n",
+                pixels.size(), stride * (int)height);
+        return makeError(id, -7, "Overlay readback size mismatch");
+    }
+
+    std::vector<uint8_t> pngData;
+    if (!stbi_write_png_to_func(stbiWriteToVector, &pngData,
+                                 (int)width, (int)height, comp,
+                                 pixels.data(), stride)) {
+        return makeError(id, -8, "PNG encode of overlay failed");
+    }
+
+    fprintf(stderr, "[bridge] overlay ready: %zu PNG bytes, %ux%u\n",
+            pngData.size(), width, height);
+
+    json result;
+    result["base64"]     = base64Encode(pngData);
+    result["format"]     = "png";
+    result["width"]      = width;
+    result["height"]     = height;
+    result["eventId"]    = eventId;
+    result["resourceId"] = resIdToU64(rtId);
+    result["rtName"]     = resNameLookup(rtId);
+    return makeResult(id, result);
+}
+
+// ── API Inspector: per-event structured chunk list ─────────────────────────
+// Walk the action tree and return pointer to the action whose eventId matches.
+static const ActionDescription *findActionByEventId(
+    const rdcarray<ActionDescription> &actions, uint32_t eventId)
+{
+    for (size_t i = 0; i < actions.size(); i++) {
+        const ActionDescription &a = actions[i];
+        if (a.eventId == eventId) return &a;
+        if (!a.children.empty()) {
+            const ActionDescription *hit = findActionByEventId(a.children, eventId);
+            if (hit) return hit;
+        }
+        // Also check nested events list — some APIs bundle multiple events
+        // under one ActionDescription. We consider a match if any of the
+        // APIEvents have the matching eventId, returning the enclosing action.
+        for (size_t e = 0; e < a.events.size(); e++) {
+            if (a.events[e].eventId == eventId) return &a;
+        }
+    }
+    return nullptr;
+}
+
+// Best-effort string form of an SDObject's leaf value (no deep recursion).
+// Used to build the API Inspector parameter preview line.
+static std::string sdLeafToStr(const SDObject *o) {
+    if (!o) return "null";
+    if (o->IsNULL()) return "NULL";
+    SDBasic bt = o->type.basetype;
+    switch (bt) {
+        case SDBasic::String:
+            return std::string("\"") + o->AsString().c_str() + "\"";
+        case SDBasic::UnsignedInteger:
+            return std::to_string(o->AsUInt64());
+        case SDBasic::SignedInteger:
+            return std::to_string(o->AsInt64());
+        case SDBasic::Float: {
+            char buf[32];
+            snprintf(buf, sizeof(buf), "%g", o->AsDouble());
+            return buf;
+        }
+        case SDBasic::Boolean:
+            return o->AsBool() ? "true" : "false";
+        case SDBasic::Character: {
+            char buf[8];
+            snprintf(buf, sizeof(buf), "'%c'", (char)o->AsUInt64());
+            return buf;
+        }
+        case SDBasic::Enum:
+            // For enums, SDObject stores the stringized value in data.str
+            return o->AsString().c_str();
+        case SDBasic::Resource: {
+            ResourceId rid;
+            uint64_t raw = o->AsUInt64();
+            memcpy(&rid, &raw, sizeof(rid));
+            std::string nm = resNameLookup(rid);
+            if (!nm.empty()) return nm;
+            return std::string("Resource ") + std::to_string(raw);
+        }
+        case SDBasic::Array:
+            return std::string("[") + std::to_string(o->NumChildren()) + "]";
+        case SDBasic::Struct:
+            return std::string("{") + std::to_string(o->NumChildren()) + "}";
+        case SDBasic::Buffer:
+            return "<buffer>";
+        default:
+            return "?";
+    }
+}
+
+// Render the top-level parameters of a chunk as "name=value, name=value" — a
+// compact RenderDoc-style summary suitable for the API Inspector row.
+static std::string chunkParamsSummary(const SDChunk &chunk) {
+    std::string out;
+    const size_t n = chunk.NumChildren();
+    const size_t maxShow = 6;
+    for (size_t i = 0; i < n && i < maxShow; i++) {
+        const SDObject *c = chunk.GetChild(i);
+        if (!c) continue;
+        if (!out.empty()) out += ", ";
+        const char *nm = c->name.c_str();
+        if (nm && *nm) { out += nm; out += "="; }
+        out += sdLeafToStr(c);
+    }
+    if (n > maxShow) out += ", ...";
+    return out;
+}
+
+static json handleGetEventChunks(int id, const json &params) {
+    if (!g_replay)
+        return makeError(id, -1, "No replay active");
+
+    uint32_t eventId = params.value("eventId", (uint32_t)0);
+
+    const rdcarray<ActionDescription> &actions = g_replay->GetRootActions();
+    const SDFile &sdfile = g_replay->GetStructuredFile();
+
+    const ActionDescription *action = findActionByEventId(actions, eventId);
+    json chunks = json::array();
+
+    auto appendChunk = [&](uint32_t evId, uint32_t chunkIndex) {
+        json j;
+        j["eventId"] = evId;
+        if (chunkIndex < sdfile.chunks.size() && sdfile.chunks[chunkIndex]) {
+            const SDChunk *ch = sdfile.chunks[chunkIndex];
+            j["name"]   = std::string(ch->name.c_str() ? ch->name.c_str() : "");
+            j["params"] = chunkParamsSummary(*ch);
+        } else {
+            j["name"] = "(unknown)";
+            j["params"] = "";
+        }
+        chunks.push_back(std::move(j));
+    };
+
+    if (action) {
+        for (size_t i = 0; i < action->events.size(); i++) {
+            const APIEvent &ev = action->events[i];
+            appendChunk(ev.eventId, ev.chunkIndex);
+        }
+    }
+
+    json result;
+    result["eventId"] = eventId;
+    result["chunks"]  = std::move(chunks);
+    return makeResult(id, result);
+}
+
+// -------- Mesh View --------
+// Decode a single component from raw bytes into a JSON number using the
+// destination CompType + byte width. Enough for the common vertex formats
+// (float32/16, int/uint 8/16/32, snorm/unorm 8/16).
+static double decodeScalar(const uint8_t *p, CompType ct, uint32_t byteWidth) {
+    switch (ct) {
+        case CompType::Float:
+            if (byteWidth == 4) { float v; memcpy(&v, p, 4); return (double)v; }
+            if (byteWidth == 8) { double v; memcpy(&v, p, 8); return v; }
+            if (byteWidth == 2) {
+                uint16_t h; memcpy(&h, p, 2);
+                uint32_t sign = (h & 0x8000) << 16;
+                uint32_t exp  = (h & 0x7C00) >> 10;
+                uint32_t mant = (h & 0x03FF);
+                uint32_t f;
+                if (exp == 0) {
+                    if (mant == 0) { f = sign; }
+                    else {
+                        exp = 1;
+                        while (!(mant & 0x0400)) { mant <<= 1; exp--; }
+                        mant &= 0x03FF;
+                        f = sign | ((exp + 112) << 23) | (mant << 13);
+                    }
+                } else if (exp == 31) {
+                    f = sign | 0x7F800000 | (mant << 13);
+                } else {
+                    f = sign | ((exp + 112) << 23) | (mant << 13);
+                }
+                float v; memcpy(&v, &f, 4); return (double)v;
+            }
+            break;
+        case CompType::UInt:
+            if (byteWidth == 1) return (double)*p;
+            if (byteWidth == 2) { uint16_t v; memcpy(&v, p, 2); return (double)v; }
+            if (byteWidth == 4) { uint32_t v; memcpy(&v, p, 4); return (double)v; }
+            if (byteWidth == 8) { uint64_t v; memcpy(&v, p, 8); return (double)v; }
+            break;
+        case CompType::SInt:
+            if (byteWidth == 1) return (double)(int8_t)*p;
+            if (byteWidth == 2) { int16_t v; memcpy(&v, p, 2); return (double)v; }
+            if (byteWidth == 4) { int32_t v; memcpy(&v, p, 4); return (double)v; }
+            if (byteWidth == 8) { int64_t v; memcpy(&v, p, 8); return (double)v; }
+            break;
+        case CompType::UNorm:
+        case CompType::UNormSRGB:
+            if (byteWidth == 1) return (double)*p / 255.0;
+            if (byteWidth == 2) { uint16_t v; memcpy(&v, p, 2); return (double)v / 65535.0; }
+            break;
+        case CompType::SNorm:
+            if (byteWidth == 1) { int8_t v = (int8_t)*p; return v < -127 ? -1.0 : (double)v / 127.0; }
+            if (byteWidth == 2) { int16_t v; memcpy(&v, p, 2); return v < -32767 ? -1.0 : (double)v / 32767.0; }
+            break;
+        case CompType::UScaled:
+            if (byteWidth == 1) return (double)*p;
+            if (byteWidth == 2) { uint16_t v; memcpy(&v, p, 2); return (double)v; }
+            break;
+        case CompType::SScaled:
+            if (byteWidth == 1) return (double)(int8_t)*p;
+            if (byteWidth == 2) { int16_t v; memcpy(&v, p, 2); return (double)v; }
+            break;
+        default: break;
+    }
+    return 0.0;
+}
+
+// Convert a MeshDataStage string (sent by the webview) to the enum.
+static MeshDataStage parseMeshStage(const std::string &s) {
+    if (s == "vsout" || s == "VSOut") return MeshDataStage::VSOut;
+    if (s == "gsout" || s == "GSOut") return MeshDataStage::GSOut;
+    return MeshDataStage::VSIn;
+}
+
+// Read `len` bytes from buffer `id` at `offset`. Empty result on failure.
+static std::vector<uint8_t> readBuffer(ResourceId resId, uint64_t offset, uint64_t len) {
+    if (!g_replay || resId == ResourceId() || len == 0) return {};
+    bytebuf raw = g_replay->GetBufferData(resId, offset, len);
+    std::vector<uint8_t> v(raw.size());
+    if (!raw.empty()) memcpy(v.data(), raw.data(), raw.size());
+    return v;
+}
+
+// Look up an index from a raw index buffer. byteStride: 1/2/4. baseVertex is added afterwards.
+static uint32_t readIndex(const std::vector<uint8_t> &idxBuf, uint32_t byteStride,
+                          uint32_t i, uint32_t restartIdx, bool &isRestart) {
+    isRestart = false;
+    uint64_t off = (uint64_t)i * byteStride;
+    if (off + byteStride > idxBuf.size()) { isRestart = true; return 0; }
+    const uint8_t *p = idxBuf.data() + off;
+    uint32_t v = 0;
+    if (byteStride == 1) v = p[0];
+    else if (byteStride == 2) { uint16_t t; memcpy(&t, p, 2); v = t; }
+    else if (byteStride == 4) memcpy(&v, p, 4);
+    if (restartIdx != 0 && v == restartIdx) isRestart = true;
+    return v;
+}
+
+static json handleGetMeshData(int id, const json &params) {
+    if (!g_replay)
+        return makeError(id, -1, "No replay active");
+
+    uint32_t eventId = params.value("eventId", (uint32_t)0);
+    std::string stageStr = params.value("stage", "vsin");
+    uint32_t maxVerts = params.value("maxVertices", (uint32_t)256);
+    uint32_t instance = params.value("instance", (uint32_t)0);
+    uint32_t view     = params.value("view", (uint32_t)0);
+    MeshDataStage stage = parseMeshStage(stageStr);
+
+    g_replay->SetFrameEvent(eventId, true);
+
+    // Pull a single MeshFormat for this stage; it describes how to read the
+    // primary (position) stream and where the index buffer lives. For VSIn
+    // we prefer the real ActionDescription counts (matches RenderDoc desktop
+    // BufferViewer.cpp ~L1791 which uses action->numIndices) because
+    // GetPostVSData(VSIn) can return 0 on APIs that don't expose a post-IA
+    // stream. For post-VS/GS stages the MeshFormat counts are authoritative.
+    MeshFormat mf = g_replay->GetPostVSData(instance, view, stage);
+
+    // For VSIn, override IB/topology/counts from the drawcall itself.
+    const ActionDescription *action = nullptr;
+    if (stage == MeshDataStage::VSIn) {
+        const rdcarray<ActionDescription> &actions = g_replay->GetRootActions();
+        action = findActionByEventId(actions, eventId);
+        if (action) {
+            if (mf.numIndices == 0) mf.numIndices = action->numIndices;
+            if (mf.baseVertex == 0)  mf.baseVertex = action->baseVertex;
+            // topology: get from per-API IA state
+            const auto *gl = g_replay->GetGLPipelineState();
+            const auto *vk = g_replay->GetVulkanPipelineState();
+            const auto *d11 = g_replay->GetD3D11PipelineState();
+            const auto *d12 = g_replay->GetD3D12PipelineState();
+            if (gl)       mf.topology = gl->vertexInput.topology;
+            else if (vk)  mf.topology = vk->inputAssembly.topology;
+            else if (d11) mf.topology = d11->inputAssembly.topology;
+            else if (d12) mf.topology = d12->inputAssembly.topology;
+            // IB from CurPipelineState + action's indexOffset
+            if (action->flags & ActionFlags::Indexed) {
+                ResourceId ib; uint64_t ibOffs = 0; uint32_t ibStride = 0;
+                if (gl)  { ib = gl->vertexInput.indexBuffer; ibStride = gl->vertexInput.indexByteStride; }
+                else if (vk)  { ib = vk->inputAssembly.indexBuffer.resourceId; ibOffs = vk->inputAssembly.indexBuffer.byteOffset; ibStride = vk->inputAssembly.indexBuffer.byteStride; }
+                else if (d11) { ib = d11->inputAssembly.indexBuffer.resourceId; ibOffs = d11->inputAssembly.indexBuffer.byteOffset; ibStride = d11->inputAssembly.indexBuffer.byteStride; }
+                else if (d12) { ib = d12->inputAssembly.indexBuffer.resourceId; ibOffs = d12->inputAssembly.indexBuffer.byteOffset; ibStride = d12->inputAssembly.indexBuffer.byteStride; }
+                mf.indexResourceId = ib;
+                mf.indexByteOffset = ibOffs + (uint64_t)action->indexOffset * ibStride;
+                mf.indexByteStride = ibStride;
+            } else {
+                // Non-indexed: produce a synthetic vertexOffset-based mapping via baseVertex.
+                mf.indexResourceId = ResourceId();
+                mf.indexByteStride = 0;
+                if (mf.baseVertex == 0) mf.baseVertex = action->vertexOffset;
+            }
+        }
+    }
+
+    json result;
+    result["eventId"] = eventId;
+    result["stage"] = stageStr;
+    result["topology"] = (uint32_t)mf.topology;
+    result["numIndices"] = mf.numIndices;
+    result["baseVertex"] = mf.baseVertex;
+    result["indexByteStride"] = mf.indexByteStride;
+    result["vertexByteStride"] = mf.vertexByteStride;
+    result["instance"] = instance;
+    result["view"] = view;
+    result["indexBufferId"] = resIdToU64(mf.indexResourceId);
+    result["vertexBufferId"] = resIdToU64(mf.vertexResourceId);
+
+    // Cap how many vertices we actually decode on this round-trip.
+    uint32_t total = mf.numIndices;
+    if (total == 0) {
+        result["rows"] = json::array();
+        result["attributes"] = json::array();
+        return makeResult(id, result);
+    }
+    uint32_t count = std::min(total, maxVerts);
+    result["totalIndices"] = total;
+    result["returnedIndices"] = count;
+
+    // For VSIn: enumerate user-bound vertex attributes so we can decode every
+    // one of them, not just the position that MeshFormat describes. Mirrors
+    // RenderDoc desktop PipeState::GetVertexInputs() in pipestate.inl so
+    // behaviour matches exactly (APPEND_ALIGNED sentinel for D3D, reflection
+    // based names, generic values on GL).
+    struct AttrRead {
+        std::string name;
+        ResourceId vb;
+        uint64_t vbOffset;
+        uint32_t vbStride;
+        uint32_t attrOffset;
+        ResourceFormat fmt;
+        bool perInstance;
+        uint32_t instanceRate;
+        bool used;               // shader reflection says this attr is read
+        bool genericEnabled;     // GL generic (glVertexAttrib4f) - no VB read
+        float genericF[4];
+        uint32_t genericU[4];
+        int32_t  genericI[4];
+        int      genericKind;    // 0=float 1=uint 2=sint
+    };
+    std::vector<AttrRead> attrs;
+
+    auto striequal = [](const rdcstr &a, const rdcstr &b) {
+        if (a.length() != b.length()) return false;
+        for (size_t i = 0; i < a.length(); i++)
+            if (std::toupper((unsigned char)a[i]) != std::toupper((unsigned char)b[i])) return false;
+        return true;
+    };
+
+    if (stage == MeshDataStage::VSIn) {
+        const auto *gl = g_replay->GetGLPipelineState();
+        const auto *vk = g_replay->GetVulkanPipelineState();
+        const auto *d11 = g_replay->GetD3D11PipelineState();
+        const auto *d12 = g_replay->GetD3D12PipelineState();
+
+        if (d11 || d12) {
+            // Common D3D path: 128 per-inputSlot running offsets for
+            // APPEND_ALIGNED (byteOffset == UINT32_MAX). Match pipestate.inl.
+            uint32_t byteOffs[128] = {};
+            const ShaderReflection *refl =
+                d11 ? (d11->inputAssembly.bytecode ? (const ShaderReflection*)d11->inputAssembly.bytecode : nullptr)
+                    : (d12->vertexShader.reflection);
+            size_t nLayouts = d11 ? d11->inputAssembly.layouts.size()
+                                  : d12->inputAssembly.layouts.size();
+            for (size_t i = 0; i < nLayouts; i++) {
+                rdcstr semName;
+                uint32_t semIdx, inputSlot, rawOffs;
+                ResourceFormat fmt;
+                bool perInst;
+                uint32_t instRate;
+                if (d11) {
+                    const auto &L = d11->inputAssembly.layouts[i];
+                    semName = L.semanticName; semIdx = L.semanticIndex;
+                    inputSlot = L.inputSlot; rawOffs = L.byteOffset; fmt = L.format;
+                    perInst = L.perInstance; instRate = L.instanceDataStepRate;
+                } else {
+                    const auto &L = d12->inputAssembly.layouts[i];
+                    semName = L.semanticName; semIdx = L.semanticIndex;
+                    inputSlot = L.inputSlot; rawOffs = L.byteOffset; fmt = L.format;
+                    perInst = L.perInstance; instRate = L.instanceDataStepRate;
+                }
+
+                // Disambiguate semantic names if duplicates exist.
+                bool needsSemIdx = false;
+                for (size_t j = 0; j < nLayouts; j++) {
+                    if (i == j) continue;
+                    rdcstr other = d11 ? d11->inputAssembly.layouts[j].semanticName
+                                       : d12->inputAssembly.layouts[j].semanticName;
+                    if (striequal(semName, other)) { needsSemIdx = true; break; }
+                }
+
+                uint32_t offs = rawOffs;
+                if (inputSlot < 128) {
+                    if (offs == UINT32_MAX)
+                        offs = byteOffs[inputSlot];
+                    else
+                        byteOffs[inputSlot] = offs;
+                    byteOffs[inputSlot] += (uint32_t)fmt.compByteWidth * (uint32_t)fmt.compCount;
+                }
+
+                AttrRead r{};
+                r.name = rdcToStr(semName) + (needsSemIdx ? std::to_string(semIdx) : "");
+                r.attrOffset = offs;
+                r.fmt = fmt;
+                r.perInstance = perInst;
+                r.instanceRate = instRate;
+                r.used = false;
+
+                size_t nVB = d11 ? d11->inputAssembly.vertexBuffers.size()
+                                 : d12->inputAssembly.vertexBuffers.size();
+                if ((size_t)inputSlot < nVB) {
+                    if (d11) {
+                        const auto &vb = d11->inputAssembly.vertexBuffers[inputSlot];
+                        r.vb = vb.resourceId; r.vbOffset = vb.byteOffset; r.vbStride = vb.byteStride;
+                    } else {
+                        const auto &vb = d12->inputAssembly.vertexBuffers[inputSlot];
+                        r.vb = vb.resourceId; r.vbOffset = vb.byteOffset; r.vbStride = vb.byteStride;
+                    }
+                }
+                if (refl) {
+                    const auto &sig = refl->inputSignature;
+                    for (size_t ia = 0; ia < sig.size(); ia++) {
+                        if (striequal(semName, sig[ia].semanticName) &&
+                            sig[ia].semanticIndex == semIdx) {
+                            r.used = true;
+                            break;
+                        }
+                    }
+                }
+                attrs.push_back(r);
+            }
+        } else if (gl) {
+            const auto &glAttrs = gl->vertexInput.attributes;
+            const ShaderReflection *refl = gl->vertexShader.reflection;
+            for (size_t i = 0; i < glAttrs.size(); i++) {
+                const auto &a = glAttrs[i];
+                AttrRead r{};
+                char nameBuf[32]; snprintf(nameBuf, sizeof(nameBuf), "attr%zu", i);
+                r.name = nameBuf;
+                r.attrOffset = a.byteOffset;
+                r.fmt = a.format;
+                r.used = true;
+                r.perInstance = false;
+                r.instanceRate = 0;
+                uint32_t vbIdx = a.vertexBufferSlot;
+                if ((size_t)vbIdx < gl->vertexInput.vertexBuffers.size()) {
+                    const auto &vb = gl->vertexInput.vertexBuffers[vbIdx];
+                    r.vb = vb.resourceId;
+                    r.vbOffset = vb.byteOffset;
+                    r.vbStride = vb.byteStride;
+                    r.perInstance = vb.instanceDivisor > 0;
+                    r.instanceRate = vb.instanceDivisor;
+                }
+                // Reflection: replace synthetic name with real shader input
+                // variable name, detect generic (disabled) attributes.
+                if (refl) {
+                    int attrib = a.boundShaderInput;
+                    if (attrib >= 0 && (size_t)attrib < refl->inputSignature.size()) {
+                        const auto &sig = refl->inputSignature[attrib];
+                        r.name = rdcToStr(sig.varName);
+                        if (!a.enabled) {
+                            // Generic (not backed by a VB). Store the
+                            // constant value the app last set.
+                            r.genericEnabled = true;
+                            r.perInstance = false;
+                            r.instanceRate = 0;
+                            uint32_t cc = sig.compCount;
+                            VarType vt = sig.varType;
+                            if (vt == VarType::Float || vt == VarType::Double) {
+                                r.genericKind = 0;
+                                for (uint32_t c = 0; c < cc && c < 4; c++)
+                                    r.genericF[c] = a.genericValue.floatValue[c];
+                                r.fmt.compType = CompType::Float;
+                            } else if (vt == VarType::UInt || vt == VarType::Bool) {
+                                r.genericKind = 1;
+                                for (uint32_t c = 0; c < cc && c < 4; c++)
+                                    r.genericU[c] = a.genericValue.uintValue[c];
+                                r.fmt.compType = CompType::UInt;
+                            } else if (vt == VarType::SInt) {
+                                r.genericKind = 2;
+                                for (uint32_t c = 0; c < cc && c < 4; c++)
+                                    r.genericI[c] = a.genericValue.intValue[c];
+                                r.fmt.compType = CompType::SInt;
+                            }
+                            r.fmt.compByteWidth = 4;
+                            r.fmt.compCount = (uint8_t)cc;
+                            r.fmt.type = ResourceFormatType::Regular;
+                        }
+                    }
+                }
+                attrs.push_back(r);
+            }
+        } else if (vk) {
+            const auto &vkAttrs = vk->vertexInput.attributes;
+            const ShaderReflection *refl = vk->vertexShader.reflection;
+            for (size_t i = 0; i < vkAttrs.size(); i++) {
+                const auto &a = vkAttrs[i];
+                AttrRead r{};
+                char nameBuf[32]; snprintf(nameBuf, sizeof(nameBuf), "attr%zu", i);
+                r.name = nameBuf;
+                r.attrOffset = a.byteOffset;
+                r.fmt = a.format;
+                r.used = true;
+                // Defaults per RenderDoc: perInstance=false, instanceRate=1
+                r.perInstance = false;
+                r.instanceRate = 1;
+                if ((size_t)a.binding < vk->vertexInput.bindings.size()) {
+                    const auto &bind = vk->vertexInput.bindings[a.binding];
+                    r.perInstance = bind.perInstance;
+                    r.instanceRate = bind.instanceDivisor;
+                }
+                // RenderDoc indexes vertexBuffers[] directly with attr.binding.
+                if ((size_t)a.binding < vk->vertexInput.vertexBuffers.size()) {
+                    const auto &vb = vk->vertexInput.vertexBuffers[a.binding];
+                    r.vb = vb.resourceId;
+                    r.vbOffset = vb.byteOffset;
+                    r.vbStride = vb.byteStride;
+                }
+                if (refl) {
+                    for (const auto &sig : refl->inputSignature) {
+                        if (sig.regIndex == a.location &&
+                            sig.systemValue == ShaderBuiltin::Undefined) {
+                            r.name = rdcToStr(sig.varName);
+                            break;
+                        }
+                    }
+                }
+                attrs.push_back(r);
+            }
+        }
+    }
+
+    // Fallback: if we don't have per-attribute info (post-VS stage, or we
+    // failed to enumerate), synthesise a single "POSITION" column from the
+    // MeshFormat that GetPostVSData returned.
+    if (attrs.empty()) {
+        AttrRead r{};
+        r.name = (stage == MeshDataStage::VSIn) ? "POSITION" : "gl_Position";
+        r.vb = mf.vertexResourceId;
+        r.vbOffset = mf.vertexByteOffset;
+        r.vbStride = mf.vertexByteStride;
+        r.attrOffset = 0;
+        r.fmt = mf.format;
+        r.used = true;
+        attrs.push_back(r);
+    }
+
+    // Report attribute schema.
+    json attrMeta = json::array();
+    for (const auto &a : attrs) {
+        attrMeta.push_back({
+            {"name", a.name},
+            {"compType", (uint32_t)a.fmt.compType},
+            {"compCount", a.fmt.compCount},
+            {"compByteWidth", a.fmt.compByteWidth},
+            {"bgra", a.fmt.BGRAOrder()},
+            {"formatType", (uint32_t)a.fmt.type},
+            {"vertexBufferId", resIdToU64(a.vb)},
+            {"byteStride", a.vbStride},
+            {"relativeOffset", a.attrOffset},
+            {"perInstance", a.perInstance},
+            {"instanceRate", a.instanceRate},
+            {"used", a.used},
+            {"genericEnabled", a.genericEnabled},
+        });
+    }
+    result["attributes"] = attrMeta;
+
+    // Read the index buffer covering at least the requested indices.
+    std::vector<uint8_t> idxBuf;
+    if (mf.indexResourceId != ResourceId() && mf.indexByteStride > 0) {
+        uint64_t need = (uint64_t)count * mf.indexByteStride;
+        idxBuf = readBuffer(mf.indexResourceId, mf.indexByteOffset, need);
+    }
+    // Use PipeState-style unified restart logic: IsRestartEnabled() +
+    // GetRestartIndex(). Emulate locally per API.
+    uint32_t restartIdx = 0;
+    bool restartEnabled = false;
+    {
+        const auto *gl = g_replay->GetGLPipelineState();
+        const auto *vk = g_replay->GetVulkanPipelineState();
+        const auto *d11 = g_replay->GetD3D11PipelineState();
+        const auto *d12 = g_replay->GetD3D12PipelineState();
+        if (gl && gl->vertexInput.primitiveRestart) {
+            restartEnabled = true;
+            restartIdx = gl->vertexInput.restartIndex;
+            if (mf.indexByteStride == 1)      restartIdx &= 0xFFu;
+            else if (mf.indexByteStride == 2) restartIdx &= 0xFFFFu;
+        } else if (vk && vk->inputAssembly.primitiveRestartEnable) {
+            restartEnabled = true;
+            restartIdx = (mf.indexByteStride == 2) ? 0xFFFFu : 0xFFFFFFFFu;
+        } else if (d11 && d11->inputAssembly.indexBuffer.byteStride > 0) {
+            // D3D11 uses topology cut-value; only strip topologies use it.
+            Topology t = d11->inputAssembly.topology;
+            if (t == Topology::LineStrip || t == Topology::TriangleStrip ||
+                t == Topology::LineStrip_Adj || t == Topology::TriangleStrip_Adj) {
+                restartEnabled = true;
+                restartIdx = (mf.indexByteStride == 2) ? 0xFFFFu : 0xFFFFFFFFu;
+            }
+        } else if (d12) {
+            // D3D12 has an explicit strip cut value (0 disables).
+            uint32_t cut = d12->inputAssembly.indexStripCutValue;
+            if (cut != 0) {
+                restartEnabled = true;
+                restartIdx = cut;
+            }
+        }
+    }
+    if (!restartEnabled) restartIdx = ~0u; // Sentinel readIndex won't match.
+
+    // Pre-read each attribute's VB into memory once (capped to the range we need).
+    struct AttrBuf { std::vector<uint8_t> data; uint32_t stride; uint32_t offset; };
+    std::vector<AttrBuf> vbufs(attrs.size());
+    for (size_t k = 0; k < attrs.size(); k++) {
+        const auto &a = attrs[k];
+        vbufs[k].stride = a.vbStride;
+        vbufs[k].offset = a.attrOffset;
+        if (a.vb == ResourceId() || a.vbStride == 0) continue;
+        // Over-read conservatively: we don't know max index value yet, so read
+        // a reasonable chunk. For indexed draws with small caps we still cover
+        // most meshes up to ~64k verts. If an index exceeds the buffer we'll
+        // gracefully fill zeros.
+        uint64_t readLen = (uint64_t)a.vbStride * 65536;
+        vbufs[k].data = readBuffer(a.vb, a.vbOffset, readLen);
+    }
+
+    // Build rows.
+    json rows = json::array();
+    for (uint32_t i = 0; i < count; i++) {
+        json row;
+        row["vtx"] = i;
+        uint32_t idx = i;
+        bool isRestart = false;
+        if (!idxBuf.empty()) {
+            uint32_t raw = readIndex(idxBuf, mf.indexByteStride, i, restartIdx, isRestart);
+            row["idx"] = raw;
+            row["restart"] = isRestart;
+            idx = isRestart ? 0 : (raw + (uint32_t)mf.baseVertex);
+        }
+
+        json cols = json::array();
+        for (size_t k = 0; k < attrs.size(); k++) {
+            const auto &a = attrs[k];
+            const auto &vb = vbufs[k];
+            json vals = json::array();
+            if (a.genericEnabled) {
+                // Constant per-attribute value (GL glVertexAttrib4f etc).
+                for (uint32_t c = 0; c < a.fmt.compCount; c++) {
+                    if (a.genericKind == 1)      vals.push_back((double)a.genericU[c]);
+                    else if (a.genericKind == 2) vals.push_back((double)a.genericI[c]);
+                    else                         vals.push_back((double)a.genericF[c]);
+                }
+            } else if (isRestart || vb.data.empty() || vb.stride == 0 ||
+                       a.fmt.type != ResourceFormatType::Regular) {
+                for (uint32_t c = 0; c < a.fmt.compCount; c++) vals.push_back(0.0);
+            } else {
+                uint32_t useIdx = a.perInstance
+                    ? (a.instanceRate ? (instance / a.instanceRate) : instance)
+                    : idx;
+                uint64_t base = (uint64_t)useIdx * vb.stride + vb.offset;
+                for (uint32_t c = 0; c < a.fmt.compCount; c++) {
+                    uint32_t srcC = (a.fmt.BGRAOrder() && a.fmt.compCount >= 3 && c < 3) ? (2u - c) : c;
+                    uint64_t off = base + (uint64_t)srcC * a.fmt.compByteWidth;
+                    if (off + a.fmt.compByteWidth > vb.data.size()) {
+                        vals.push_back(0.0);
+                    } else {
+                        vals.push_back(decodeScalar(vb.data.data() + off, a.fmt.compType,
+                                                    a.fmt.compByteWidth));
+                    }
+                }
+            }
+            cols.push_back(vals);
+        }
+        row["cols"] = cols;
+        rows.push_back(row);
+    }
+    result["rows"] = rows;
+
+    return makeResult(id, result);
+}
+
 static json handleShutdown(int id) {
+    g_overlayOut = nullptr; g_overlayW = 0; g_overlayH = 0;
     if (g_replay) { g_replay->Shutdown(); g_replay = nullptr; }
     if (g_capFile) { g_capFile->Shutdown(); g_capFile = nullptr; }
     if (g_replayInit && g_dll.isLoaded()) {
@@ -1127,6 +2065,9 @@ static json dispatch(const json &req) {
         if (method == "getTexturePreview") return handleGetTexturePreview(id, params);
         if (method == "saveTexture")        return handleSaveTexture(id, params);
         if (method == "getPipelineState")   return handleGetPipelineState(id, params);
+        if (method == "getDrawcallOverlay") return handleGetDrawcallOverlay(id, params);
+        if (method == "getEventChunks")     return handleGetEventChunks(id, params);
+        if (method == "getMeshData")        return handleGetMeshData(id, params);
         if (method == "shutdown")           return handleShutdown(id);
         return makeError(id, -100, "Unknown method: " + method);
     } catch (const std::exception &e) {
@@ -1141,7 +2082,7 @@ int main(int argc, char *argv[]) {
 
     // Signal readiness
     json ready = {{"ready", true}, {"protocol", "renderdoc-bridge/1.0"}};
-    std::cout << ready.dump() << "\n" << std::flush;
+    writeJsonLine(ready);
 
     // Read JSON lines from stdin
     std::string line;
@@ -1153,12 +2094,12 @@ int main(int argc, char *argv[]) {
             req = json::parse(line);
         } catch (const json::parse_error &e) {
             json err = makeError(0, -1000, std::string("JSON parse error: ") + e.what());
-            std::cout << err.dump() << "\n" << std::flush;
+            writeJsonLine(err);
             continue;
         }
 
         json response = dispatch(req);
-        std::cout << response.dump() << "\n" << std::flush;
+        writeJsonLine(response);
 
         // Exit after shutdown command
         if (req.value("method", "") == "shutdown")

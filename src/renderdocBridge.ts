@@ -32,8 +32,15 @@ import {
 } from './ipc/schemas';
 import { BridgeError } from './ipc/bridgeError';
 
-/** Default per-call timeout (ms) for native bridge requests. */
-const DEFAULT_NATIVE_CALL_TIMEOUT_MS = 30_000;
+/** Default per-call timeout (ms) for native bridge requests.
+ *  0 = no timeout. RenderDoc's own GUI doesn't time-box replay-related
+ *  calls (OpenCapture, replay driver init, GetRootActions etc. can take
+ *  tens of seconds on large GLES / D3D12 captures). We rely on the
+ *  process-death detector in `processNativeOutput` to reject hung calls
+ *  if the bridge actually crashes. Light health-check calls like `ping`
+ *  still pass their own short timeout explicitly.
+ */
+const DEFAULT_NATIVE_CALL_TIMEOUT_MS = 0;
 /** Shorter timeout used for the lightweight `ping` health check. */
 const NATIVE_PING_TIMEOUT_MS = 2_000;
 
@@ -361,6 +368,19 @@ export class RenderDocBridge {
     private nativeRequestId = 0;
     private nativePendingRequests = new Map<number, { method: string; resolve: (v: unknown) => void; reject: (e: BridgeError) => void }>();
     private nativeOutputBuffer = '';
+    /** Listeners for notifications (messages with no `id`) sent from the native bridge. */
+    private nativeNotificationListeners = new Map<string, Set<(params: any) => void>>();
+
+    /** Subscribe to a native bridge notification (e.g. `tryReplayProgress`). Returns an unsubscribe fn. */
+    onNativeNotification(method: string, listener: (params: any) => void): () => void {
+        let set = this.nativeNotificationListeners.get(method);
+        if (!set) {
+            set = new Set();
+            this.nativeNotificationListeners.set(method, set);
+        }
+        set.add(listener);
+        return () => { set!.delete(listener); };
+    }
 
     /** Check if native bridge is running */
     hasNativeBridge(): boolean {
@@ -394,9 +414,21 @@ export class RenderDocBridge {
         if (!bridgePath) { return; }
 
         try {
+            // Spawn with cwd + PATH set to the RenderDoc install dir, so
+            // renderdoc.dll can find its sibling DLLs and plugins/ subfolder.
+            // Without this, OpenCapture can hang for several minutes searching
+            // for missing plugin DLLs (the official RenderDoc GUI never hits
+            // this because it always runs from its own install dir).
+            const env = { ...process.env };
+            if (this.renderdocPath) {
+                const sep = process.platform === 'win32' ? ';' : ':';
+                const existingPath = env.PATH || env.Path || '';
+                env.PATH = this.renderdocPath + sep + existingPath;
+            }
             const child = cp.spawn(bridgePath, [], {
                 stdio: ['pipe', 'pipe', 'pipe'],
-                env: { ...process.env },
+                env,
+                cwd: this.renderdocPath || undefined,
             });
             this.nativeProcess = child;
             console.log('[RenderDoc] Native bridge spawned, pid:', child.pid);
@@ -509,6 +541,15 @@ export class RenderDocBridge {
                     } else {
                         pending.resolve(msg.result);
                     }
+                } else if (msg.id === undefined && typeof msg.method === 'string') {
+                    // Notification (no response expected). Dispatch to any
+                    // registered listeners for that method name.
+                    const listeners = this.nativeNotificationListeners.get(msg.method);
+                    if (listeners) {
+                        for (const fn of listeners) {
+                            try { fn(msg.params ?? {}); } catch { /* ignore listener errors */ }
+                        }
+                    }
                 }
             } catch {
                 // Ignore unparseable lines
@@ -527,32 +568,38 @@ export class RenderDocBridge {
             const msg = JSON.stringify({ id, method, params }) + '\n';
 
             // Resolve timeout: explicit arg > user setting > default.
+            // A value of 0 (or negative) explicitly disables the timeout —
+            // used for heavy operations like tryReplay that can legitimately
+            // take minutes on large captures.
             const configured = vscode.workspace.getConfiguration('renderdoc')
                 .get<number>('nativeBridge.callTimeoutMs');
             const ms = timeoutMs
                 ?? (typeof configured === 'number' && configured > 0 ? configured : DEFAULT_NATIVE_CALL_TIMEOUT_MS);
 
             // Wire up the timeout first so we can cancel it on success.
-            const timer = setTimeout(() => {
-                if (this.nativePendingRequests.has(id)) {
-                    this.nativePendingRequests.delete(id);
-                    reject(new BridgeError(
-                        'timeout',
-                        `Native bridge call '${method}' timed out after ${ms}ms`,
-                        { method },
-                    ));
-                }
-            }, ms);
+            // If ms <= 0, skip the timer entirely (no deadline).
+            const timer: NodeJS.Timeout | null = ms > 0
+                ? setTimeout(() => {
+                    if (this.nativePendingRequests.has(id)) {
+                        this.nativePendingRequests.delete(id);
+                        reject(new BridgeError(
+                            'timeout',
+                            `Native bridge call '${method}' timed out after ${ms}ms`,
+                            { method },
+                        ));
+                    }
+                }, ms)
+                : null;
 
             this.nativePendingRequests.set(id, {
                 method,
-                resolve: (v) => { clearTimeout(timer); resolve(v); },
-                reject:  (e) => { clearTimeout(timer); reject(e); },
+                resolve: (v) => { if (timer) { clearTimeout(timer); } resolve(v); },
+                reject:  (e) => { if (timer) { clearTimeout(timer); } reject(e); },
             });
 
             this.nativeProcess.stdin.write(msg, (err) => {
                 if (err) {
-                    clearTimeout(timer);
+                    if (timer) { clearTimeout(timer); }
                     this.nativePendingRequests.delete(id);
                     reject(new BridgeError('io', `stdin write failed: ${err.message}`, { method, cause: err }));
                 }
@@ -611,7 +658,12 @@ export class RenderDocBridge {
 
     /** Explicitly try local replay for SuggestRemote captures (user-initiated) */
     async nativeTryReplay(): Promise<any> {
-        return this.nativeCall('tryReplay', {});
+        // Initialising a replay driver can be very expensive for large
+        // captures (Unity GLES, big D3D12 frames): compiling shaders,
+        // creating a GL/D3D context, uploading resources, etc. RenderDoc's
+        // own GUI doesn't time-box this operation, so we disable the
+        // per-call timeout here (0 = no timeout) to match that behaviour.
+        return this.nativeCall('tryReplay', {}, 0);
     }
 
     /** Get pipeline state at a specific event via native bridge */
@@ -627,6 +679,46 @@ export class RenderDocBridge {
     /** Get texture data via native bridge (saves to temp PNG, returns base64) */
     async nativeGetTextureData(textureId: string, mip?: number, eventId?: number, channelExtract?: number): Promise<any> {
         return this.nativeCall('getTexturePreview', { resourceId: parseInt(textureId, 10) || 0, mip: mip ?? 0, eventId: eventId ?? 0, channelExtract: channelExtract ?? -1 });
+    }
+
+    /** Render the first bound color RT at `eventId` with a Drawcall overlay. */
+    async nativeGetDrawcallOverlay(eventId: number): Promise<{
+        base64: string;
+        format: string;
+        width: number;
+        height: number;
+        eventId: number;
+        resourceId: number;
+        rtName?: string;
+    }> {
+        return (await this.nativeCall('getDrawcallOverlay', { eventId })) as any;
+    }
+
+    /**
+     * Return the structured-file chunks that belong to the given event id.
+     * Feeds the API Inspector sidebar: one row per underlying `APIEvent`
+     * (e.g. glBindBuffer / glDrawElements) attached to the action.
+     */
+    async nativeGetEventChunks(eventId: number): Promise<{
+        eventId: number;
+        chunks: Array<{ eventId: number; name: string; params: string }>;
+    }> {
+        return (await this.nativeCall('getEventChunks', { eventId })) as any;
+    }
+
+    /** Fetch decoded mesh data for the draw at `eventId`. */
+    async nativeGetMeshData(
+        eventId: number,
+        stage: 'vsin' | 'vsout' | 'gsout' = 'vsin',
+        opts?: { maxVertices?: number; instance?: number; view?: number },
+    ): Promise<any> {
+        return this.nativeCall('getMeshData', {
+            eventId,
+            stage,
+            maxVertices: opts?.maxVertices ?? 256,
+            instance: opts?.instance ?? 0,
+            view: opts?.view ?? 0,
+        });
     }
 
     /** Get root actions (draw call tree) via native bridge */

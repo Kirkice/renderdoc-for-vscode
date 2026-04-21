@@ -66,17 +66,26 @@ export function buildInspectorHtml(
         </header>
 
         <nav class="tabs" role="tablist">
-            <button class="tab active" data-tab="overview" role="tab">Overview</button>
-            <button class="tab" data-tab="pipeline" role="tab">Pipeline</button>
+            <button class="tab active" data-tab="textures" role="tab">Texture Viewer</button>
+            <button class="tab" data-tab="pipeline" role="tab">Pipeline State</button>
             <button class="tab" data-tab="shaders" role="tab">Shaders</button>
-            <button class="tab" data-tab="textures" role="tab">Textures</button>
-            <button class="tab" data-tab="mesh" role="tab">Mesh</button>
-            <button class="tab" data-tab="events" role="tab">Events</button>
+            <button class="tab" data-tab="mesh" role="tab">Mesh View</button>
+            <button class="tab" data-tab="overview" role="tab">Overview</button>
+            <button class="tab" data-tab="resources" role="tab">Resource Inspector</button>
         </nav>
 
         <main class="content">
-            <section id="tab-overview" class="tab-panel active">
-                <div id="overview-body" class="empty-state">Load a capture to begin.</div>
+            <section id="tab-textures" class="tab-panel active">
+                <div id="tex-current" class="tex-current empty-state">Select an event to preview its render target.</div>
+                <div id="textures-toolbar" class="sub-toolbar">
+                    <div class="scope-toggle" data-scope="tex">
+                        <button class="scope active" data-val="output">Outputs (RTs)</button>
+                        <button class="scope" data-val="input">Inputs (Sampled)</button>
+                    </div>
+                    <input id="tex-filter" type="search" placeholder="Filter..." class="filter-input">
+                    <span id="tex-count" class="muted"></span>
+                </div>
+                <div id="textures-body" class="tex-grid empty-state">Select an event.</div>
             </section>
 
             <section id="tab-pipeline" class="tab-panel">
@@ -87,35 +96,53 @@ export function buildInspectorHtml(
                 <div id="shaders-toolbar" class="sub-toolbar" hidden>
                     <div id="shader-stage-tabs" class="stage-tabs"></div>
                 </div>
+                <div id="shader-file-tabs" class="stage-tabs shader-file-tabs" hidden></div>
                 <pre id="shaders-body" class="code-view empty-state">Select an event to view its shaders.</pre>
             </section>
 
-            <section id="tab-textures" class="tab-panel">
-                <div id="textures-toolbar" class="sub-toolbar">
-                    <div class="scope-toggle" data-scope="tex">
-                        <button class="scope" data-val="draw">This Draw (RTs)</button>
-                        <button class="scope active" data-val="all">All Textures</button>
-                    </div>
-                    <input id="tex-filter" type="search" placeholder="Filter textures..." class="filter-input">
-                    <span id="tex-count" class="muted"></span>
-                </div>
-                <div id="textures-body" class="tex-grid empty-state">Load a capture to see textures.</div>
-            </section>
-
             <section id="tab-mesh" class="tab-panel">
-                <div id="mesh-body" class="empty-state">Mesh input inspection requires bound buffer data (coming soon).</div>
+                <div id="mesh-toolbar" class="sub-toolbar">
+                    <div class="scope-toggle" data-scope="mesh">
+                        <button class="scope active" data-val="vsin">VS Input</button>
+                        <button class="scope" data-val="vsout">VS Output</button>
+                    </div>
+                    <label class="muted" style="display:flex;align-items:center;gap:4px;">
+                        Max rows:
+                        <input id="mesh-max" type="number" min="16" max="65536" value="256" style="width:70px;">
+                    </label>
+                    <button id="mesh-refresh" class="icon-btn">Reload</button>
+                    <button id="mesh-reset-view" class="icon-btn" title="Reset preview camera">Reset View</button>
+                    <label class="muted" style="display:flex;align-items:center;gap:4px;">
+                        <input id="mesh-show-preview" type="checkbox" checked>
+                        Preview
+                    </label>
+                    <span id="mesh-info" class="muted"></span>
+                </div>
+                <div id="mesh-split" class="mesh-split">
+                    <div id="mesh-body" class="mesh-table-wrap empty-state">Select an event to view mesh data.</div>
+                    <div id="mesh-preview-pane" class="mesh-preview-pane">
+                        <canvas id="mesh-canvas"></canvas>
+                        <div id="mesh-preview-hint" class="mesh-preview-hint">Drag: rotate · Shift+Drag: pan · Wheel: zoom</div>
+                    </div>
+                </div>
             </section>
 
-            <section id="tab-events" class="tab-panel">
-                <div id="events-toolbar" class="sub-toolbar">
-                    <div class="scope-toggle" data-scope="evt">
-                        <button class="scope" data-val="group">Current Group</button>
-                        <button class="scope active" data-val="all">All Events</button>
+            <section id="tab-overview" class="tab-panel">
+                <div id="overview-body" class="empty-state">Load a capture to begin.</div>
+            </section>
+
+            <section id="tab-resources" class="tab-panel">
+                <div id="resources-toolbar" class="sub-toolbar">
+                    <div class="scope-toggle" data-scope="res">
+                        <button class="scope active" data-val="all">All</button>
+                        <button class="scope" data-val="Texture">Textures</button>
+                        <button class="scope" data-val="Buffer">Buffers</button>
+                        <button class="scope" data-val="Shader">Shaders</button>
                     </div>
-                    <input id="evt-filter" type="search" placeholder="Filter events..." class="filter-input">
-                    <span id="evt-count" class="muted"></span>
+                    <input id="res-filter" type="search" placeholder="Filter resources..." class="filter-input">
+                    <span id="res-count" class="muted"></span>
                 </div>
-                <div id="events-body" class="event-tree empty-state">Load a capture.</div>
+                <div id="resources-body" class="resource-list empty-state">Load a capture to see resources.</div>
             </section>
         </main>
 
