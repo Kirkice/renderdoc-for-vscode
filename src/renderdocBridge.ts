@@ -18,6 +18,7 @@ import {
     GetTexturePreviewResponse,
     OpenCaptureResponse,
     TryReplayResponse,
+    GetTimingsResponse,
     validateResponse,
     type TGetRootActionsResponse,
     type TGetResourcesResponse,
@@ -29,6 +30,7 @@ import {
     type TGetTexturePreviewResponse,
     type TOpenCaptureResponse,
     type TTryReplayResponse,
+    type TGetTimingsResponse,
 } from './ipc/schemas';
 import { BridgeError } from './ipc/bridgeError';
 
@@ -136,15 +138,21 @@ function nativeResourceToInfo(r: any, textures: Map<string, any>): ResourceInfo 
     if (tex) { typeStr = 'Texture'; }
     return {
         resourceId: id,
-        name: typeof r.name === 'string' ? r.name : '',
+        name: (tex?.name ?? (typeof r.name === 'string' ? r.name : '')),
         type: typeStr,
         format: tex?.format ?? '',
         width: tex?.width ?? 0,
         height: tex?.height ?? 0,
         depth: tex?.depth ?? 0,
-        arraySize: tex?.arraysize ?? 0,
+        arraySize: tex?.arraySize ?? tex?.arraysize ?? 0,
         mipLevels: tex?.mips ?? 0,
-        byteSize: 0,
+        byteSize: tex?.byteSize ?? 0,
+        ...(tex ? {
+            textureType:  tex.textureType,
+            cubemap:      tex.cubemap,
+            msaaSamples:  tex.msaaSamples,
+            usage:        tex.usage,
+        } : {}),
     };
 }
 
@@ -251,6 +259,23 @@ export class RenderDocBridge {
         }
         const native = await this.nativeGetRootActions();
         return native.actions.map((a: any) => convertNativeActionToDrawCall(a));
+    }
+
+    /**
+     * Fetch per-event GPU duration by running `FetchCounters(EventGPUDuration)`.
+     * This re-replays the whole frame with timer queries and can take several
+     * seconds. Returns a map of eventId → duration in microseconds.
+     */
+    async getDrawTimings(): Promise<Map<number, number>> {
+        if (!this.hasNativeBridge()) {
+            throw new Error(NATIVE_REPLAY_REQUIRED_MSG);
+        }
+        const res: TGetTimingsResponse = await this.nativeCallT('getTimings', GetTimingsResponse, {});
+        const map = new Map<number, number>();
+        for (const t of res.timings) {
+            map.set(t.eventId, t.durationUs);
+        }
+        return map;
     }
 
     /** Get resource list — requires the native bridge with an active replay. */
@@ -679,6 +704,19 @@ export class RenderDocBridge {
     /** Get texture data via native bridge (saves to temp PNG, returns base64) */
     async nativeGetTextureData(textureId: string, mip?: number, eventId?: number, channelExtract?: number): Promise<any> {
         return this.nativeCall('getTexturePreview', { resourceId: parseInt(textureId, 10) || 0, mip: mip ?? 0, eventId: eventId ?? 0, channelExtract: channelExtract ?? -1 });
+    }
+
+    /**
+     * Render multiple textures at THUMB_DIM×THUMB_DIM using the GPU thumbnail output.
+     * Much faster than N individual getTexturePreview calls because:
+     *   1. SetFrameEvent is called only once for the whole batch
+     *   2. GPU renders directly to 256×256 — no temp file, no large PNG encode
+     * @param eventId Frame event to seek to (0 = end-of-frame)
+     * @param resourceIds Resource IDs to render
+     */
+    async nativeGetTextureThumbBatch(eventId: number, resourceIds: string[]): Promise<any> {
+        const textures = resourceIds.map(id => ({ resourceId: parseInt(id, 10) || 0, mip: 0 }));
+        return this.nativeCall('getTextureThumbBatch', { eventId, textures });
     }
 
     /** Render the first bound color RT at `eventId` with a Drawcall overlay. */

@@ -282,7 +282,7 @@
         html += '<div class="pipe-subtitle">Graphics Pipeline</div>';
         html += '<div class="pipe-flow">';
         GFX_PIPELINE.forEach((stage, idx) => {
-            if (idx > 0) html += '<span class="pipe-arrow">▶</span>';
+            if (idx > 0) html += '<span class="pipe-arrow">▼</span>';
             html += renderPipelineStage(stage, shaders, fb, vi);
         });
         html += '</div>';
@@ -345,9 +345,16 @@
         html += '<span class="ps-name">' + esc(stage.label) + '</span>';
         if (stage.kind === 'Shader') {
             if (shaderInfo) {
-                const shName = shaderInfo.name || resName(shaderInfo.resourceId);
-                html += '<span class="ps-shader" title="' + esc(shName) + '">' + esc(shName) + '</span>';
-                html += '<span class="ps-meta">id ' + esc(String(shaderInfo.resourceId)) + '</span>';
+                const progName = shaderInfo.programName || '';
+                const shName   = shaderInfo.shaderName  || '';
+                // Prefer program label (set by glObjectLabel on the program), fall back to shader name
+                const displayName = progName || shName || resName(shaderInfo.resourceId);
+                const tooltip = progName && shName ? progName + ' > ' + shName : displayName;
+                html += '<span class="ps-shader" title="' + esc(tooltip) + '">' + esc(displayName) + '</span>';
+                if (progName && shName)
+                    html += '<span class="ps-meta">&gt; ' + esc(shName) + '</span>';
+                else
+                    html += '<span class="ps-meta">id ' + esc(String(shaderInfo.resourceId)) + '</span>';
             } else {
                 html += '<span class="ps-meta">(not bound)</span>';
             }
@@ -550,6 +557,7 @@
     // Render the large "current draw output" preview panel on top of the
     // Texture Viewer tab — mirrors RenderDoc's "Cur Output" header image.
     const rtPreviewCache = new Map();   // key → base64 PNG
+    const rtPreviewErrors = new Map();  // key → error message (prevents infinite re-request)
     const rtPreviewPending = new Set(); // key currently in flight
     function rtKey(resId) {
         return String(resId) + ':0:' + (state.eventId || 0) + ':-1';
@@ -585,9 +593,15 @@
         area.className = 'tex-current';
         const key = rtKey(rtId);
         const cached = rtPreviewCache.get(key);
-        const body = cached
-            ? '<img src="data:image/png;base64,' + cached + '" alt="current RT">'
-            : '<div class="muted">Loading…</div>';
+        const errMsg = rtPreviewErrors.get(key);
+        let body;
+        if (cached) {
+            body = '<img src="data:image/png;base64,' + cached + '" alt="current RT">';
+        } else if (errMsg) {
+            body = '<div class="muted" style="padding:8px;font-size:0.85em;">Preview unavailable: ' + esc(errMsg) + '</div>';
+        } else {
+            body = '<div class="muted">Loading…</div>';
+        }
         area.innerHTML =
             '<div class="tex-current-header">' +
                 '<span class="tex-current-label">Cur Output 0</span>' +
@@ -600,7 +614,7 @@
         const btn = area.querySelector('.tex-current-open');
         if (btn) btn.addEventListener('click', () => openTextureModal(String(rtId)));
 
-        if (!cached && !rtPreviewPending.has(key)) {
+        if (!cached && !errMsg && !rtPreviewPending.has(key)) {
             rtPreviewPending.add(key);
             vscode.postMessage({
                 type: 'requestTexture',
@@ -614,11 +628,17 @@
 
     // Thumbnail management ──────────────────────────────────────
     // We keep a client-side cache of already-loaded thumbnails, keyed by
-    // "resId:eventId", so tab switches or filter changes don't refetch.
+    // resId alone (no eventId) — thumbnail cards show a static preview of
+    // the texture's content and do NOT need to be re-fetched on every event
+    // switch.  Only the large "Cur Output" RT preview uses an eventId key
+    // so it correctly tracks the RT state at the selected draw.
     const thumbCache = new Map();       // key → base64 PNG
     const thumbPending = new Set();     // key currently in flight
     function thumbKey(resId) {
-        return String(resId) + ':0:' + (state.eventId || 0) + ':-1';
+        // Use eventId=0 so the native bridge samples end-of-frame state.
+        // This key is stable across event changes, preventing the N-texture
+        // refetch stampede that made switching draws very slow.
+        return String(resId) + ':0:0:-1';
     }
     function requestThumbnail(resId) {
         const key = thumbKey(resId);
@@ -632,7 +652,7 @@
             type: 'requestTexture',
             resourceId: resId,
             mip: 0,
-            eventId: state.eventId || 0,
+            eventId: 0,   // end-of-frame state; thumbnails are capture-level, not per-event
             channelExtract: -1,
         });
     }
@@ -694,6 +714,8 @@
             rtPreviewPending.delete(m.key);
             if (!m.error && m.base64) {
                 rtPreviewCache.set(m.key, m.base64);
+            } else if (m.error) {
+                rtPreviewErrors.set(m.key, m.error);
             }
             if (state.activeTab === 'textures') renderCurrentRTPreview();
             // The same key may also satisfy a thumbnail card (RT is shown

@@ -303,6 +303,11 @@ export class InspectorPanel {
                     'Pipeline state request timed out after 30s.',
                 );
                 this.pipelineCache.set(eventId, result);
+                // Proactively pre-fetch all render-target thumbnails for this event
+                // so the Textures tab is instant when the user navigates to it.
+                if (eventId === this.currentEventId && result && !result.error) {
+                    this.prefetchRTTextures(eventId, result).catch(() => { /* best-effort */ });
+                }
             } catch (e: any) {
                 this.pipelineCache.set(eventId, { error: e.message });
             }
@@ -313,6 +318,39 @@ export class InspectorPanel {
                 eventId,
                 data: this.pipelineCache.get(eventId),
             });
+        }
+    }
+
+    /**
+     * Pre-fetch GPU thumbnails for all render targets at `eventId`.
+     * Uses the fast `getTextureThumbBatch` path (single SetFrameEvent + GPU render at 256×256).
+     * Results are stored in the texturePreviewCache and pushed to the webview immediately,
+     * so the Textures tab renders without waiting when the user switches to it.
+     */
+    private async prefetchRTTextures(eventId: number, pipeline: any) {
+        const fb = pipeline.framebuffer || {};
+        const rtIds: string[] = [
+            ...(fb.colorTargets || []).map(String),
+            ...(fb.depthTarget ? [String(fb.depthTarget)] : []),
+        ];
+        if (rtIds.length === 0) { return; }
+
+        // Only fetch RTs that are not yet in cache for this event
+        const uncached = rtIds.filter(id => !this.texturePreviewCache.has(`${id}:0:${eventId}:-1`));
+        if (uncached.length === 0) { return; }
+
+        try {
+            const batchResult = await this.bridge.nativeGetTextureThumbBatch(eventId, uncached);
+            if (!batchResult?.results) { return; }
+            for (const r of batchResult.results as any[]) {
+                if (!r?.base64 || this.currentEventId !== eventId) { continue; }
+                const key = `${r.resourceId}:0:${eventId}:-1`;
+                const data = { base64: r.base64, width: r.width, height: r.height, texFormat: r.texFormat };
+                this.texturePreviewCache.set(key, data);
+                this.panel.webview.postMessage({ type: 'texturePreview', key, ...data });
+            }
+        } catch (_e) {
+            // Pre-fetch failure is non-fatal; textures will load on demand instead
         }
     }
 

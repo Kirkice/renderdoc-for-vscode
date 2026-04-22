@@ -15,6 +15,13 @@ function computeEidRange(dc: DrawCall): { min: number; max: number } {
     return { min, max };
 }
 
+/** Format microseconds to a compact human-readable string. */
+function formatDuration(us: number): string {
+    if (us >= 1_000_000) { return `${(us / 1_000_000).toFixed(2)} s`; }
+    if (us >= 1_000)     { return `${(us / 1_000).toFixed(2)} ms`; }
+    return `${us.toFixed(1)} µs`;
+}
+
 export class DrawCallProvider implements vscode.TreeDataProvider<DrawCallItem> {
     private _onDidChangeTreeData = new vscode.EventEmitter<DrawCallItem | undefined>();
     readonly onDidChangeTreeData = this._onDidChangeTreeData.event;
@@ -63,6 +70,11 @@ class DrawCallItem extends vscode.TreeItem {
         this.tooltip = this.buildTooltip();
         this.iconPath = this.pickIcon();
         this.contextValue = 'drawcall';
+
+        // Show duration as the secondary description column when available
+        if (drawCall.durationUs !== undefined) {
+            this.description = formatDuration(drawCall.durationUs);
+        }
 
         // Clicking any node jumps the Inspector to that event.
         this.command = {
@@ -132,6 +144,7 @@ class DrawCallItem extends vscode.TreeItem {
         if (dc.numIndices > 0) { tip += `\nIndices: ${dc.numIndices}`; }
         if (dc.numInstances > 0) { tip += `\nInstances: ${dc.numInstances}`; }
         if (dc.flags) { tip += `\nFlags: ${dc.flags}`; }
+        if (dc.durationUs !== undefined) { tip += `\nGPU time: ${formatDuration(dc.durationUs)}`; }
         return tip;
     }
 }

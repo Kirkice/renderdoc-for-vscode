@@ -31,6 +31,7 @@ let currentCapturePath: string | undefined;
 // ── Selection tracking (for Copilot context) ──
 let currentSelectedDrawCall: any | undefined;
 let currentSelectedResource: any | undefined;
+let currentDrawCalls: DrawCall[] = [];
 
 // Path of the capture currently known to the native bridge process.
 // Used to force-restart the bridge before loading a different capture,
@@ -171,6 +172,7 @@ export async function activate(context: vscode.ExtensionContext) {
                 DrawOverlayPanel.currentPanel.showEvent(sel.eventId, sel.label).catch(() => {});
             }
         }),
+        vscode.commands.registerCommand('renderdoc.fetchTimings', () => fetchTimings()),
     );    // ── Copilot integration (non-critical, don't break extension if unavailable) ──
     try {
         const getCapturePath = () => currentCapturePath;
@@ -178,7 +180,7 @@ export async function activate(context: vscode.ExtensionContext) {
             selectedDrawCall: currentSelectedDrawCall,
             selectedResource: currentSelectedResource,
         });
-        initTools(bridge, getCapturePath, getSelectionContext);
+        initTools(bridge, getCapturePath, getSelectionContext, () => currentDrawCalls);
         initChatParticipant(bridge, getCapturePath, getSelectionContext);
         registerAllTools(context);
         registerChatParticipant(context);
@@ -246,6 +248,7 @@ async function loadCapture(context: vscode.ExtensionContext, filePath: string, s
     if (cached) {
         console.log('[RenderDoc] loadCapture: cache hit, skipping replay init.');
         captureInfoProvider.update(cached.captureInfo);
+        currentDrawCalls = cached.drawCalls;
         drawCallProvider.update(cached.drawCalls);
         resourceProvider.update(cached.resources);
         apiInspectorProvider.clear();
@@ -435,6 +438,7 @@ async function loadCapture(context: vscode.ExtensionContext, filePath: string, s
                 if (token.isCancellationRequested) { return; }
                 progress.report({ message: 'Loading draw calls...', increment: 10 });
                 drawCalls = await bridge.getDrawCalls(filePath);
+                currentDrawCalls = drawCalls;
                 drawCallProvider.update(drawCalls);
 
                 if (token.isCancellationRequested) { return; }
@@ -510,12 +514,51 @@ async function refreshCapture() {
     const captureInfo = await bridge.getCaptureInfo(info.filePath);
     captureInfoProvider.update(captureInfo);
     const drawCalls = await bridge.getDrawCalls(info.filePath);
+    currentDrawCalls = drawCalls;
     drawCallProvider.update(drawCalls);
     const resources = await bridge.getResources(info.filePath);
     resourceProvider.update(resources);
     if (InspectorPanel.currentPanel) {
         InspectorPanel.currentPanel.setCapture(captureInfo, drawCalls, resources);
     }
+}
+
+/** Walk draw call tree and attach GPU timings by eventId. */
+function applyTimingsToTree(calls: DrawCall[], timings: Map<number, number>): void {
+    for (const dc of calls) {
+        const t = timings.get(dc.eventId);
+        if (t !== undefined) { dc.durationUs = t; }
+        if (dc.children && dc.children.length > 0) {
+            applyTimingsToTree(dc.children, timings);
+        }
+    }
+}
+
+async function fetchTimings() {
+    if (!bridge.hasNativeBridge()) {
+        vscode.window.showWarningMessage('RenderDoc: GPU timings require an active local replay.');
+        return;
+    }
+    if (currentDrawCalls.length === 0) {
+        vscode.window.showWarningMessage('RenderDoc: No draw calls loaded. Open a capture first.');
+        return;
+    }
+    await vscode.window.withProgress(
+        { location: vscode.ProgressLocation.Notification, title: 'RenderDoc — Fetching GPU timings…' },
+        async (progress) => {
+            progress.report({ message: 'Replaying frame with timer queries…' });
+            try {
+                const timings = await bridge.getDrawTimings();
+                applyTimingsToTree(currentDrawCalls, timings);
+                drawCallProvider.update(currentDrawCalls);
+                vscode.window.showInformationMessage(
+                    `RenderDoc: GPU timings loaded for ${timings.size} events.`
+                );
+            } catch (err: any) {
+                vscode.window.showErrorMessage(`RenderDoc: Failed to fetch timings — ${err.message}`);
+            }
+        }
+    );
 }
 
 async function configureRenderdocPath() {
@@ -609,7 +652,11 @@ async function viewShaderSource(context: vscode.ExtensionContext, item: any) {
                 }
                 const panelData: Record<string, string> = {};
                 for (const [stage, info] of Object.entries(result.shaders) as [string, any][]) {
-                    panelData[stage] = info.source || info.disassembly || '// No source available';
+                    // Build a human-readable tab label: "VertexShader  myVS.hlsl (main)"
+                    const shaderName: string = info.name || '';
+                    const entry: string = info.entryPoint && info.entryPoint !== 'main' ? ` (${info.entryPoint})` : '';
+                    const tabLabel = shaderName ? `${stage}  ${shaderName}${entry}` : `${stage}${entry}`;
+                    panelData[tabLabel] = info.source || info.disassembly || '// No source available';
                 }
                 showShaderPanel(context, panelData, eventId);
             } catch (err: any) {

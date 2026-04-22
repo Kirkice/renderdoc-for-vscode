@@ -110,20 +110,38 @@ export const GetResourcesResponse = z.object({
 
 export const NativeTexture = z.object({
     resourceId: ResourceId,
+    name: z.string().optional(),
+    format: z.string(),
+    textureType: z.string().optional(),
     width: z.number(),
     height: z.number(),
     depth: z.number(),
     mips: z.number(),
-    arraysize: z.number(),
-    format: z.string(),
-    dimension: z.number(),
-    type: z.number(),
+    arraySize: z.number().optional(),
+    arraysize: z.number().optional(),   // compat with old bridge builds
+    cubemap: z.boolean().optional(),
+    msaaSamples: z.number().optional(),
+    msaaQuality: z.number().optional(),
+    byteSize: z.number().optional(),
+    usage: z.string().optional(),
 });
 
 export const GetTexturesResponse = z.object({
     textures: z.array(NativeTexture),
     count: z.number(),
 });
+
+export const TimingEntry = z.object({
+    eventId: z.number(),
+    durationUs: z.number(),
+});
+
+export const GetTimingsResponse = z.object({
+    timings: z.array(TimingEntry),
+    count: z.number(),
+});
+
+export type TGetTimingsResponse = z.infer<typeof GetTimingsResponse>;
 
 export const GetDisassemblyTargetsResponse = z.object({
     targets: z.array(z.string()),

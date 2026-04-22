@@ -7,15 +7,18 @@ import { InspectorPanel } from '../views/inspectorPanel';
 let _bridge: RenderDocBridge;
 let _getCurrentCapturePath: () => string | undefined;
 let _getSelectionContext: () => { selectedDrawCall: any; selectedResource: any };
+let _getCurrentDrawCalls: () => DrawCall[];
 
 export function initTools(
     bridge: RenderDocBridge,
     getCurrentCapturePath: () => string | undefined,
     getSelectionContext: () => { selectedDrawCall: any; selectedResource: any },
+    getCurrentDrawCalls?: () => DrawCall[],
 ) {
     _bridge = bridge;
     _getCurrentCapturePath = getCurrentCapturePath;
     _getSelectionContext = getSelectionContext;
+    _getCurrentDrawCalls = getCurrentDrawCalls ?? (() => []);
 }
 
 function requireCapturePath(): string {
@@ -56,7 +59,12 @@ export class GetDrawCallsTool implements vscode.LanguageModelTool<GetDrawCallsIn
         _token: vscode.CancellationToken,
     ): Promise<vscode.LanguageModelToolResult> {
         const filePath = requireCapturePath();
-        let drawCalls = await _bridge.getDrawCalls(filePath);
+        // Prefer the in-memory draw calls (may contain durationUs from fetchTimings).
+        // Fall back to re-fetching from the bridge if nothing is cached yet.
+        let drawCalls = _getCurrentDrawCalls();
+        if (drawCalls.length === 0) {
+            drawCalls = await _bridge.getDrawCalls(filePath);
+        }
 
         const filter = options.input?.filter?.toLowerCase();
         if (filter) {
@@ -351,22 +359,67 @@ interface DrawCallSummary {
     dispatchCount: number;
     otherCount: number;
     topLevelGroups: number;
-    drawCalls: DrawCall[];
+    /** Compact top-level tree (children stripped to childCount) for context efficiency. */
+    tree: CompactDrawCall[];
+    /** Flat leaf-level draw calls (no children), capped at 100. */
+    drawCalls: FlatDrawCall[];
+    truncated: boolean;
+}
+
+interface FlatDrawCall {
+    eventId: number;
+    name: string;
+    flags: string;
+    numIndices: number;
+    numInstances: number;
+    durationUs?: number;
+}
+
+interface CompactDrawCall {
+    eventId: number;
+    name: string;
+    childCount: number;
+    children?: CompactDrawCall[];
+}
+
+const FLAT_LIMIT = 100;
+/**
+ * Compact tree depth: 0 = camera/top-level groups, 1 = render-pass sub-groups.
+ * At depth >= TREE_DEPTH_LIMIT children are replaced by childCount only.
+ * Keeping this at 2 means the tree expands Camera→Pass→(count) — enough for a
+ * render-flow diagram without listing every individual draw call.
+ */
+const TREE_DEPTH_LIMIT = 2;
+
+function toCompactTree(list: DrawCall[], depth = 0): CompactDrawCall[] {
+    return list.map(dc => {
+        const node: CompactDrawCall = {
+            eventId: dc.eventId,
+            name: dc.name,
+            childCount: dc.children?.length ?? 0,
+        };
+        if (dc.children?.length && depth < TREE_DEPTH_LIMIT) {
+            node.children = toCompactTree(dc.children, depth + 1);
+        }
+        return node;
+    });
 }
 
 function summarizeDrawCalls(drawCalls: DrawCall[]): DrawCallSummary {
     let drawCount = 0, clearCount = 0, dispatchCount = 0, otherCount = 0;
-    const flat: DrawCall[] = [];
+    const flat: FlatDrawCall[] = [];
 
     function walk(list: DrawCall[]) {
         for (const dc of list) {
-            flat.push(dc);
+            // Strip children to avoid recursive duplication in flat list
+            const { children, ...rest } = dc;
+            flat.push(rest);
             const lower = dc.name.toLowerCase();
             if (lower.includes('draw')) { drawCount++; }
             else if (lower.includes('clear')) { clearCount++; }
             else if (lower.includes('dispatch')) { dispatchCount++; }
             else { otherCount++; }
-            if (dc.children?.length) { walk(dc.children); }
+            if (children?.length) { walk(children); }
         }
     }
     walk(drawCalls);
@@ -378,7 +431,9 @@ function summarizeDrawCalls(drawCalls: DrawCall[]): DrawCallSummary {
         dispatchCount,
         otherCount,
         topLevelGroups: drawCalls.length,
-        drawCalls: flat.length > 200 ? flat.slice(0, 200) : flat,
+        tree: toCompactTree(drawCalls),
+        drawCalls: flat.slice(0, FLAT_LIMIT),
+        truncated: flat.length > FLAT_LIMIT,
     };
 }
 
@@ -502,6 +557,82 @@ export class GetSelectionContextTool implements vscode.LanguageModelTool<Record<
     }
 }
 
+// ─── Tool: Get Mesh Data ─────────────────────────────────────────────────────
+interface GetMeshDataInput {
+    eventId: number;
+    /** 'vsin' = vertex shader input, 'vsout' = post-VS, 'gsout' = post-GS. Default: 'vsin' */
+    stage?: 'vsin' | 'vsout' | 'gsout';
+    /** Max vertices to return in 'rows'. Copilot default: 32. UI default: 256. */
+    maxVertices?: number;
+    /** Instance index (for instanced draws). Default: 0 */
+    instance?: number;
+}
+
+export class GetMeshDataTool implements vscode.LanguageModelTool<GetMeshDataInput> {
+    async invoke(
+        options: vscode.LanguageModelToolInvocationOptions<GetMeshDataInput>,
+        _token: vscode.CancellationToken,
+    ): Promise<vscode.LanguageModelToolResult> {
+        const { eventId, stage = 'vsin', maxVertices = 32, instance = 0 } = options.input;
+        const raw = await _bridge.nativeGetMeshData(eventId, stage, { maxVertices, instance });
+
+        // Topology enum → readable string (mirrors RenderDoc Topology enum order)
+        const TOPOLOGY = ['Unknown','PointList','LineList','LineStrip','TriangleList','TriangleStrip',
+            'LineList_Adj','LineStrip_Adj','TriangleList_Adj','TriangleStrip_Adj',
+            'PatchList_1CPs','PatchList_2CPs','PatchList_3CPs','PatchList_4CPs',
+            'PatchList_5CPs','PatchList_6CPs','PatchList_7CPs','PatchList_8CPs',
+            'PatchList_9CPs','PatchList_10CPs','PatchList_11CPs','PatchList_12CPs',
+            'PatchList_13CPs','PatchList_14CPs','PatchList_15CPs','PatchList_16CPs',
+        ];
+        const topoStr = TOPOLOGY[raw.topology] ?? `Topology(${raw.topology})`;
+
+        // Build a compact summary instead of dumping all raw rows
+        const attrs: Array<{ name: string; format: string; used: boolean; perInstance: boolean }> =
+            (raw.attributes ?? []).map((a: any) => ({
+                name: a.name,
+                format: a.format,
+                used: a.used,
+                perInstance: a.perInstance,
+            }));
+
+        // Build human-readable rows: { vtx, idx?, [attrName]: [values] }
+        const attrNames: string[] = (raw.attributes ?? []).map((a: any) => a.name as string);
+        const rows = (raw.rows ?? []).map((r: any) => {
+            const row: Record<string, unknown> = { vtx: r.vtx };
+            if (r.idx !== undefined) { row.idx = r.idx; }
+            if (r.restart) { row.restart = true; }
+            (r.cols ?? []).forEach((vals: number[], k: number) => {
+                row[attrNames[k] ?? `attr${k}`] = vals.length === 1 ? vals[0] : vals;
+            });
+            return row;
+        });
+
+        const summary = {
+            eventId: raw.eventId,
+            stage,
+            topology: topoStr,
+            totalVertices: raw.totalIndices,
+            returnedVertices: raw.returnedIndices,
+            indexed: raw.indexByteStride > 0,
+            indexByteStride: raw.indexByteStride || undefined,
+            attributes: attrs,
+            rows,
+        };
+
+        return new vscode.LanguageModelToolResult([
+            new vscode.LanguageModelTextPart(JSON.stringify(summary, null, 2)),
+        ]);
+    }
+
+    async prepareInvocation(
+        options: vscode.LanguageModelToolInvocationPrepareOptions<GetMeshDataInput>,
+        _token: vscode.CancellationToken,
+    ): Promise<vscode.PreparedToolInvocation> {
+        const stage = options.input?.stage ?? 'vsin';
+        return { invocationMessage: `Reading mesh data (${stage}) at EID ${options.input?.eventId}…` };
+    }
+}
+
 // ─── Registration ───────────────────────────────────────────────────────────
 export function registerAllTools(context: vscode.ExtensionContext) {
     context.subscriptions.push(
@@ -515,5 +646,6 @@ export function registerAllTools(context: vscode.ExtensionContext) {
         vscode.lm.registerTool('renderdoc_getTextureInfo', new GetTextureInfoTool()),
         vscode.lm.registerTool('renderdoc_analyzeFrame', new AnalyzeFrameTool()),
         vscode.lm.registerTool('renderdoc_getSelectionContext', new GetSelectionContextTool()),
+        vscode.lm.registerTool('renderdoc_getMeshData', new GetMeshDataTool()),
     );
 }

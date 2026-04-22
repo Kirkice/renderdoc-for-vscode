@@ -272,6 +272,12 @@
         "icon": "$(eye)"
       },
       {
+        "command": "renderdoc.fetchTimings",
+        "title": "Fetch GPU Timings",
+        "category": "RenderDoc",
+        "icon": "$(clock)"
+      },
+      {
         "command": "renderdoc.showDrawCallDetails",
         "title": "Show Draw Call Details",
         "category": "RenderDoc"
@@ -401,6 +407,11 @@
           "command": "renderdoc.showDrawcallOverlay",
           "when": "view == renderdoc-drawCalls",
           "group": "navigation@1"
+        },
+        {
+          "command": "renderdoc.fetchTimings",
+          "when": "view == renderdoc-drawCalls",
+          "group": "navigation@2"
         },
         {
           "command": "renderdoc.viewAllShaders",

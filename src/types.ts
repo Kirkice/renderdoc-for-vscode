@@ -29,6 +29,8 @@ export interface DrawCall {
     numIndices: number;
     numInstances: number;
     children: DrawCall[];
+    /** GPU duration in microseconds — populated by renderdoc.fetchTimings */
+    durationUs?: number;
 }
 
 export interface ResourceInfo {

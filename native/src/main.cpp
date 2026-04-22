@@ -67,6 +67,23 @@ static IReplayOutput    *g_overlayOut  = nullptr;
 static int32_t           g_overlayW    = 0;
 static int32_t           g_overlayH    = 0;
 
+// Track the last SetFrameEvent position so we can skip redundant full replays.
+// All handlers that advance the frame must go through ensureEvent().
+// UINT32_MAX means "unknown / just opened capture".
+static uint32_t          g_currentEventId = UINT32_MAX;
+static void ensureEvent(uint32_t eid) {
+    if (eid == g_currentEventId) return;  // already there — no replay needed
+    g_replay->SetFrameEvent(eid, false);
+    g_currentEventId = eid;
+}
+static void resetEventCache() { g_currentEventId = UINT32_MAX; }
+
+// Persistent 256×256 headless output used for fast GPU-rendered thumbnails.
+// SetTextureDisplay + Display + ReadbackOutputTexture is much faster than
+// SaveTexture-to-file for small preview images (no temp-file I/O, GPU-scaled).
+static IReplayOutput    *g_thumbOut    = nullptr;
+static const int32_t     THUMB_DIM     = 256;
+
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
 static json makeError(int id, int code, const std::string &msg) {
@@ -102,6 +119,39 @@ static std::string resultMessage(const ResultDetails &r) {
 // ResourceFormat::Name() calls RENDERDOC_ResourceFormatName in the DLL.
 // Provide a basic string representation instead.
 static std::string formatToStr(const ResourceFormat &f) {
+    // Special / packed / block-compressed types
+    switch(f.type) {
+        case ResourceFormatType::BC1:         return f.compType == CompType::UNormSRGB ? "BC1_SRGB" : "BC1_UNORM";
+        case ResourceFormatType::BC2:         return f.compType == CompType::UNormSRGB ? "BC2_SRGB" : "BC2_UNORM";
+        case ResourceFormatType::BC3:         return f.compType == CompType::UNormSRGB ? "BC3_SRGB" : "BC3_UNORM";
+        case ResourceFormatType::BC4:         return f.compType == CompType::SNorm  ? "BC4_SNORM" : "BC4_UNORM";
+        case ResourceFormatType::BC5:         return f.compType == CompType::SNorm  ? "BC5_SNORM" : "BC5_UNORM";
+        case ResourceFormatType::BC6:         return f.compType == CompType::Float  ? "BC6H_SF16" : "BC6H_UF16";
+        case ResourceFormatType::BC7:         return f.compType == CompType::UNormSRGB ? "BC7_SRGB" : "BC7_UNORM";
+        case ResourceFormatType::ETC2:        return f.compType == CompType::UNormSRGB ? "ETC2_SRGB" : "ETC2_UNORM";
+        case ResourceFormatType::EAC:         return f.compCount == 1 ? "EAC_R11_UNORM" : "EAC_RG11_UNORM";
+        case ResourceFormatType::ASTC:        return f.compType == CompType::UNormSRGB ? "ASTC_SRGB" : "ASTC_UNORM";
+        case ResourceFormatType::PVRTC:       return "PVRTC";
+        case ResourceFormatType::R10G10B10A2: return f.compType == CompType::UNorm ? "R10G10B10A2_UNORM" : "R10G10B10A2_UINT";
+        case ResourceFormatType::R11G11B10:   return "R11G11B10_FLOAT";
+        case ResourceFormatType::R9G9B9E5:    return "R9G9B9E5_FLOAT";
+        case ResourceFormatType::R5G6B5:      return "R5G6B5_UNORM";
+        case ResourceFormatType::R5G5B5A1:    return "R5G5B5A1_UNORM";
+        case ResourceFormatType::R4G4B4A4:    return "R4G4B4A4_UNORM";
+        case ResourceFormatType::R4G4:        return "R4G4_UNORM";
+        case ResourceFormatType::D16S8:       return "D16S8";
+        case ResourceFormatType::D24S8:       return "D24S8";
+        case ResourceFormatType::D32S8:       return "D32S8";
+        case ResourceFormatType::S8:          return "S8_UINT";
+        case ResourceFormatType::A8:          return "A8_UNORM";
+        case ResourceFormatType::YUV8:        return "YUV8";
+        case ResourceFormatType::YUV10:       return "YUV10";
+        case ResourceFormatType::YUV12:       return "YUV12";
+        case ResourceFormatType::YUV16:       return "YUV16";
+        case ResourceFormatType::Undefined:   return "Undefined";
+        default: break;
+    }
+    // Regular multi-component types
     std::string s;
     if (f.compCount > 0) s += "R";
     if (f.compCount > 1) s += "G";
@@ -109,12 +159,13 @@ static std::string formatToStr(const ResourceFormat &f) {
     if (f.compCount > 3) s += "A";
     s += std::to_string(f.compByteWidth * 8);
     switch(f.compType) {
-        case CompType::Float:  s += "_FLOAT"; break;
-        case CompType::UNorm:  s += "_UNORM"; break;
-        case CompType::SNorm:  s += "_SNORM"; break;
-        case CompType::UInt:   s += "_UINT"; break;
-        case CompType::SInt:   s += "_SINT"; break;
-        case CompType::Depth:  s += "_DEPTH"; break;
+        case CompType::Float:    s += "_FLOAT";  break;
+        case CompType::UNorm:    s += "_UNORM";  break;
+        case CompType::UNormSRGB:s += "_SRGB";   break;
+        case CompType::SNorm:    s += "_SNORM";  break;
+        case CompType::UInt:     s += "_UINT";   break;
+        case CompType::SInt:     s += "_SINT";   break;
+        case CompType::Depth:    s += "_DEPTH";  break;
         default: break;
     }
     return s;
@@ -174,17 +225,54 @@ static json resourceToJson(const ResourceDescription &r) {
 }
 
 // Serialize TextureDescription to JSON
+static const char *texTypeStr(TextureType tt) {
+    switch(tt) {
+        case TextureType::Buffer:          return "Buffer";
+        case TextureType::Texture1D:       return "Texture1D";
+        case TextureType::Texture1DArray:  return "Texture1DArray";
+        case TextureType::Texture2D:       return "Texture2D";
+        case TextureType::TextureRect:     return "TextureRect";
+        case TextureType::Texture2DArray:  return "Texture2DArray";
+        case TextureType::Texture2DMS:     return "Texture2DMS";
+        case TextureType::Texture2DMSArray:return "Texture2DMSArray";
+        case TextureType::Texture3D:       return "Texture3D";
+        case TextureType::TextureCube:     return "TextureCube";
+        case TextureType::TextureCubeArray:return "TextureCubeArray";
+        default:                           return "Unknown";
+    }
+}
+
+static std::string texUsageStr(TextureCategory flags) {
+    std::string s;
+    if ((flags & TextureCategory::ShaderRead)      != TextureCategory::NoFlags) s += "ShaderRead|";
+    if ((flags & TextureCategory::ColorTarget)     != TextureCategory::NoFlags) s += "ColorTarget|";
+    if ((flags & TextureCategory::DepthTarget)     != TextureCategory::NoFlags) s += "DepthTarget|";
+    if ((flags & TextureCategory::ShaderReadWrite) != TextureCategory::NoFlags) s += "ShaderReadWrite|";
+    if ((flags & TextureCategory::SwapBuffer)      != TextureCategory::NoFlags) s += "SwapBuffer|";
+    if (!s.empty()) s.pop_back(); // remove trailing '|'
+    return s.empty() ? "None" : s;
+}
+
 static json textureToJson(const TextureDescription &t) {
     json j;
-    j["resourceId"] = resIdToU64(t.resourceId);
-    j["width"]      = t.width;
-    j["height"]     = t.height;
-    j["depth"]      = t.depth;
-    j["mips"]       = t.mips;
-    j["arraysize"]  = t.arraysize;
-    j["format"]     = formatToStr(t.format);
-    j["dimension"]  = (uint32_t)t.dimension;
-    j["type"]       = (uint32_t)t.type;
+    j["resourceId"]  = resIdToU64(t.resourceId);
+    j["name"]        = resNameLookup(t.resourceId);
+    j["format"]      = formatToStr(t.format);
+    j["compCount"]   = t.format.compCount;
+    j["textureType"] = texTypeStr(t.type);
+    j["width"]       = t.width;
+    j["height"]      = t.height;
+    j["depth"]       = t.depth;
+    j["mips"]        = t.mips;
+    j["arraySize"]   = t.arraysize;
+    j["cubemap"]     = t.cubemap;
+    j["msaaSamples"] = t.msSamp > 1 ? t.msSamp : 1;
+    j["msaaQuality"] = t.msQual;
+    j["byteSize"]    = t.byteSize;
+    j["usage"]       = texUsageStr(t.creationFlags);
+    j["isSwapBuffer"]= (t.creationFlags & TextureCategory::SwapBuffer) != TextureCategory::NoFlags;
+    j["isDepthTarget"]=(t.creationFlags & TextureCategory::DepthTarget) != TextureCategory::NoFlags;
+    j["isColorTarget"]=(t.creationFlags & TextureCategory::ColorTarget) != TextureCategory::NoFlags;
     return j;
 }
 
@@ -313,7 +401,9 @@ static json handleOpenCapture(int id, const json &params) {
 }
 
 static json handleCloseCapture(int id) {
+    if (g_thumbOut) { g_thumbOut->Shutdown(); g_thumbOut = nullptr; }
     g_overlayOut = nullptr; g_overlayW = 0; g_overlayH = 0;
+    resetEventCache();
     if (g_replay) { g_replay->Shutdown(); g_replay = nullptr; }
     if (g_capFile) { g_capFile->Shutdown(); g_capFile = nullptr; }
     return makeResult(id, {{"closed", true}});
@@ -408,6 +498,7 @@ static json handleTryReplay(int id) {
     }
 
     g_replay = replayResult.second;
+    resetEventCache();  // next request sets frame event from clean state
     fprintf(stderr, "[bridge] tryReplay succeeded!\n");
     return makeResult(id, {{"replay", true}});
 }
@@ -456,6 +547,53 @@ static json handleGetTextures(int id) {
         arr.push_back(textureToJson(textures[i]));
 
     return makeResult(id, {{"textures", arr}, {"count", textures.size()}});
+}
+
+// Returns per-event GPU duration in microseconds.
+// Uses GPUCounter::EventGPUDuration (counter=1). This re-replays the frame
+// with GPU timer queries; it may take several seconds on large captures.
+static json handleGetTimings(int id) {
+    if (!g_replay)
+        return makeError(id, -1, "No replay active");
+
+    rdcarray<GPUCounter> counters;
+    counters.push_back(GPUCounter::EventGPUDuration);
+
+    // Confirm the counter is available (some APIs may not support it)
+    rdcarray<GPUCounter> available = g_replay->EnumerateCounters();
+    bool found = false;
+    for (size_t i = 0; i < available.size(); i++) {
+        if (available[i] == GPUCounter::EventGPUDuration) { found = true; break; }
+    }
+    if (!found)
+        return makeError(id, -2, "EventGPUDuration counter not available for this capture");
+
+    // Determine result value type from counter description
+    CounterDescription desc = g_replay->DescribeCounter(GPUCounter::EventGPUDuration);
+
+    rdcarray<CounterResult> results = g_replay->FetchCounters(counters);
+
+    json arr = json::array();
+    for (size_t i = 0; i < results.size(); i++) {
+        const CounterResult &r = results[i];
+        if (r.counter != GPUCounter::EventGPUDuration) continue;
+        // EventGPUDuration: 8-byte double = microseconds; 4-byte float = microseconds
+        double us = 0.0;
+        if (desc.resultByteWidth == 8 && desc.resultType == CompType::Float) {
+            us = r.value.d;   // stored as double
+        } else if (desc.resultByteWidth == 4 && desc.resultType == CompType::Float) {
+            us = (double)r.value.f;
+        } else if (desc.resultByteWidth >= 8) {
+            us = r.value.d;   // treat 8-byte non-float as double too
+        } else {
+            us = (double)r.value.u32;
+        }
+        json entry;
+        entry["eventId"]    = r.eventId;
+        entry["durationUs"] = us;
+        arr.push_back(std::move(entry));
+    }
+    return makeResult(id, {{"timings", arr}, {"count", arr.size()}});
 }
 
 static json handleGetDisassemblyTargets(int id) {
@@ -554,7 +692,7 @@ static json handleGetShaderSourceForEvent(int id, const json &params) {
     fprintf(stderr, "[bridge] getShaderSourceForEvent: eventId=%u\n", eventId);
 
     // 1. Set the frame event
-    g_replay->SetFrameEvent(eventId, true);
+    ensureEvent(eventId);
 
     // 2. Get pipeline state to find bound shaders
     struct StageInfo {
@@ -866,6 +1004,69 @@ static bool encodePNGToMemory(const std::vector<uint8_t> &rgba, uint32_t w, uint
                                    (int)w, (int)h, 4, rgba.data(), stride) != 0;
 }
 
+// GPU-render a texture to PNG via IReplayOutput at its native dimensions.
+// Used as a fallback when SaveTexture fails (e.g. backbuffer / GPU-only resources).
+// Uses IReplayOutput::DrawThumbnail which manages its own internal headless output windows
+// and correctly handles depth textures (renders depth value to R channel).
+// channelExtract: -1=all channels, 0=R, 1=G, 2=B, 3=A
+// isDepthFmt: when true, converts the R-only depth output to grayscale for better display.
+static bool renderTextureGPU(ResourceId resId, uint32_t mip,
+                              uint32_t width, uint32_t height, uint32_t samples,
+                              int channelExtract, bool isDepthFmt,
+                              std::vector<uint8_t> &pngOut) {
+    if (!g_replay || width == 0 || height == 0) return false;
+
+    // We need any valid IReplayOutput to call DrawThumbnail on.
+    // DrawThumbnail manages its own internal headless output windows (cached by size),
+    // so it does not depend on g_overlayOut's main output dimensions.
+    if (!g_overlayOut) {
+        WindowingData win = CreateHeadlessWindowingData((int32_t)width, (int32_t)height);
+        g_overlayOut = g_replay->CreateOutput(win, ReplayOutputType::Texture);
+        if (!g_overlayOut) return false;
+        g_overlayW = (int32_t)width;
+        g_overlayH = (int32_t)height;
+    }
+
+    Subresource sub = {};
+    sub.mip    = mip;
+    sub.slice  = 0;
+    sub.sample = (samples > 1) ? TextureDisplay::ResolveSamples : 0u;
+
+    // DrawThumbnail: creates/reuses a headless output of the requested size, renders the texture
+    // using RenderTexture (same GL shader path as the GUI viewer), then reads back RGB pixels.
+    // For depth textures it automatically detects depthMode and renders depth into the R channel.
+    // Returns tightly-packed RGB (3 bytes/pixel), or empty on failure.
+    bytebuf pixels = g_overlayOut->DrawThumbnail((int32_t)width, (int32_t)height,
+                                                  resId, sub, CompType::Typeless);
+    fprintf(stderr, "[bridge] DrawThumbnail: %ux%u -> %zu bytes\n", width, height, pixels.size());
+    if (pixels.empty()) return false;
+    if (pixels.size() < (size_t)width * height * 3) return false;
+
+    const uint8_t* src = pixels.data();
+    std::vector<uint8_t> rgb(width * height * 3);
+
+    if (channelExtract >= 0 && channelExtract < 3) {
+        // Extract a single RGB channel to grayscale.
+        for (uint32_t i = 0; i < width * height; i++) {
+            uint8_t v = src[i * 3 + channelExtract];
+            rgb[i * 3 + 0] = rgb[i * 3 + 1] = rgb[i * 3 + 2] = v;
+        }
+    } else if (isDepthFmt) {
+        // DrawThumbnail renders depth into R only (G=B=0). Copy R to G and B for grayscale.
+        for (uint32_t i = 0; i < width * height; i++) {
+            uint8_t v = src[i * 3 + 0];
+            rgb[i * 3 + 0] = rgb[i * 3 + 1] = rgb[i * 3 + 2] = v;
+        }
+    } else {
+        memcpy(rgb.data(), src, width * height * 3);
+    }
+
+    pngOut.clear();
+    return stbi_write_png_to_func(stbiWriteToVector, &pngOut,
+                                   (int)width, (int)height, 3,
+                                   rgb.data(), (int)width * 3) != 0;
+}
+
 static json handleGetTexturePreview(int id, const json &params) {
     if (!g_replay)
         return makeError(id, -1, "No replay active");
@@ -885,21 +1086,25 @@ static json handleGetTexturePreview(int id, const json &params) {
     }
     if (eventId > 0) {
         fprintf(stderr, "[bridge] Setting frame event to %u for texture preview\n", eventId);
-        g_replay->SetFrameEvent(eventId, true);
+        ensureEvent(eventId);
     }
 
     // Get texture info
     const rdcarray<TextureDescription> &textures = g_replay->GetTextures();
     uint32_t width = 0, height = 0;
     uint32_t compCount = 0;
+    uint32_t samples = 1;
     ResourceFormatType fmtType = ResourceFormatType::Undefined;
+    CompType compType = CompType::Typeless;
     std::string format;
     for (size_t i = 0; i < textures.size(); i++) {
         if (textures[i].resourceId == resId) {
             width = textures[i].width;
             height = textures[i].height;
             compCount = textures[i].format.compCount;
+            samples = textures[i].msSamp > 0 ? textures[i].msSamp : 1;
             fmtType = textures[i].format.type;
+            compType = textures[i].format.compType;
             format = formatToStr(textures[i].format);
             break;
         }
@@ -951,27 +1156,62 @@ static json handleGetTexturePreview(int id, const json &params) {
 
     // Standard path: use SaveTexture (works for non-ASTC formats)
     if (!usedASTCFallback) {
-        std::string tmpPath = std::filesystem::temp_directory_path().string() + "/rdctex_" + std::to_string(rid) + ".png";
+        // Depth/depth-stencil formats: SaveTexture can write a transparent PNG on
+        // ANGLE D3D11 for depth-only textures (AlphaMapping::Discard ignored).
+        // For packed depth-stencil formats (D32S8 etc.) SaveTexture often fails
+        // outright. In both cases, prefer the GPU render path.
+        bool isDepthFormat = (compType == CompType::Depth) ||
+                             (fmtType == ResourceFormatType::D16S8) ||
+                             (fmtType == ResourceFormatType::D24S8) ||
+                             (fmtType == ResourceFormatType::D32S8) ||
+                             (fmtType == ResourceFormatType::S8);
 
-        TextureSave save;
-        save.resourceId = resId;
-        save.destType = FileType::PNG;
-        save.mip = mip;
-        save.slice.sliceIndex = 0;
-        save.comp.blackPoint = 0.0f;
-        save.comp.whitePoint = 1.0f;
-        save.alpha = AlphaMapping::Preserve;
-        save.channelExtract = channelExtract;
+        bool pngReady = false;
 
-        rdcstr outPath(tmpPath.c_str());
-        fprintf(stderr, "[bridge] SaveTexture: %ux%u fmt=%s -> %s\n", width, height, format.c_str(), tmpPath.c_str());
-        ResultDetails saveResult = g_replay->SaveTexture(save, outPath);
+        // For depth formats, try GPU render first (SaveTexture often fails for depth).
+        if (isDepthFormat && width > 0 && height > 0) {
+            fprintf(stderr, "[bridge] Depth format detected (%s), trying GPU render path first\n", format.c_str());
+            pngReady = renderTextureGPU(resId, mip, width, height, samples, channelExtract, isDepthFormat, pngData);
+            if (!pngReady)
+                fprintf(stderr, "[bridge] GPU render failed for depth format, falling back to SaveTexture\n");
+        }
 
-        if (saveResult.code != ResultCode::Succeeded)
-            return makeError(id, -3, "SaveTexture failed: " + resultMessage(saveResult));
+        if (!pngReady) {
+            std::string tmpPath = std::filesystem::temp_directory_path().string() + "/rdctex_" + std::to_string(rid) + ".png";
 
-        pngData = readFileBytes(tmpPath);
-        std::filesystem::remove(tmpPath);
+            TextureSave save;
+            save.resourceId = resId;
+            save.destType = FileType::PNG;
+            save.mip = mip;
+            save.slice.sliceIndex = 0;
+            save.comp.blackPoint = 0.0f;
+            save.comp.whitePoint = 1.0f;
+            // Formats without an alpha channel (compCount < 4) have no alpha data;
+            // AlphaMapping::Preserve would output alpha=0 (fully transparent) for
+            // those formats. Use Discard to force alpha=1.0 (fully opaque) so that
+            // R8, RG16, RGB24 and similar textures are visible in the PNG viewer.
+            save.alpha = (compCount >= 4) ? AlphaMapping::Preserve : AlphaMapping::Discard;
+            save.channelExtract = channelExtract;
+
+            rdcstr outPath(tmpPath.c_str());
+            fprintf(stderr, "[bridge] SaveTexture: %ux%u fmt=%s -> %s\n", width, height, format.c_str(), tmpPath.c_str());
+            ResultDetails saveResult = g_replay->SaveTexture(save, outPath);
+
+            if (saveResult.code != ResultCode::Succeeded) {
+                // SaveTexture can fail for GPU-only resources like the backbuffer.
+                // For depth formats we already tried GPU render above; for others try now.
+                fprintf(stderr, "[bridge] SaveTexture failed (%s) — falling back to GPU render path\n",
+                        resultMessage(saveResult).c_str());
+                // For all formats (depth and non-depth), try GPU render as fallback.
+                if (!renderTextureGPU(resId, mip, width, height, samples, channelExtract, isDepthFormat, pngData)) {
+                    return makeError(id, -3, "SaveTexture failed: " + resultMessage(saveResult)
+                                            + "; GPU fallback also failed");
+                }
+            } else {
+                pngData = readFileBytes(tmpPath);
+                std::filesystem::remove(tmpPath);
+            }
+        }
     }
 
     if (pngData.empty())
@@ -1027,7 +1267,7 @@ static json handleGetPipelineState(int id, const json &params) {
 
     uint32_t eventId = params.value("eventId", (uint32_t)0);
     if (eventId > 0) {
-        g_replay->SetFrameEvent(eventId, true);
+        ensureEvent(eventId);
     }
 
     json result;
@@ -1035,12 +1275,21 @@ static json handleGetPipelineState(int id, const json &params) {
 
     // Use API-specific pipeline state getters to avoid PipeState helper methods
     // (those are implemented in the DLL and we can't link to them)
-    auto addShader = [&](const char *name, ResourceId resId, ShaderStage stage) {
+    auto addShader = [&](const char *name, ResourceId resId, ShaderStage stage,
+                         ResourceId programId = ResourceId()) {
         if (resId != ResourceId()) {
+            std::string shaderName = resNameLookup(resId);
+            std::string programName = (programId != ResourceId()) ? resNameLookup(programId) : "";
+            // Prefer the program label (set by glObjectLabel on the program object) when the
+            // shader itself only has an autogenerated name — mirrors RenderDoc desktop behaviour
+            // where "Universal Render Pipeline/Lit(LTC) > Shader 516" is shown.
+            std::string displayName = (!programName.empty()) ? programName : shaderName;
             shaders[name] = {
-                {"resourceId", resIdToU64(resId)},
-                {"name",       resNameLookup(resId)},
-                {"stage", (uint32_t)stage}
+                {"resourceId",  resIdToU64(resId)},
+                {"name",        displayName},
+                {"programName", programName},
+                {"shaderName",  shaderName},
+                {"stage",       (uint32_t)stage}
             };
         }
     };
@@ -1066,12 +1315,12 @@ static json handleGetPipelineState(int id, const json &params) {
         auto pickGL = [](const GLPipe::Shader &s) -> ResourceId {
             return s.shaderResourceId != ResourceId() ? s.shaderResourceId : s.programResourceId;
         };
-        addShader("vertex",   pickGL(gl->vertexShader),   ShaderStage::Vertex);
-        addShader("tessCtrl", pickGL(gl->tessControlShader), ShaderStage::Hull);
-        addShader("tessEval", pickGL(gl->tessEvalShader),  ShaderStage::Domain);
-        addShader("geometry", pickGL(gl->geometryShader),  ShaderStage::Geometry);
-        addShader("fragment", pickGL(gl->fragmentShader),  ShaderStage::Pixel);
-        addShader("compute",  pickGL(gl->computeShader),   ShaderStage::Compute);
+        addShader("vertex",   pickGL(gl->vertexShader),   ShaderStage::Vertex,   gl->vertexShader.programResourceId);
+        addShader("tessCtrl", pickGL(gl->tessControlShader), ShaderStage::Hull,  gl->tessControlShader.programResourceId);
+        addShader("tessEval", pickGL(gl->tessEvalShader),  ShaderStage::Domain,  gl->tessEvalShader.programResourceId);
+        addShader("geometry", pickGL(gl->geometryShader),  ShaderStage::Geometry,gl->geometryShader.programResourceId);
+        addShader("fragment", pickGL(gl->fragmentShader),  ShaderStage::Pixel,   gl->fragmentShader.programResourceId);
+        addShader("compute",  pickGL(gl->computeShader),   ShaderStage::Compute, gl->computeShader.programResourceId);
 
         for (const auto &att : gl->framebuffer.drawFBO.colorAttachments) {
             if (att.resource != ResourceId())
@@ -1179,6 +1428,21 @@ static json handleGetPipelineState(int id, const json &params) {
         }
     }
 
+    // When no color targets are reported (e.g. Present draws or depth-only passes),
+    // fall back to textures marked as SwapBuffer — this is the same logic RenderDoc's
+    // TextureViewer uses in Following::GetOutputTargets() for Present actions.
+    if (colorTargets.empty()) {
+        const rdcarray<TextureDescription> &allTextures = g_replay->GetTextures();
+        for (size_t i = 0; i < allTextures.size(); i++) {
+            if ((allTextures[i].creationFlags & TextureCategory::SwapBuffer) != TextureCategory::NoFlags) {
+                colorTargets.push_back(resIdToU64(allTextures[i].resourceId));
+                fprintf(stderr, "[bridge] getPipelineState: colorTargets empty, using SwapBuffer tex %llu (%s)\n",
+                        resIdToU64(allTextures[i].resourceId),
+                        resNameLookup(allTextures[i].resourceId).c_str());
+            }
+        }
+    }
+
     framebuffer["colorTargets"] = colorTargets;
     if (depthTarget != 0)   framebuffer["depthTarget"]   = depthTarget;
     if (stencilTarget != 0) framebuffer["stencilTarget"] = stencilTarget;
@@ -1221,6 +1485,253 @@ static json handleGetPipelineState(int id, const json &params) {
         }
     }
     result["boundTextures"] = boundTextures;
+
+    // ── Enum helpers (local lambdas) ────────────────────────────────────────
+    auto fillModeStr = [](FillMode m) -> const char* {
+        switch(m) { case FillMode::Solid: return "Solid"; case FillMode::Wireframe: return "Wireframe"; case FillMode::Point: return "Point"; default: return "Unknown"; }
+    };
+    auto cullModeStr = [](CullMode m) -> const char* {
+        switch(m) { case CullMode::NoCull: return "NoCull"; case CullMode::Front: return "Front"; case CullMode::Back: return "Back"; case CullMode::FrontAndBack: return "FrontAndBack"; default: return "Unknown"; }
+    };
+    auto cmpFnStr = [](CompareFunction f) -> const char* {
+        switch(f) { case CompareFunction::Never: return "Never"; case CompareFunction::AlwaysTrue: return "Always"; case CompareFunction::Less: return "Less"; case CompareFunction::LessEqual: return "LessEqual"; case CompareFunction::Greater: return "Greater"; case CompareFunction::GreaterEqual: return "GreaterEqual"; case CompareFunction::Equal: return "Equal"; case CompareFunction::NotEqual: return "NotEqual"; default: return "Unknown"; }
+    };
+    auto stencilOpStr = [](StencilOperation op) -> const char* {
+        switch(op) { case StencilOperation::Keep: return "Keep"; case StencilOperation::Zero: return "Zero"; case StencilOperation::Replace: return "Replace"; case StencilOperation::IncSat: return "IncSat"; case StencilOperation::DecSat: return "DecSat"; case StencilOperation::IncWrap: return "IncWrap"; case StencilOperation::DecWrap: return "DecWrap"; case StencilOperation::Invert: return "Invert"; default: return "Unknown"; }
+    };
+    auto blendMulStr = [](BlendMultiplier m) -> const char* {
+        switch(m) { case BlendMultiplier::Zero: return "Zero"; case BlendMultiplier::One: return "One"; case BlendMultiplier::SrcCol: return "SrcColor"; case BlendMultiplier::InvSrcCol: return "InvSrcColor"; case BlendMultiplier::DstCol: return "DstColor"; case BlendMultiplier::InvDstCol: return "InvDstColor"; case BlendMultiplier::SrcAlpha: return "SrcAlpha"; case BlendMultiplier::InvSrcAlpha: return "InvSrcAlpha"; case BlendMultiplier::DstAlpha: return "DstAlpha"; case BlendMultiplier::InvDstAlpha: return "InvDstAlpha"; case BlendMultiplier::SrcAlphaSat: return "SrcAlphaSat"; case BlendMultiplier::FactorRGB: return "BlendFactor"; case BlendMultiplier::InvFactorRGB: return "InvBlendFactor"; case BlendMultiplier::FactorAlpha: return "BlendFactorAlpha"; case BlendMultiplier::InvFactorAlpha: return "InvBlendFactorAlpha"; default: return "Unknown"; }
+    };
+    auto blendOpStr = [](BlendOperation op) -> const char* {
+        switch(op) { case BlendOperation::Add: return "Add"; case BlendOperation::Subtract: return "Subtract"; case BlendOperation::ReversedSubtract: return "RevSubtract"; case BlendOperation::Minimum: return "Min"; case BlendOperation::Maximum: return "Max"; default: return "Unknown"; }
+    };
+    auto filterModeStr = [](FilterMode m) -> const char* {
+        switch(m) { case FilterMode::NoFilter: return "None"; case FilterMode::Point: return "Point"; case FilterMode::Linear: return "Linear"; case FilterMode::Cubic: return "Cubic"; case FilterMode::Anisotropic: return "Anisotropic"; default: return "Unknown"; }
+    };
+    auto addressModeStr = [](AddressMode m) -> const char* {
+        switch(m) { case AddressMode::Wrap: return "Wrap"; case AddressMode::Mirror: return "Mirror"; case AddressMode::MirrorOnce: return "MirrorOnce"; case AddressMode::ClampEdge: return "ClampEdge"; case AddressMode::ClampBorder: return "ClampBorder"; default: return "Unknown"; }
+    };
+
+    auto serializeStencilFace = [&](const StencilFace &f) -> json {
+        return {
+            {"failOp",      stencilOpStr(f.failOperation)},
+            {"depthFailOp", stencilOpStr(f.depthFailOperation)},
+            {"passOp",      stencilOpStr(f.passOperation)},
+            {"compareFunc", cmpFnStr(f.function)},
+            {"reference",   f.reference},
+            {"compareMask", f.compareMask},
+            {"writeMask",   f.writeMask},
+        };
+    };
+    auto serializeColorBlend = [&](const ColorBlend &b, int idx) -> json {
+        return {
+            {"index",    idx},
+            {"enabled",  b.enabled},
+            {"writeMask", b.writeMask},
+            {"colorBlend", {
+                {"src", blendMulStr(b.colorBlend.source)},
+                {"dst", blendMulStr(b.colorBlend.destination)},
+                {"op",  blendOpStr(b.colorBlend.operation)},
+            }},
+            {"alphaBlend", {
+                {"src", blendMulStr(b.alphaBlend.source)},
+                {"dst", blendMulStr(b.alphaBlend.destination)},
+                {"op",  blendOpStr(b.alphaBlend.operation)},
+            }},
+            {"logicOpEnabled", b.logicOperationEnabled},
+        };
+    };
+
+    // ── Rasterizer state ────────────────────────────────────────────────────
+    json rasterizer = json::object();
+    if (gl) {
+        const auto &rs = gl->rasterizer.state;
+        rasterizer = {
+            {"fillMode",            fillModeStr(rs.fillMode)},
+            {"cullMode",            cullModeStr(rs.cullMode)},
+            {"frontCCW",            rs.frontCCW},
+            {"depthBias",           rs.depthBias},
+            {"slopeScaledDepthBias",rs.slopeScaledDepthBias},
+            {"depthClamp",          rs.depthClamp},
+            {"multisampleEnable",   rs.multisampleEnable},
+            {"alphaToCoverage",     rs.alphaToCoverage},
+            {"pointSize",           rs.pointSize},
+            {"lineWidth",           rs.lineWidth},
+        };
+    } else if (vk) {
+        const auto &rs = vk->rasterizer;
+        rasterizer = {
+            {"fillMode",            fillModeStr(rs.fillMode)},
+            {"cullMode",            cullModeStr(rs.cullMode)},
+            {"frontCCW",            rs.frontCCW},
+            {"depthBias",           rs.depthBias},
+            {"depthBiasClamp",      rs.depthBiasClamp},
+            {"slopeScaledDepthBias",rs.slopeScaledDepthBias},
+            {"depthClampEnable",    rs.depthClampEnable},
+            {"depthClipEnable",     rs.depthClipEnable},
+            {"rasterizerDiscard",   rs.rasterizerDiscardEnable},
+            {"lineWidth",           rs.lineWidth},
+        };
+    } else if (d11) {
+        const auto &rs = d11->rasterizer.state;
+        rasterizer = {
+            {"fillMode",            fillModeStr(rs.fillMode)},
+            {"cullMode",            cullModeStr(rs.cullMode)},
+            {"frontCCW",            rs.frontCCW},
+            {"depthBias",           rs.depthBias},
+            {"depthBiasClamp",      rs.depthBiasClamp},
+            {"slopeScaledDepthBias",rs.slopeScaledDepthBias},
+            {"depthClip",           rs.depthClip},
+            {"scissorEnable",       rs.scissorEnable},
+            {"multisampleEnable",   rs.multisampleEnable},
+            {"antialiasedLineEnable",rs.antialiasedLines},
+        };
+    } else if (d12) {
+        const auto &rs = d12->rasterizer.state;
+        rasterizer = {
+            {"fillMode",            fillModeStr(rs.fillMode)},
+            {"cullMode",            cullModeStr(rs.cullMode)},
+            {"frontCCW",            rs.frontCCW},
+            {"depthBias",           rs.depthBias},
+            {"depthBiasClamp",      rs.depthBiasClamp},
+            {"slopeScaledDepthBias",rs.slopeScaledDepthBias},
+            {"depthClip",           rs.depthClip},
+        };
+    }
+    result["rasterizer"] = rasterizer;
+
+    // ── Depth / Stencil state ───────────────────────────────────────────────
+    json depthStencil = json::object();
+    if (gl) {
+        depthStencil = {
+            {"depthEnable",   gl->depthState.depthEnable},
+            {"depthFunc",     cmpFnStr(gl->depthState.depthFunction)},
+            {"depthWrites",   gl->depthState.depthWrites},
+            {"stencilEnable", gl->stencilState.stencilEnable},
+            {"frontFace",     serializeStencilFace(gl->stencilState.frontFace)},
+            {"backFace",      serializeStencilFace(gl->stencilState.backFace)},
+        };
+    } else if (vk) {
+        depthStencil = {
+            {"depthEnable",   vk->depthStencil.depthTestEnable},
+            {"depthFunc",     cmpFnStr(vk->depthStencil.depthFunction)},
+            {"depthWrites",   vk->depthStencil.depthWriteEnable},
+            {"stencilEnable", vk->depthStencil.stencilTestEnable},
+            {"frontFace",     serializeStencilFace(vk->depthStencil.frontFace)},
+            {"backFace",      serializeStencilFace(vk->depthStencil.backFace)},
+        };
+    } else if (d11) {
+        const auto &ds = d11->outputMerger.depthStencilState;
+        depthStencil = {
+            {"depthEnable",   ds.depthEnable},
+            {"depthFunc",     cmpFnStr(ds.depthFunction)},
+            {"depthWrites",   ds.depthWrites},
+            {"stencilEnable", ds.stencilEnable},
+            {"frontFace",     serializeStencilFace(ds.frontFace)},
+            {"backFace",      serializeStencilFace(ds.backFace)},
+        };
+    } else if (d12) {
+        const auto &ds = d12->outputMerger.depthStencilState;
+        depthStencil = {
+            {"depthEnable",   ds.depthEnable},
+            {"depthFunc",     cmpFnStr(ds.depthFunction)},
+            {"depthWrites",   ds.depthWrites},
+            {"stencilEnable", ds.stencilEnable},
+            {"frontFace",     serializeStencilFace(ds.frontFace)},
+            {"backFace",      serializeStencilFace(ds.backFace)},
+        };
+    }
+    result["depthStencil"] = depthStencil;
+
+    // ── Blend state ─────────────────────────────────────────────────────────
+    {
+        json blendState = json::object();
+        json blendTargets = json::array();
+        json blendFactor = json::array();
+
+        auto fillFactor = [&](const rdcfixedarray<float, 4> &f) {
+            blendFactor = {f[0], f[1], f[2], f[3]};
+        };
+
+        if (gl) {
+            blendState["alphaToCoverage"] = gl->rasterizer.state.alphaToCoverage;
+            fillFactor(gl->framebuffer.blendState.blendFactor);
+            int idx = 0;
+            for (const auto &b : gl->framebuffer.blendState.blends)
+                blendTargets.push_back(serializeColorBlend(b, idx++));
+        } else if (vk) {
+            blendState["alphaToCoverage"] = vk->colorBlend.alphaToCoverageEnable;
+            fillFactor(vk->colorBlend.blendFactor);
+            int idx = 0;
+            for (const auto &b : vk->colorBlend.blends)
+                blendTargets.push_back(serializeColorBlend(b, idx++));
+        } else if (d11) {
+            blendState["alphaToCoverage"]  = d11->outputMerger.blendState.alphaToCoverage;
+            blendState["independentBlend"] = d11->outputMerger.blendState.independentBlend;
+            fillFactor(d11->outputMerger.blendState.blendFactor);
+            int idx = 0;
+            for (const auto &b : d11->outputMerger.blendState.blends)
+                blendTargets.push_back(serializeColorBlend(b, idx++));
+        } else if (d12) {
+            blendState["alphaToCoverage"]  = d12->outputMerger.blendState.alphaToCoverage;
+            blendState["independentBlend"] = d12->outputMerger.blendState.independentBlend;
+            fillFactor(d12->outputMerger.blendState.blendFactor);
+            int idx = 0;
+            for (const auto &b : d12->outputMerger.blendState.blends)
+                blendTargets.push_back(serializeColorBlend(b, idx++));
+        }
+
+        blendState["blendFactor"] = blendFactor;
+        blendState["targets"]     = blendTargets;
+        result["blendState"] = blendState;
+    }
+
+    // ── Sampler descriptors ─────────────────────────────────────────────────
+    {
+        json samplers = json::array();
+        const rdcarray<DescriptorAccess> &accesses = g_replay->GetDescriptorAccess();
+        std::map<ResourceId, rdcarray<DescriptorRange>> storeRanges;
+        std::map<ResourceId, std::vector<const DescriptorAccess *>> storeAccesses;
+        for (size_t i = 0; i < accesses.size(); i++) {
+            const DescriptorAccess &acc = accesses[i];
+            if (acc.descriptorStore == ResourceId()) continue;
+            if (!IsSamplerDescriptor(acc.type)) continue;
+            storeRanges[acc.descriptorStore].push_back(DescriptorRange(acc));
+            storeAccesses[acc.descriptorStore].push_back(&acc);
+        }
+        std::set<uint64_t> seenSamplers;
+        for (auto &kv : storeRanges) {
+            rdcarray<SamplerDescriptor> descs = g_replay->GetSamplerDescriptors(kv.first, kv.second);
+            const auto &accs = storeAccesses[kv.first];
+            for (size_t i = 0; i < descs.size() && i < accs.size(); i++) {
+                const SamplerDescriptor &sd = descs[i];
+                uint64_t objId = resIdToU64(sd.object);
+                // deduplicate by object ResourceId (0 = inline sampler, always include)
+                if (objId != 0) {
+                    if (seenSamplers.count(objId)) continue;
+                    seenSamplers.insert(objId);
+                }
+                json sj = {
+                    {"resourceId",    objId},
+                    {"name",          objId != 0 ? resNameLookup(sd.object) : ""},
+                    {"minFilter",     filterModeStr(sd.filter.minify)},
+                    {"magFilter",     filterModeStr(sd.filter.magnify)},
+                    {"mipFilter",     filterModeStr(sd.filter.mip)},
+                    {"addressU",      addressModeStr(sd.addressU)},
+                    {"addressV",      addressModeStr(sd.addressV)},
+                    {"addressW",      addressModeStr(sd.addressW)},
+                    {"compareEnable", sd.compareFunction != CompareFunction::AlwaysTrue},
+                    {"compareFunc",   cmpFnStr(sd.compareFunction)},
+                    {"maxAnisotropy", sd.maxAnisotropy},
+                    {"minLOD",        sd.minLOD},
+                    {"maxLOD",        sd.maxLOD},
+                    {"mipBias",       sd.mipBias},
+                };
+                samplers.push_back(sj);
+            }
+        }
+        result["samplers"] = samplers;
+    }
 
     result["shaders"] = shaders;
     return makeResult(id, result);
@@ -2030,6 +2541,7 @@ static json handleGetMeshData(int id, const json &params) {
 }
 
 static json handleShutdown(int id) {
+    if (g_thumbOut) { g_thumbOut->Shutdown(); g_thumbOut = nullptr; }
     g_overlayOut = nullptr; g_overlayW = 0; g_overlayH = 0;
     if (g_replay) { g_replay->Shutdown(); g_replay = nullptr; }
     if (g_capFile) { g_capFile->Shutdown(); g_capFile = nullptr; }
@@ -2039,6 +2551,111 @@ static json handleShutdown(int id) {
     }
     g_dll.unload();
     return makeResult(id, {{"shutdown", true}});
+}
+
+// ── GPU thumbnail batch ─────────────────────────────────────────────────────
+// Renders multiple textures at THUMB_DIM×THUMB_DIM using a persistent
+// IReplayOutput. Much faster than SaveTexture-to-file for small previews:
+//   • No temp-file I/O
+//   • GPU scales to thumbnail size (256×256) instead of full resolution
+//   • Reuses the same output window → no re-creation overhead per texture
+//   • Only one ensureEvent() call for the whole batch
+// ────────────────────────────────────────────────────────────────────────────
+
+static IReplayOutput* ensureThumbOut() {
+    if (g_thumbOut) return g_thumbOut;
+    if (!g_replay)  return nullptr;
+    WindowingData win = CreateHeadlessWindowingData(THUMB_DIM, THUMB_DIM);
+    g_thumbOut = g_replay->CreateOutput(win, ReplayOutputType::Texture);
+    return g_thumbOut;
+}
+
+static json renderOneThumbnail(ResourceId resId, uint32_t mip,
+                                const rdcarray<TextureDescription> &textures) {
+    json r;
+    r["resourceId"] = resIdToU64(resId);
+
+    uint32_t width = 0, height = 0, compCount = 0;
+    std::string format;
+    for (size_t i = 0; i < textures.size(); i++) {
+        if (textures[i].resourceId == resId) {
+            width    = textures[i].width;
+            height   = textures[i].height;
+            compCount= textures[i].format.compCount;
+            format   = formatToStr(textures[i].format);
+            break;
+        }
+    }
+    if (width == 0 || height == 0) { r["error"] = "texture not found"; return r; }
+
+    IReplayOutput *out = ensureThumbOut();
+    if (!out) { r["error"] = "thumbnail output unavailable"; return r; }
+
+    // scale=-1.0 is RenderDoc's own "auto-fit to viewport" value (same as SaveTexture path)
+    TextureDisplay disp = {};
+    disp.resourceId           = resId;
+    disp.typeCast             = CompType::Typeless;
+    disp.scale                = -1.0f;
+    disp.red = disp.green = disp.blue = true;
+    disp.alpha                = false;
+    disp.flipY                = false;
+    disp.hdrMultiplier        = -1.0f;
+    disp.linearDisplayAsGamma = true;
+    disp.rangeMin             = 0.0f;
+    disp.rangeMax             = 1.0f;
+    disp.subresource          = {mip, 0, 0};
+    disp.overlay              = DebugOverlay::NoOverlay;
+
+    out->SetTextureDisplay(disp);
+    out->Display();
+    bytebuf pixels = out->ReadbackOutputTexture();
+
+    if (pixels.empty()) { r["error"] = "readback empty"; return r; }
+
+    // All drivers compact to 3 bytes/pixel (RGB) per ReadbackOutputTexture contract
+    int comp = 3;
+    if (pixels.size() == (size_t)THUMB_DIM * THUMB_DIM * 4) comp = 4;
+    if (pixels.size() < (size_t)THUMB_DIM * THUMB_DIM * (size_t)comp) {
+        r["error"] = "readback size mismatch"; return r;
+    }
+
+    std::vector<uint8_t> pngData;
+    if (!stbi_write_png_to_func(stbiWriteToVector, &pngData,
+                                THUMB_DIM, THUMB_DIM, comp,
+                                pixels.data(), THUMB_DIM * comp)) {
+        r["error"] = "png encode failed"; return r;
+    }
+
+    r["base64"]    = base64Encode(pngData);
+    r["format"]    = "png";
+    r["width"]     = THUMB_DIM;
+    r["height"]    = THUMB_DIM;
+    r["texFormat"] = format;
+    r["compCount"] = compCount;
+    return r;
+}
+
+static json handleGetTextureThumbBatch(int id, const json &params) {
+    if (!g_replay)
+        return makeError(id, -1, "No replay active");
+
+    uint32_t eventId = params.value("eventId", (uint32_t)0);
+    const json &texList = params.value("textures", json::array());
+
+    if (eventId == 0) {
+        const rdcarray<ActionDescription> &actions = g_replay->GetRootActions();
+        eventId = findMaxEventId(actions);
+    }
+    ensureEvent(eventId);
+
+    const rdcarray<TextureDescription> &textures = g_replay->GetTextures();
+    json results = json::array();
+    for (const auto &entry : texList) {
+        uint64_t rid = entry.value("resourceId", (uint64_t)0);
+        uint32_t mip = entry.value("mip", (uint32_t)0);
+        results.push_back(renderOneThumbnail(u64ToResId(rid), mip, textures));
+    }
+    return makeResult(id, {{"results", results}, {"eventId", eventId}});
 }
 
 // ── Main loop ───────────────────────────────────────────────────────────────
@@ -2058,11 +2675,13 @@ static json dispatch(const json &req) {
         if (method == "getRootActions")     return handleGetRootActions(id);
         if (method == "getResources")       return handleGetResources(id);
         if (method == "getTextures")        return handleGetTextures(id);
+        if (method == "getTimings")          return handleGetTimings(id);
         if (method == "getDisassemblyTargets") return handleGetDisassemblyTargets(id);
         if (method == "getShaderEntryPoints") return handleGetShaderEntryPoints(id, params);
         if (method == "getShaderSource")    return handleGetShaderSource(id, params);
         if (method == "getShaderSourceForEvent") return handleGetShaderSourceForEvent(id, params);
         if (method == "getTexturePreview") return handleGetTexturePreview(id, params);
+        if (method == "getTextureThumbBatch") return handleGetTextureThumbBatch(id, params);
         if (method == "saveTexture")        return handleSaveTexture(id, params);
         if (method == "getPipelineState")   return handleGetPipelineState(id, params);
         if (method == "getDrawcallOverlay") return handleGetDrawcallOverlay(id, params);
