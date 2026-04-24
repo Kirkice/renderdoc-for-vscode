@@ -163,6 +163,16 @@
                     if (state.activeTab === 'mesh') renderMesh();
                 }
                 break;
+            case 'maliAnalysisResult':
+                const outDom = document.getElementById('mali-offline-result');
+                const containerDom = document.getElementById('mali-offline-result-container');
+                const splitterDom = document.getElementById('mali-offline-splitter');
+                if (outDom) {
+                    outDom.innerText = m.error ? m.error : (m.result || '');
+                }
+                if (containerDom) containerDom.style.display = 'flex';
+                if (splitterDom) splitterDom.style.display = 'block';
+                break;
         }
     });
 
@@ -425,6 +435,26 @@
             vscode.postMessage({ type: 'openShaderInEditor', source: info.source || info.disassembly || '', language: 'glsl' });
         });
         tabs.appendChild(openBtn);
+
+        const analyzeBtn = document.createElement('button');
+        analyzeBtn.className = 'icon-btn';
+        analyzeBtn.textContent = 'Mali Analyze';
+        analyzeBtn.title = 'Analyze performance with Mali Offline Compiler';
+        analyzeBtn.addEventListener('click', () => {
+            const info = shaders[state.activeShaderStage];
+            const container = document.getElementById('mali-offline-result-container');
+            const splitter = document.getElementById('mali-offline-splitter');
+            if (container) container.style.display = 'flex';
+            if (splitter) splitter.style.display = 'block';
+            const outDom = document.getElementById('mali-offline-result');
+            if (outDom) outDom.innerText = 'Analyzing...';
+            vscode.postMessage({
+                type: 'analyzeMaliOffline',
+                source: info.source || '',
+                stage: state.activeShaderStage
+            });
+        });
+        tabs.appendChild(analyzeBtn);
 
         const info = shaders[state.activeShaderStage];
         body.className = 'code-view';
@@ -1514,6 +1544,37 @@
         window.addEventListener('resize', () => {
             if (state.activeTab === 'mesh') renderMeshPreview();
         });
+
+        // Mali Offline Splitter
+        const maliSplitter = document.getElementById('mali-offline-splitter');
+        const shadersContainerEl = document.getElementById('shaders-container');
+        if (maliSplitter && shadersContainerEl) {
+            let isDraggingMaliSplitter = false;
+            let startX = 0;
+            let startWidth = 0;
+
+            maliSplitter.addEventListener('pointerdown', (e) => {
+                isDraggingMaliSplitter = true;
+                startX = e.clientX;
+                startWidth = shadersContainerEl.getBoundingClientRect().width;
+                maliSplitter.classList.add('dragging');
+                maliSplitter.setPointerCapture(e.pointerId);
+                e.preventDefault();
+            });
+
+            maliSplitter.addEventListener('pointermove', (e) => {
+                if (!isDraggingMaliSplitter) return;
+                const dx = e.clientX - startX;
+                const newWidth = Math.max(100, Math.min(window.innerWidth - 100, startWidth + dx));
+                shadersContainerEl.style.flex = `0 0 ${newWidth}px`;
+            });
+
+            maliSplitter.addEventListener('pointerup', (e) => {
+                isDraggingMaliSplitter = false;
+                maliSplitter.classList.remove('dragging');
+                try { maliSplitter.releasePointerCapture(e.pointerId); } catch {}
+            });
+        }
 
         // Mesh View Splitter
         const meshSplitter = document.getElementById('mesh-splitter');

@@ -519,6 +519,15 @@
         .horizontal-splitter:hover, .horizontal-splitter.dragging {
             background-color: var(--vscode-focusBorder);
         }
+        .vertical-splitter {
+            flex: 0 0 4px;
+            cursor: col-resize;
+            background-color: var(--vscode-panel-border);
+            z-index: 10;
+        }
+        .vertical-splitter:hover, .vertical-splitter.dragging {
+            background-color: var(--vscode-focusBorder);
+        }
         .mesh-preview-pane {
             flex: 0 0 260px;
             min-height: 0;

@@ -97,7 +97,16 @@ export function buildInspectorHtml(
                     <div id="shader-stage-tabs" class="stage-tabs"></div>
                 </div>
                 <div id="shader-file-tabs" class="stage-tabs shader-file-tabs" hidden></div>
-                <pre id="shaders-body" class="code-view empty-state">Select an event to view its shaders.</pre>
+                <div style="display:flex; flex-direction:row; height:calc(100vh - 180px); gap: 0;">
+                    <div id="shaders-container" style="flex: 2; display: flex; flex-direction: column; min-width: 0; min-height: 0;">
+                        <pre id="shaders-body" class="code-view empty-state" style="flex: 1; height: 100%; margin: 0; min-width: 0;">Select an event to view its shaders.</pre>
+                    </div>
+                    <div id="mali-offline-splitter" class="vertical-splitter" style="display:none;"></div>
+                    <div id="mali-offline-result-container" style="display:none; flex: 1; flex-direction: column; min-width: 0; border: 1px solid var(--vscode-panel-border); border-radius: 3px; background: var(--vscode-editor-background);">
+                        <div style="padding: 6px 12px; background: var(--vscode-sideBar-background); border-bottom: 1px solid var(--vscode-panel-border); font-weight: 600; font-size: 0.9em; flex-shrink: 0;">Mali Offline Compiler Analysis</div>
+                        <div id="mali-offline-result" style="padding: 12px; font-family: var(--vscode-editor-font-family); font-size: var(--vscode-editor-font-size, 13px); overflow: auto; white-space: pre; flex: 1;"></div>
+                    </div>
+                </div>
             </section>
 
             <section id="tab-mesh" class="tab-panel">

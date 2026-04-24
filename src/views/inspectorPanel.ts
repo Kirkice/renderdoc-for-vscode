@@ -54,6 +54,8 @@ export class InspectorPanel {
     // Mesh decode cache keyed by "eventId:stage:maxVerts:instance".
     private meshCache = new LruCache<string, any>(64);
 
+    private latestMaliAnalysis?: { source: string, stage: string, result: string };
+
     private disposables: vscode.Disposable[] = [];
 
     public static createOrShow(context: vscode.ExtensionContext, bridge: RenderDocBridge) {
@@ -234,6 +236,10 @@ export class InspectorPanel {
     /** Current focused draw call (if any). */
     public getCurrentDrawCall(): DrawCall | undefined {
         return this.currentDrawCall;
+    }
+
+    public getLatestMaliAnalysisResult(): { source: string, stage: string, result: string } | undefined {
+        return this.latestMaliAnalysis;
     }
 
     /** File path of the currently loaded capture, or undefined if none. */
@@ -467,6 +473,10 @@ export class InspectorPanel {
                     .then(doc => vscode.window.showTextDocument(doc, { viewColumn: vscode.ViewColumn.Active }));
                 break;
             }
+            case 'analyzeMaliOffline': {
+                this.analyzeMaliOffline(msg.source, msg.stage);
+                break;
+            }
             case 'copyToClipboard':
                 vscode.env.clipboard.writeText(msg.text ?? '');
                 vscode.window.setStatusBarMessage('Copied to clipboard', 2000);
@@ -492,6 +502,86 @@ export class InspectorPanel {
     /** Public wrapper around dispose so callers can force-close the panel. */
     public disposePanel() {
         this.dispose();
+    }
+
+    private async analyzeMaliOffline(source: string, stage: string) {
+        try {
+            const config = vscode.workspace.getConfiguration('renderdoc');
+            const maliocPath = config.get<string>('maliOfflineCompilerPath');
+
+            if (!maliocPath) {
+                this.panel.webview.postMessage({
+                    type: 'maliAnalysisResult',
+                    error: 'Error: mali offline compiler path (malioc.exe) is not configured in settings.'
+                });
+                return;
+            }
+
+            const fs = require('fs');
+            const path = require('path');
+            const os = require('os');
+            const { exec } = require('child_process');
+            
+            let finalMaliPath = maliocPath;
+            // 如果用户填写的只是一个目录，自动加上 malioc.exe
+            if (fs.existsSync(finalMaliPath) && fs.statSync(finalMaliPath).isDirectory()) {
+                finalMaliPath = path.join(finalMaliPath, process.platform === 'win32' ? 'malioc.exe' : 'malioc');
+            }
+
+            // Map stage to appropriate extension
+            let ext = '.vert';
+            if (stage === 'fragment' || stage === 'pixel' || stage === 'FS') ext = '.frag';
+            else if (stage === 'compute' || stage === 'CS') ext = '.comp';
+            else if (stage === 'geometry' || stage === 'GS') ext = '.geom';
+            else if (stage === 'tess_control' || stage === 'hull' || stage === 'TCS' || stage === 'HS') ext = '.tesc';
+            else if (stage === 'tess_eval' || stage === 'domain' || stage === 'TES' || stage === 'DS') ext = '.tese';
+            else if (stage === 'vertex' || stage === 'VS') ext = '.vert';
+
+            const tempFile = path.join(os.tmpdir(), `mali_analyze_${Date.now()}${ext}`);
+            fs.writeFileSync(tempFile, source);
+
+            // 在 Windows 下加 chcp 65001 强制控制台输出 UTF-8，防止中文系统的报错变成乱码
+            const cmd = process.platform === 'win32' 
+                ? `chcp 65001 >nul & "${finalMaliPath}" "${tempFile}"` 
+                : `"${finalMaliPath}" "${tempFile}"`;
+
+            exec(cmd, { timeout: 30000 }, (error: any, stdout: string, stderr: string) => {
+                if (fs.existsSync(tempFile)) fs.unlinkSync(tempFile); // cleanup
+                
+                let result = stdout;
+                if (error && stderr && !stdout) {
+                    result = stderr;
+                } else if (stderr) {
+                    result += '\n\n' + stderr;
+                }
+
+                const errStr = error ? (error.message || stderr) : undefined;
+                const finalResult = result || 'No output from Mali Offline Compiler.';
+                
+                this.latestMaliAnalysis = {
+                    source: source,
+                    stage: stage,
+                    result: errStr ? `Error: ${errStr}\nOutput: ${finalResult}` : finalResult
+                };
+
+                this.panel.webview.postMessage({
+                    type: 'maliAnalysisResult',
+                    result: finalResult,
+                    error: (!result && errStr) ? errStr : undefined
+                });
+            });
+
+        } catch (e: any) {
+            this.latestMaliAnalysis = {
+                source: source,
+                stage: stage,
+                result: `Failed to run Mali Offline Compiler: ${e.message}`
+            };
+            this.panel.webview.postMessage({
+                type: 'maliAnalysisResult',
+                error: `Failed to run Mali Offline Compiler: ${e.message}`
+            });
+        }
     }
 
     // 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€

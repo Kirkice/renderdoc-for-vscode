@@ -363,6 +363,8 @@ interface DrawCallSummary {
     tree: CompactDrawCall[];
     /** Flat leaf-level draw calls (no children), capped at 100. */
     drawCalls: FlatDrawCall[];
+    /** Top 50 most expensive draw calls (sorted by durationUs, if available). Use this for performance and timing questions! */
+    expensiveDraws?: FlatDrawCall[];
     truncated: boolean;
 }
 
@@ -424,6 +426,11 @@ function summarizeDrawCalls(drawCalls: DrawCall[]): DrawCallSummary {
     }
     walk(drawCalls);
 
+    const expensiveDraws = flat
+        .filter(dc => typeof dc.durationUs === 'number')
+        .sort((a, b) => b.durationUs! - a.durationUs!)
+        .slice(0, 50);
+
     return {
         totalCount: flat.length,
         drawCount,
@@ -433,6 +440,7 @@ function summarizeDrawCalls(drawCalls: DrawCall[]): DrawCallSummary {
         topLevelGroups: drawCalls.length,
         tree: toCompactTree(drawCalls),
         drawCalls: flat.slice(0, FLAT_LIMIT),
+        expensiveDraws: expensiveDraws.length > 0 ? expensiveDraws : undefined,
         truncated: flat.length > FLAT_LIMIT,
     };
 }
@@ -518,6 +526,7 @@ export class GetSelectionContextTool implements vscode.LanguageModelTool<Record<
         const inspector = InspectorPanel.currentPanel;
         const inspectorEventId = inspector?.getCurrentEventId();
         const inspectorDrawCall = inspector?.getCurrentDrawCall();
+        const latestMaliAnalysis = inspector?.getLatestMaliAnalysisResult();
 
         const focusedEventId = inspectorEventId ?? selection.selectedDrawCall?.eventId;
         const focusedDrawCall = inspectorDrawCall ?? selection.selectedDrawCall;
@@ -530,6 +539,7 @@ export class GetSelectionContextTool implements vscode.LanguageModelTool<Record<
             focusedEventId: focusedEventId ?? null,
             focusedDrawCall: focusedDrawCall ?? null,
             sidebarSelectedResource: selection.selectedResource ?? null,
+            latestMaliAnalysis: latestMaliAnalysis ?? null,
         };
 
         // Enrich with pipeline state and bound-shader summary for the focused event.

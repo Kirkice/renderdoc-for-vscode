@@ -36,6 +36,12 @@ export interface MsgOpenShaderInEditor {
     language?: string;
 }
 
+export interface MsgAnalyzeMaliOffline {
+    type: 'analyzeMaliOffline';
+    source: string;
+    stage: string;
+}
+
 export interface MsgCopyToClipboard {
     type: 'copyToClipboard';
     text?: string;
@@ -66,6 +72,7 @@ export type WebviewToExtensionMessage =
     | MsgSelectEvent
     | MsgRequestTexture
     | MsgOpenShaderInEditor
+    | MsgAnalyzeMaliOffline
     | MsgCopyToClipboard
     | MsgExportTexture
     | MsgShowResourceDetails
@@ -128,10 +135,17 @@ export interface MsgMeshLoaded {
     error?: string;
 }
 
+export interface MsgMaliAnalysisResult {
+    type: 'maliAnalysisResult';
+    result?: string;
+    error?: string;
+}
+
 export type ExtensionToWebviewMessage =
     | MsgCaptureLoaded
     | MsgEventChanged
     | MsgShadersLoaded
     | MsgPipelineLoaded
     | MsgTexturePreview
-    | MsgMeshLoaded;
+    | MsgMeshLoaded
+    | MsgMaliAnalysisResult;

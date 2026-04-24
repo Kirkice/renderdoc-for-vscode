@@ -249,10 +249,10 @@ function closeCapture() {
         InspectorPanel.currentPanel.setCapture(undefined, [], []);
     }
     if (ThumbnailPanel.currentPanel) {
-        ThumbnailPanel.currentPanel.panel.dispose();
+        ThumbnailPanel.currentPanel.dispose();
     }
     if (DrawOverlayPanel.currentPanel) {
-        DrawOverlayPanel.currentPanel.panel.dispose();
+        DrawOverlayPanel.currentPanel.dispose();
     }
 }
 

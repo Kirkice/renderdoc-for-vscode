@@ -574,6 +574,11 @@
           "type": "string",
           "default": "",
           "description": "Override the path to renderdoc_bridge(.exe). If empty, the extension looks next to itself, in its download cache, or prompts you to download the prebuilt binary on first run."
+        },
+        "renderdoc.maliOfflineCompilerPath": {
+          "type": "string",
+          "default": "",
+          "description": "Path to the Mali Offline Compiler executable (malioc.exe). Used for analyzing shader performance."
         }
       }
     }
