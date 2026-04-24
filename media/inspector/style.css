@@ -429,39 +429,69 @@
         }
         .channel-toggle .ch:last-child { border-right: none; }
 
-        /* Mesh View */
+        /* Mesh View — virtualized grid */
         .mesh-table-wrap {
-            overflow: auto;
             height: 100%;
             padding: 0;
-        }
-        .mesh-table {
-            border-collapse: collapse;
+            overflow: auto;
+            position: relative;
             font-family: var(--vscode-editor-font-family, monospace);
             font-size: 0.82em;
-            white-space: nowrap;
+        }
+        .mesh-table-wrap.empty-state { display: block; }
+        .mesh-inner {
+            position: relative;
+            width: max-content;
             min-width: 100%;
         }
-        .mesh-table th, .mesh-table td {
+        .mesh-grid {
+            display: grid;
+            position: sticky;
+            top: 0;
+            z-index: 2;
+            background: var(--vscode-editorWidget-background, var(--vscode-sideBar-background));
+            border-bottom: 1px solid var(--vscode-panel-border);
+        }
+        .mhc {
             padding: 2px 8px;
             border-right: 1px solid var(--vscode-panel-border);
-            border-bottom: 1px solid var(--vscode-panel-border);
             text-align: right;
-        }
-        .mesh-table thead th {
-            position: sticky; top: 0; z-index: 1;
-            background: var(--vscode-editorWidget-background, var(--vscode-sideBar-background));
+            white-space: nowrap;
             font-weight: normal;
+            line-height: 20px;
         }
-        .mesh-table thead th.mesh-col-attr {
+        .mhc-attr {
             text-align: center;
             color: var(--vscode-textLink-foreground);
         }
-        .mesh-table thead th.mesh-col-sub { color: var(--vscode-descriptionForeground); font-size: 0.92em; }
-        .mesh-table thead th.mesh-col-num { background: var(--vscode-sideBar-background); }
-        .mesh-table tbody tr:nth-child(even) { background: rgba(255,255,255,0.025); }
-        .mesh-table tbody tr:hover { background: var(--vscode-list-hoverBackground); }
-        .mesh-table tbody tr.restart td { color: var(--vscode-descriptionForeground); font-style: italic; }
+        .mhc-sub { color: var(--vscode-descriptionForeground); font-size: 0.92em; }
+        .mhc-num { background: var(--vscode-sideBar-background); }
+        .mesh-rows-host {
+            position: relative;
+        }
+        .mesh-window {
+            position: absolute;
+            top: 0; left: 0; right: 0;
+            display: grid;
+            grid-auto-rows: 22px;
+            will-change: transform;
+        }
+        .mrow {
+            display: contents;
+        }
+        .mrow .mc {
+            padding: 0 8px;
+            line-height: 22px;
+            border-right: 1px solid var(--vscode-panel-border);
+            border-bottom: 1px solid var(--vscode-panel-border);
+            text-align: right;
+            white-space: nowrap;
+            overflow: hidden;
+        }
+        .mrow .mc.num { color: var(--vscode-descriptionForeground); }
+        .mrow.restart .mc { color: var(--vscode-descriptionForeground); font-style: italic; }
+        .mrow:nth-child(even) .mc { background: rgba(255,255,255,0.025); }
+        .mrow:hover .mc { background: var(--vscode-list-hoverBackground); }
         .mesh-table td.num { color: var(--vscode-descriptionForeground); }
 
         /* Mesh preview */

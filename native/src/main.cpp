@@ -2103,7 +2103,10 @@ static json handleGetMeshData(int id, const json &params) {
 
     uint32_t eventId = params.value("eventId", (uint32_t)0);
     std::string stageStr = params.value("stage", "vsin");
-    uint32_t maxVerts = params.value("maxVertices", (uint32_t)256);
+    // maxVertices == 0 means "all" - mirrors RenderDoc desktop's BufferViewer
+    // which uses the full action->numIndices. A safety cap prevents OOM on
+    // pathological captures.
+    uint32_t maxVerts = params.value("maxVertices", (uint32_t)0);
     uint32_t instance = params.value("instance", (uint32_t)0);
     uint32_t view     = params.value("view", (uint32_t)0);
     MeshDataStage stage = parseMeshStage(stageStr);
@@ -2174,7 +2177,10 @@ static json handleGetMeshData(int id, const json &params) {
         result["attributes"] = json::array();
         return makeResult(id, result);
     }
-    uint32_t count = std::min(total, maxVerts);
+    // maxVerts==0 -> all rows. Apply hard safety cap of ~4M to avoid OOM.
+    constexpr uint32_t kHardCap = 4u * 1024u * 1024u;
+    uint32_t effectiveMax = (maxVerts == 0) ? kHardCap : std::min(maxVerts, kHardCap);
+    uint32_t count = std::min(total, effectiveMax);
     result["totalIndices"] = total;
     result["returnedIndices"] = count;
 
@@ -2407,9 +2413,10 @@ static json handleGetMeshData(int id, const json &params) {
     }
 
     // Report attribute schema.
+    // (bufferIndex is filled in below after we dedupe VB reads.)
     json attrMeta = json::array();
     for (const auto &a : attrs) {
-        attrMeta.push_back({
+        json meta = {
             {"name", a.name},
             {"compType", (uint32_t)a.fmt.compType},
             {"compCount", a.fmt.compCount},
@@ -2423,15 +2430,28 @@ static json handleGetMeshData(int id, const json &params) {
             {"instanceRate", a.instanceRate},
             {"used", a.used},
             {"genericEnabled", a.genericEnabled},
-        });
+            {"bufferIndex", -1},
+        };
+        if (a.genericEnabled) {
+            json gv = json::array();
+            for (uint32_t c = 0; c < a.fmt.compCount && c < 4; c++) {
+                if (a.genericKind == 1)      gv.push_back((double)a.genericU[c]);
+                else if (a.genericKind == 2) gv.push_back((double)a.genericI[c]);
+                else                         gv.push_back((double)a.genericF[c]);
+            }
+            meta["genericValues"] = gv;
+            meta["genericKind"] = a.genericKind;
+        }
+        attrMeta.push_back(meta);
     }
-    result["attributes"] = attrMeta;
 
     // Read the index buffer covering at least the requested indices.
     std::vector<uint8_t> idxBuf;
     if (mf.indexResourceId != ResourceId() && mf.indexByteStride > 0) {
         uint64_t need = (uint64_t)count * mf.indexByteStride;
         idxBuf = readBuffer(mf.indexResourceId, mf.indexByteOffset, need);
+        // Trim to exactly the bytes we report (avoid sending over-read tail).
+        if (idxBuf.size() > need) idxBuf.resize((size_t)need);
     }
     // Use PipeState-style unified restart logic: IsRestartEnabled() +
     // GetRestartIndex(). Emulate locally per API.
@@ -2467,75 +2487,79 @@ static json handleGetMeshData(int id, const json &params) {
             }
         }
     }
-    if (!restartEnabled) restartIdx = ~0u; // Sentinel readIndex won't match.
+    uint32_t restartIdxForScan = restartEnabled ? restartIdx : ~0u;
 
-    // Pre-read each attribute's VB into memory once (capped to the range we need).
-    struct AttrBuf { std::vector<uint8_t> data; uint32_t stride; uint32_t offset; };
-    std::vector<AttrBuf> vbufs(attrs.size());
+    // Determine the highest vertex index we will actually reference so we can
+    // tightly size each VB read. (Mirrors RenderDoc desktop BufferViewer,
+    // which only reads the bytes required for the visible rows.)
+    uint32_t maxVertexIdx = 0;
+    if (!idxBuf.empty()) {
+        for (uint32_t i = 0; i < count; i++) {
+            bool isR = false;
+            uint32_t raw = readIndex(idxBuf, mf.indexByteStride, i, restartIdxForScan, isR);
+            if (!isR && raw > maxVertexIdx) maxVertexIdx = raw;
+        }
+    } else {
+        maxVertexIdx = count ? count - 1 : 0;
+    }
+    uint32_t vertsToRead = maxVertexIdx + 1;
+
+    // Dedupe VB reads: group attributes that share (resId, vbOffset, stride)
+    // into a single buffer. Saves lots of bandwidth when multiple attributes
+    // live in the same interleaved vertex buffer.
+    struct BufGroup {
+        ResourceId resId;
+        uint64_t   vbOffset;
+        uint32_t   stride;
+        uint32_t   maxAttrEnd;   // max(attrOffset + attrSize) across members
+    };
+    std::vector<BufGroup> groups;
+    std::vector<int> attrToGroup(attrs.size(), -1);
     for (size_t k = 0; k < attrs.size(); k++) {
         const auto &a = attrs[k];
-        vbufs[k].stride = a.vbStride;
-        vbufs[k].offset = a.attrOffset;
-        if (a.vb == ResourceId() || a.vbStride == 0) continue;
-        // Over-read conservatively: we don't know max index value yet, so read
-        // a reasonable chunk. For indexed draws with small caps we still cover
-        // most meshes up to ~64k verts. If an index exceeds the buffer we'll
-        // gracefully fill zeros.
-        uint64_t readLen = (uint64_t)a.vbStride * 65536;
-        vbufs[k].data = readBuffer(a.vb, a.vbOffset, readLen);
+        if (a.genericEnabled || a.vb == ResourceId() || a.vbStride == 0) continue;
+        uint32_t attrSize = (uint32_t)a.fmt.compByteWidth * (uint32_t)a.fmt.compCount;
+        uint32_t attrEnd  = a.attrOffset + attrSize;
+        int found = -1;
+        for (size_t g = 0; g < groups.size(); g++) {
+            if (groups[g].resId == a.vb && groups[g].vbOffset == a.vbOffset &&
+                groups[g].stride == a.vbStride) { found = (int)g; break; }
+        }
+        if (found < 0) {
+            groups.push_back({a.vb, a.vbOffset, a.vbStride, attrEnd});
+            found = (int)groups.size() - 1;
+        } else if (attrEnd > groups[found].maxAttrEnd) {
+            groups[found].maxAttrEnd = attrEnd;
+        }
+        attrToGroup[k] = found;
     }
 
-    // Build rows.
-    json rows = json::array();
-    for (uint32_t i = 0; i < count; i++) {
-        json row;
-        row["vtx"] = i;
-        uint32_t idx = i;
-        bool isRestart = false;
-        if (!idxBuf.empty()) {
-            uint32_t raw = readIndex(idxBuf, mf.indexByteStride, i, restartIdx, isRestart);
-            row["idx"] = raw;
-            row["restart"] = isRestart;
-            idx = isRestart ? 0 : (raw + (uint32_t)mf.baseVertex);
+    // Read each group once.
+    json bufArr = json::array();
+    for (const auto &g : groups) {
+        uint64_t readLen = 0;
+        if (vertsToRead > 0) {
+            readLen = (uint64_t)(vertsToRead - 1) * g.stride + g.maxAttrEnd;
         }
-
-        json cols = json::array();
-        for (size_t k = 0; k < attrs.size(); k++) {
-            const auto &a = attrs[k];
-            const auto &vb = vbufs[k];
-            json vals = json::array();
-            if (a.genericEnabled) {
-                // Constant per-attribute value (GL glVertexAttrib4f etc).
-                for (uint32_t c = 0; c < a.fmt.compCount; c++) {
-                    if (a.genericKind == 1)      vals.push_back((double)a.genericU[c]);
-                    else if (a.genericKind == 2) vals.push_back((double)a.genericI[c]);
-                    else                         vals.push_back((double)a.genericF[c]);
-                }
-            } else if (isRestart || vb.data.empty() || vb.stride == 0 ||
-                       a.fmt.type != ResourceFormatType::Regular) {
-                for (uint32_t c = 0; c < a.fmt.compCount; c++) vals.push_back(0.0);
-            } else {
-                uint32_t useIdx = a.perInstance
-                    ? (a.instanceRate ? (instance / a.instanceRate) : instance)
-                    : idx;
-                uint64_t base = (uint64_t)useIdx * vb.stride + vb.offset;
-                for (uint32_t c = 0; c < a.fmt.compCount; c++) {
-                    uint32_t srcC = (a.fmt.BGRAOrder() && a.fmt.compCount >= 3 && c < 3) ? (2u - c) : c;
-                    uint64_t off = base + (uint64_t)srcC * a.fmt.compByteWidth;
-                    if (off + a.fmt.compByteWidth > vb.data.size()) {
-                        vals.push_back(0.0);
-                    } else {
-                        vals.push_back(decodeScalar(vb.data.data() + off, a.fmt.compType,
-                                                    a.fmt.compByteWidth));
-                    }
-                }
-            }
-            cols.push_back(vals);
-        }
-        row["cols"] = cols;
-        rows.push_back(row);
+        std::vector<uint8_t> data = readBuffer(g.resId, g.vbOffset, readLen);
+        if (data.size() > readLen) data.resize((size_t)readLen);
+        bufArr.push_back(base64Encode(data));
     }
-    result["rows"] = rows;
+
+    // Patch bufferIndex into the attribute metadata.
+    for (size_t k = 0; k < attrs.size(); k++) {
+        attrMeta[k]["bufferIndex"] = attrToGroup[k];
+    }
+    result["attributes"] = attrMeta;
+    result["buffers"]    = bufArr;
+
+    // Index buffer + restart info.
+    if (!idxBuf.empty()) {
+        result["indexData"] = base64Encode(idxBuf);
+    }
+    result["restartEnabled"] = restartEnabled;
+    result["restartIndex"]   = restartIdx;
+    result["maxVertexIndex"] = maxVertexIdx;
 
     return makeResult(id, result);
 }

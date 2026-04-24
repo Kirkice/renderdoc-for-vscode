@@ -106,10 +106,6 @@ export function buildInspectorHtml(
                         <button class="scope active" data-val="vsin">VS Input</button>
                         <button class="scope" data-val="vsout">VS Output</button>
                     </div>
-                    <label class="muted" style="display:flex;align-items:center;gap:4px;">
-                        Max rows:
-                        <input id="mesh-max" type="number" min="16" max="65536" value="256" style="width:70px;">
-                    </label>
                     <button id="mesh-refresh" class="icon-btn">Reload</button>
                     <button id="mesh-reset-view" class="icon-btn" title="Reset preview camera">Reset View</button>
                     <label class="muted" style="display:flex;align-items:center;gap:4px;">

@@ -168,11 +168,11 @@ export class InspectorPanel {
         }
     }
 
-    /** Set / change the focused event 鈥?the whole panel updates around this. */
+    /** Set / change the focused event — the whole panel updates around this. */
     public async setEvent(eventId: number, drawCall?: DrawCall) {
         this.currentEventId = eventId;
         this.currentDrawCall = drawCall ?? this.findDrawCall(eventId);
-        this.panel.title = `Inspector 鈥?EID ${eventId}${this.currentDrawCall ? ': ' + this.currentDrawCall.name : ''}`;
+        this.panel.title = `Inspector — EID ${eventId}${this.currentDrawCall ? ': ' + this.currentDrawCall.name : ''}`;
 
         // Post eventChanged immediately so the header updates even while the
         // capture state is still being pulled (first draw click after reload
@@ -367,8 +367,8 @@ export class InspectorPanel {
         try {
             const data = await withTimeout(
                 this.bridge.nativeGetMeshData(eventId, stage, { maxVertices, instance }),
-                30000,
-                'Mesh fetch timed out after 30s.',
+                120000,
+                'Mesh fetch timed out after 120s.',
             );
             this.meshCache.set(key, data);
             this.panel.webview.postMessage({ type: 'meshLoaded', key, data });
@@ -457,7 +457,7 @@ export class InspectorPanel {
                 this.loadMesh(
                     msg.eventId,
                     msg.stage,
-                    msg.maxVertices ?? 256,
+                    msg.maxVertices ?? 0,
                     msg.instance ?? 0,
                 );
                 break;

@@ -21,7 +21,7 @@
         eventScope: 'all',   // 'all' | 'group'
         texScope: 'output',  // 'output' | 'input'
         meshStage: 'vsin',   // 'vsin' | 'vsout'
-        meshMax: 256,
+        meshMax: 0,          // 0 = all rows (matches RenderDoc desktop BufferViewer)
         meshCache: {},       // key -> { data } | { error }
         meshPending: {},
         meshShowPreview: true,
@@ -923,12 +923,286 @@
         return null;
     }
 
+    // ── Binary mesh decoding ───────────────────────────────────────
+    // Decode base64 string → Uint8Array. ~5x faster than using atob+loop
+    // via the browser's built-in parsing of data URLs.
+    function b64ToBytes(s) {
+        if (!s) return new Uint8Array(0);
+        const bin = atob(s);
+        const n = bin.length;
+        const out = new Uint8Array(n);
+        for (let i = 0; i < n; i++) out[i] = bin.charCodeAt(i);
+        return out;
+    }
+
+    // Convert a half-float (uint16) to a JS number.
+    function halfToFloat(h) {
+        const sign = (h & 0x8000) >> 15;
+        const exp  = (h & 0x7C00) >> 10;
+        const mant = (h & 0x03FF);
+        if (exp === 0) {
+            if (mant === 0) return sign ? -0 : 0;
+            return (sign ? -1 : 1) * Math.pow(2, -14) * (mant / 1024);
+        }
+        if (exp === 31) {
+            if (mant === 0) return sign ? -Infinity : Infinity;
+            return NaN;
+        }
+        return (sign ? -1 : 1) * Math.pow(2, exp - 15) * (1 + mant / 1024);
+    }
+
+    // Pull a single scalar out of a DataView for a given (CompType, width).
+    // CompType values (from replay_enums.h): 0=Typeless, 1=Float, 2=UNorm,
+    // 3=SNorm, 4=UInt, 5=SInt, 6=UScaled, 7=SScaled, 8=Depth, 9=UNormSRGB.
+    function decodeScalar(dv, off, compType, width) {
+        if (off < 0 || off + width > dv.byteLength) return 0;
+        switch (compType) {
+            case 1: // Float
+                if (width === 4) return dv.getFloat32(off, true);
+                if (width === 8) return dv.getFloat64(off, true);
+                if (width === 2) return halfToFloat(dv.getUint16(off, true));
+                return 0;
+            case 4: case 6: // UInt / UScaled
+                if (width === 1) return dv.getUint8(off);
+                if (width === 2) return dv.getUint16(off, true);
+                if (width === 4) return dv.getUint32(off, true);
+                if (width === 8) {
+                    const lo = dv.getUint32(off, true);
+                    const hi = dv.getUint32(off + 4, true);
+                    return hi * 4294967296 + lo;
+                }
+                return 0;
+            case 5: case 7: // SInt / SScaled
+                if (width === 1) return dv.getInt8(off);
+                if (width === 2) return dv.getInt16(off, true);
+                if (width === 4) return dv.getInt32(off, true);
+                if (width === 8) {
+                    const lo = dv.getUint32(off, true);
+                    const hi = dv.getInt32(off + 4, true);
+                    return hi * 4294967296 + lo;
+                }
+                return 0;
+            case 2: case 9: // UNorm / UNormSRGB
+                if (width === 1) return dv.getUint8(off) / 255;
+                if (width === 2) return dv.getUint16(off, true) / 65535;
+                return 0;
+            case 3: { // SNorm
+                if (width === 1) {
+                    const v = dv.getInt8(off);
+                    return v < -127 ? -1 : v / 127;
+                }
+                if (width === 2) {
+                    const v = dv.getInt16(off, true);
+                    return v < -32767 ? -1 : v / 32767;
+                }
+                return 0;
+            }
+            default: return 0;
+        }
+    }
+
+    // Prepare typed-array / metadata caches for a fetched mesh payload.
+    // Called once per response; decoded state lives on `entry.decoded`.
+    function prepareMeshData(entry) {
+        if (!entry || entry.error || !entry.data || entry.decoded) return entry && entry.decoded;
+        const d = entry.data;
+        const attrs = d.attributes || [];
+        const bufBytes = (d.buffers || []).map(b64ToBytes);
+        const bufViews = bufBytes.map(b => new DataView(b.buffer, b.byteOffset, b.byteLength));
+        const idxBytes = d.indexData ? b64ToBytes(d.indexData) : null;
+        const idxView  = idxBytes ? new DataView(idxBytes.buffer, idxBytes.byteOffset, idxBytes.byteLength) : null;
+        entry.decoded = {
+            attrs,
+            bufViews,
+            bufBytes,
+            idxView,
+            indexStride: d.indexByteStride || 0,
+            baseVertex: d.baseVertex | 0,
+            restartEnabled: !!d.restartEnabled,
+            restartIndex: d.restartIndex >>> 0,
+            topology: d.topology | 0,
+            count: d.returnedIndices | 0,
+            total: d.totalIndices | 0,
+            hasIdx: !!idxView,
+        };
+        return entry.decoded;
+    }
+
+    // Read the raw index at position i; returns { raw, isRestart }.
+    function readIndexAt(dec, i) {
+        if (!dec.hasIdx) return { raw: i, isRestart: false };
+        const s = dec.indexStride;
+        const off = i * s;
+        if (off + s > dec.idxView.byteLength) return { raw: 0, isRestart: false };
+        let raw = 0;
+        if (s === 1) raw = dec.idxView.getUint8(off);
+        else if (s === 2) raw = dec.idxView.getUint16(off, true);
+        else if (s === 4) raw = dec.idxView.getUint32(off, true);
+        const isRestart = dec.restartEnabled && raw === dec.restartIndex;
+        return { raw, isRestart };
+    }
+
+    // Decode one attribute's scalar components for a given vertex index.
+    // `vtxIdx` is the actual VB lookup index (raw + baseVertex for indexed,
+    // row number otherwise).
+    function decodeAttrCells(a, dec, vtxIdx, isRestart, instance) {
+        const cc = Math.max(1, a.compCount || 1);
+        const out = new Array(cc);
+        if (a.genericEnabled) {
+            const gv = a.genericValues || [];
+            for (let c = 0; c < cc; c++) out[c] = gv[c] != null ? gv[c] : 0;
+            return out;
+        }
+        if (isRestart || a.formatType !== 0 /* not ResourceFormatType::Regular */) {
+            for (let c = 0; c < cc; c++) out[c] = 0;
+            return out;
+        }
+        const bi = a.bufferIndex;
+        if (bi == null || bi < 0 || bi >= dec.bufViews.length) {
+            for (let c = 0; c < cc; c++) out[c] = 0;
+            return out;
+        }
+        const dv = dec.bufViews[bi];
+        const stride = a.byteStride | 0;
+        const relOff = a.relativeOffset | 0;
+        const width = a.compByteWidth | 0;
+        const useIdx = a.perInstance
+            ? ((a.instanceRate | 0) ? ((instance | 0) / (a.instanceRate | 0)) | 0 : (instance | 0))
+            : vtxIdx;
+        const base = useIdx * stride + relOff;
+        const bgra = !!a.bgra && cc >= 3;
+        for (let c = 0; c < cc; c++) {
+            const srcC = (bgra && c < 3) ? (2 - c) : c;
+            out[c] = decodeScalar(dv, base + srcC * width, a.compType, width);
+        }
+        return out;
+    }
+
+    // ── Mesh virtualized table ─────────────────────────────────────
+    const MESH_ROW_HEIGHT = 22;        // px; must match CSS
+    const MESH_ROW_OVERSCAN = 16;       // rows rendered above/below viewport
+
+    // Build the table header + scroll container once per dataset change.
+    // Returns true if a fresh skeleton was (re-)built.
+    function buildMeshSkeleton(body, dec) {
+        // Reuse existing skeleton if the attribute schema hasn't changed.
+        const sig = dec.count + '|' + dec.hasIdx + '|' +
+            dec.attrs.map(a => (a.name || '') + ':' + (a.compCount || 1) +
+                               ':' + (a.compType | 0) + ':' + (a.compByteWidth | 0)).join(';');
+        if (body.dataset.meshSig === sig) return false;
+        body.dataset.meshSig = sig;
+
+        // Fixed per-column widths keep the header and virtualized row grid in
+        // lockstep horizontally (important because they are separate grids).
+        const COL_NUM = 64;    // VTX / IDX
+        const COL_CELL = 88;   // per attribute sub-component
+        let colCount = 1 + (dec.hasIdx ? 1 : 0);
+        for (const a of dec.attrs) colCount += Math.max(1, a.compCount || 1);
+        const tplParts = [];
+        tplParts.push(COL_NUM + 'px');
+        if (dec.hasIdx) tplParts.push(COL_NUM + 'px');
+        for (const a of dec.attrs) {
+            const cc = Math.max(1, a.compCount || 1);
+            for (let c = 0; c < cc; c++) tplParts.push(COL_CELL + 'px');
+        }
+        const tpl = tplParts.join(' ');
+
+        // Build header. Top row spans per attribute, bottom row per sub-column.
+        let hdrHtml = '';
+        hdrHtml += '<div class="mhc mhc-num" style="grid-row:1/3">VTX</div>';
+        if (dec.hasIdx) hdrHtml += '<div class="mhc mhc-num" style="grid-row:1/3">IDX</div>';
+        for (const a of dec.attrs) {
+            const cc = Math.max(1, a.compCount || 1);
+            hdrHtml += '<div class="mhc mhc-attr" style="grid-column:span ' + cc +
+                '" title="' + esc(fmtComp(a)) + '">' + esc(a.name || '(unnamed)') + '</div>';
+        }
+        for (const a of dec.attrs) {
+            const cc = Math.max(1, a.compCount || 1);
+            const labels = ['x', 'y', 'z', 'w'];
+            for (let c = 0; c < cc; c++) {
+                hdrHtml += '<div class="mhc mhc-sub">.' + (labels[c] || ('c' + c)) + '</div>';
+            }
+        }
+
+        body.innerHTML =
+            '<div class="mesh-inner">' +
+                '<div class="mesh-grid" style="grid-template-columns:' + tpl + '">' +
+                    hdrHtml +
+                '</div>' +
+                '<div class="mesh-rows-host">' +
+                    '<div class="mesh-window" style="grid-template-columns:' + tpl + '"></div>' +
+                '</div>' +
+            '</div>';
+
+        const host = body.querySelector('.mesh-rows-host');
+        host.style.height = (dec.count * MESH_ROW_HEIGHT) + 'px';
+
+        // Attach the scroll listener once; subsequent skeleton rebuilds update
+        // the cached `dec` via closure so the most recent dataset is rendered.
+        body._meshDec = dec;
+        if (!body._meshScrollBound) {
+            body._meshScrollBound = true;
+            body.addEventListener('scroll', () => {
+                if (body._meshDec) renderMeshRows(body, body._meshDec);
+            }, { passive: true });
+        }
+        body.scrollTop = 0;
+        return true;
+    }
+
+    // Render only the rows visible (± overscan) in the scroll viewport.
+    function renderMeshRows(body, dec) {
+        const host = body.querySelector('.mesh-rows-host');
+        const win  = body.querySelector('.mesh-window');
+        if (!host || !win) return;
+        // Where does the row area start inside the scroll container?
+        const hostOffsetTop = host.offsetTop;
+        const scrollTop = body.scrollTop;
+        const clientH = body.clientHeight;
+        const viewTop = Math.max(0, scrollTop - hostOffsetTop);
+        let first = Math.max(0, Math.floor(viewTop / MESH_ROW_HEIGHT) - MESH_ROW_OVERSCAN);
+        let last  = Math.min(dec.count,
+            Math.ceil((viewTop + clientH) / MESH_ROW_HEIGHT) + MESH_ROW_OVERSCAN);
+        if (last <= first) return;
+
+        // Skip rebuilding if window hasn't moved since last render.
+        const prev = win.dataset.range || '';
+        const key = first + ':' + last;
+        if (prev === key) return;
+        win.dataset.range = key;
+
+        win.style.transform = 'translateY(' + (first * MESH_ROW_HEIGHT) + 'px)';
+
+        const attrs = dec.attrs;
+        const parts = [];
+        for (let i = first; i < last; i++) {
+            const idxInfo = readIndexAt(dec, i);
+            const isRestart = idxInfo.isRestart;
+            const vtxIdx = isRestart ? 0 : (idxInfo.raw + dec.baseVertex);
+            parts.push('<div class="mrow' + (isRestart ? ' restart' : '') + '">');
+            parts.push('<div class="mc mono num">' + i + '</div>');
+            if (dec.hasIdx) parts.push('<div class="mc mono num">' + (isRestart ? '—' : idxInfo.raw) + '</div>');
+            for (let k = 0; k < attrs.length; k++) {
+                const a = attrs[k];
+                const isInt = (COMP_TYPE_INFO[a.compType] || {}).int;
+                const vals = decodeAttrCells(a, dec, vtxIdx, isRestart, 0);
+                const cc = Math.max(1, a.compCount || 1);
+                for (let c = 0; c < cc; c++) {
+                    parts.push('<div class="mc mono">' + esc(formatValue(vals[c], isInt)) + '</div>');
+                }
+            }
+            parts.push('</div>');
+        }
+        win.innerHTML = parts.join('');
+    }
+
     function renderMesh() {
         const body = document.getElementById('mesh-body');
         const info = document.getElementById('mesh-info');
         if (state.eventId == null) {
             body.textContent = 'Select an event.';
             body.className = 'mesh-table-wrap empty-state';
+            delete body.dataset.meshSig;
             info.textContent = '';
             return;
         }
@@ -936,67 +1210,34 @@
         if (!entry) {
             body.textContent = 'Loading mesh data…';
             body.className = 'mesh-table-wrap empty-state';
+            delete body.dataset.meshSig;
             info.textContent = '';
             return;
         }
         if (entry.error) {
             body.textContent = 'Mesh unavailable: ' + entry.error;
             body.className = 'mesh-table-wrap empty-state';
+            delete body.dataset.meshSig;
             info.textContent = '';
             return;
         }
-        const data = entry.data || {};
-        const attrs = data.attributes || [];
-        const rows = data.rows || [];
-        info.textContent = (data.returnedIndices != null ? data.returnedIndices + ' / ' + (data.totalIndices || 0) + ' indices' : '')
+        const dec = prepareMeshData(entry);
+        const attrs = dec.attrs;
+        info.textContent = (dec.count + ' / ' + dec.total + ' indices')
             + (attrs.length ? ' · ' + attrs.length + ' attributes' : '');
 
-        if (attrs.length === 0 || rows.length === 0) {
+        if (attrs.length === 0 || dec.count === 0) {
             body.textContent = 'No mesh data at this event.';
             body.className = 'mesh-table-wrap empty-state';
+            delete body.dataset.meshSig;
             return;
         }
 
         body.className = 'mesh-table-wrap';
-        // Build header: VTX | IDX | per-attribute columns (each attribute gets
-        // compCount sub-columns like .x .y .z .w).
-        let html = '<table class="mesh-table"><thead><tr>';
-        html += '<th rowspan="2" class="mesh-col-num">VTX</th>';
-        const hasIdx = rows[0].idx !== undefined;
-        if (hasIdx) html += '<th rowspan="2" class="mesh-col-num">IDX</th>';
-        for (const a of attrs) {
-            const cc = Math.max(1, a.compCount || 1);
-            html += '<th colspan="' + cc + '" class="mesh-col-attr" title="' + esc(fmtComp(a)) + '">'
-                + esc(a.name || '(unnamed)') + '</th>';
-        }
-        html += '</tr><tr>';
-        for (const a of attrs) {
-            const cc = Math.max(1, a.compCount || 1);
-            const labels = ['x', 'y', 'z', 'w'];
-            for (let c = 0; c < cc; c++) {
-                html += '<th class="mesh-col-sub">.' + (labels[c] || ('c' + c)) + '</th>';
-            }
-        }
-        html += '</tr></thead><tbody>';
-        for (const row of rows) {
-            const isRestart = row.restart;
-            html += '<tr' + (isRestart ? ' class="restart"' : '') + '>';
-            html += '<td class="mono num">' + row.vtx + '</td>';
-            if (hasIdx) html += '<td class="mono num">' + (isRestart ? '—' : row.idx) + '</td>';
-            const cols = row.cols || [];
-            for (let i = 0; i < attrs.length; i++) {
-                const a = attrs[i];
-                const isInt = (COMP_TYPE_INFO[a.compType] || {}).int;
-                const vals = cols[i] || [];
-                const cc = Math.max(1, a.compCount || 1);
-                for (let c = 0; c < cc; c++) {
-                    html += '<td class="mono">' + esc(formatValue(vals[c], isInt)) + '</td>';
-                }
-            }
-            html += '</tr>';
-        }
-        html += '</tbody></table>';
-        body.innerHTML = html;
+        buildMeshSkeleton(body, dec);
+        // Force a render pass for the initial viewport.
+        delete body.querySelector('.mesh-window').dataset.range;
+        renderMeshRows(body, dec);
 
         // Also refresh the 3D preview.
         renderMeshPreview();
@@ -1041,24 +1282,27 @@
 
         const entry = state.meshCache[meshRequestKey()];
         if (!entry || entry.error || !entry.data) return;
+        const dec = prepareMeshData(entry);
+        if (!dec || dec.count === 0) return;
         const data = entry.data;
-        const rows = data.rows || [];
-        if (rows.length === 0) return;
 
         const pi = findPositionAttr(data);
-        const posAttr = (data.attributes || [])[pi];
+        const posAttr = dec.attrs[pi];
         if (!posAttr) return;
         const cc = posAttr.compCount || 0;
         const isClip = state.meshStage !== 'vsin';
 
-        // Extract positions, compute AABB.
-        const pts = new Array(rows.length);
+        // Extract positions from raw buffers (much faster than re-JSON).
+        const N = dec.count;
+        const pts = new Array(N);
         let minX=Infinity,minY=Infinity,minZ=Infinity;
         let maxX=-Infinity,maxY=-Infinity,maxZ=-Infinity;
         let anyFinite = false;
-        for (let i = 0; i < rows.length; i++) {
-            if (rows[i].restart) { pts[i] = null; continue; }
-            const v = (rows[i].cols && rows[i].cols[pi]) || [];
+        for (let i = 0; i < N; i++) {
+            const idxInfo = readIndexAt(dec, i);
+            if (idxInfo.isRestart) { pts[i] = null; continue; }
+            const vtxIdx = idxInfo.raw + dec.baseVertex;
+            const v = decodeAttrCells(posAttr, dec, vtxIdx, false, 0);
             let x = +v[0] || 0;
             let y = +v[1] || 0;
             let z = cc >= 3 ? (+v[2] || 0) : 0;
@@ -1127,7 +1371,6 @@
             ctx.moveTo(p1[0], p1[1]); ctx.lineTo(p2[0], p2[1]);
         }
 
-        const N = rows.length;
         if (topo === 1) {
             // PointList — drawn below.
         } else if (topo === 2) {
@@ -1191,11 +1434,16 @@
         const maxInput = document.getElementById('mesh-max');
         if (maxInput) {
             maxInput.addEventListener('change', () => {
-                const n = parseInt(maxInput.value, 10);
-                if (!isNaN(n) && n > 0) {
-                    state.meshMax = Math.min(65536, Math.max(1, n));
-                    renderMesh();
+                const raw = maxInput.value.trim();
+                if (raw === '') {
+                    state.meshMax = 0; // all
+                } else {
+                    const n = parseInt(raw, 10);
+                    if (!isNaN(n) && n >= 0) {
+                        state.meshMax = Math.min(4194304, n);
+                    }
                 }
+                renderMesh();
             });
         }
         const reload = document.getElementById('mesh-refresh');
