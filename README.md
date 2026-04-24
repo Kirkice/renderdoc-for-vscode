@@ -2,7 +2,7 @@
 
 # RenderDoc for VS Code
 
-**Inspect, analyze, and debug GPU captures — without ever leaving your editor.**
+**Inspect, analyze, and debug GPU captures — without leaving your editor.**
 
 [![VS Code](https://img.shields.io/badge/VS%20Code-1.95%2B-007ACC?logo=visualstudiocode&logoColor=white)](https://code.visualstudio.com/)
 [![License](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
@@ -15,56 +15,56 @@
 
 ---
 
-## ✨ Overview
+## Overview
 
-**RenderDoc for VS Code** brings the full power of the RenderDoc graphics debugger into Visual Studio Code. Open any `.rdc` capture file and get an instant, first-class inspection experience — draw call timelines, live shader source, pipeline state, texture previews, and an AI-assisted frame analyzer via GitHub Copilot Chat.
+**RenderDoc for VS Code** brings the full power of the RenderDoc graphics debugger into Visual Studio Code. Open any `.rdc` capture file and get an instant, first-class inspection experience — hierarchical draw call timelines, live shader source, full pipeline state, texture previews, GPU timing profiling, Mali shader analysis, and an AI-powered frame analyzer via GitHub Copilot Chat.
 
 No context switching. No external viewers. Just your capture, your editor, and your agent.
 
 ---
 
-## 🎯 Highlights
+## Highlights
 
 <table>
 <tr>
 <td width="50%" valign="top">
 
-### 🔬 Full Capture Inspector
-A dedicated, tabbed inspector panel with **Overview**, **Pipeline**, **Shaders**, **Textures**, **Mesh**, and **Events** — modeled after RenderDoc's native UI.
+### Full Capture Inspector
+A dedicated, tabbed inspector panel with **Overview**, **Pipeline**, **Shaders**, **Textures**, **Mesh**, and **Events** — modeled after RenderDoc's native UI, built for the editor.
 
 </td>
 <td width="50%" valign="top">
 
-### 🌳 Event Browser Tree
-Hierarchical draw-call tree with EID-prefixed labels and group ranges (e.g. `11-559 Camera.Render`) — mirrors RenderDoc's Event Browser.
-
-</td>
-</tr>
-<tr>
-<td width="50%" valign="top">
-
-### 🎨 Live Texture Previews
-Click a draw to see **only the textures that draw actually samples** — render targets, depth buffers, and sampler bindings auto-loaded as thumbnails.
-
-</td>
-<td width="50%" valign="top">
-
-### 🧩 Native Replay Bridge
-A C++ bridge (`renderdoc_bridge.exe`) links directly to RenderDoc's replay DLL — real pipeline state, real shader disassembly, real descriptor enumeration.
+### Hierarchical Event Browser
+Draw-call tree with EID-prefixed labels and group ranges (e.g. `11–559 Camera.Render`). GPU timings (`durationUs`) are shown per event after running **Fetch GPU Timings**.
 
 </td>
 </tr>
 <tr>
 <td width="50%" valign="top">
 
-### 💬 Copilot Chat Participant
-Ask `@renderdoc` anything about your capture — it reads your current selection and runs 9 specialized language-model tools on your behalf.
+### Live Texture Previews
+Click any draw to see **only the textures that draw actually samples** — render targets, depth buffers, and sampler bindings auto-loaded as thumbnails. ASTC and HDR formats supported natively.
 
 </td>
 <td width="50%" valign="top">
 
-### 🖼️ ASTC & HDR Aware
-Built-in ASTC decoder plus `R11F_G11F_B10F` / `RGBA16F` previews — works on mobile GLES captures that other tools choke on.
+### Native Replay Bridge
+A C++ bridge (`renderdoc_bridge.exe`) links directly to RenderDoc's replay DLL — delivering real pipeline state, shader disassembly, descriptor enumeration, and mesh data at native speed.
+
+</td>
+</tr>
+<tr>
+<td width="50%" valign="top">
+
+### AI-Powered Frame Analysis (`@renderdoc`)
+Ask `@renderdoc` anything about your capture. The Copilot participant reads your current Inspector selection and dispatches 10 specialized language-model tools — including GPU timing-aware draw ranking and Mali shader analysis results.
+
+</td>
+<td width="50%" valign="top">
+
+### Mali Offline Compiler Integration
+Analyze any shader directly from the Inspector's Shaders tab using the **Mali Offline Compiler** (`malioc`). Results are shown in a resizable side-by-side panel alongside the shader source, and are also exposed to `@renderdoc` for AI-assisted optimization advice.
 
 </td>
 </tr>
@@ -72,293 +72,283 @@ Built-in ASTC decoder plus `R11F_G11F_B10F` / `RGBA16F` previews — works on mo
 
 ---
 
-## 🚀 Quick Start
+## Quick Start
 
-```text
-1. Install the extension in VS Code (1.95 or later)
+```
+1. Install the extension in VS Code 1.95+
 2. File → Open File… → select your .rdc capture
 3. The RenderDoc sidebar appears automatically
-4. Click any draw call → Inspector opens to the side
-5. Chat with @renderdoc for deep analysis
+4. Click any draw call → Inspector opens beside your editor
+5. Run "Fetch GPU Timings" to populate durationUs per draw
+6. Chat with @renderdoc for deep frame analysis
 ```
 
-> **Requires:** A local RenderDoc installation (for the replay runtime DLL). The extension auto-discovers the default install path on Windows/Linux/macOS; override via **`RenderDoc: Configure RenderDoc Path`** if needed.
+> **Requires:** A local RenderDoc installation (for the replay runtime DLL). The extension auto-discovers the default install path; override via **`RenderDoc: Configure RenderDoc Path`** if needed.
 
 ---
 
-## 📖 Usage Guide
+## Usage Guide
 
-### 1 · Installing the extension
+### 1 · Installing the Extension
 
-**Option A — from VSIX (recommended for end users):**
+**Option A — from VSIX (recommended):**
 ```powershell
 code --install-extension renderdoc-for-vscode-0.0.1.vsix
 ```
-Or in VS Code: `Extensions` panel → `···` menu → **Install from VSIX…**
+Or: `Extensions` panel → `···` menu → **Install from VSIX…**
 
-**Option B — from source (for contributors):** see [Building from Source](#️-building-from-source).
+**Option B — from source:** see [Building from Source](#building-from-source).
+
+---
 
 ### 2 · Installing RenderDoc (runtime dependency)
 
-The extension loads RenderDoc's replay library (`renderdoc.dll` /
-`librenderdoc.so` / `librenderdoc.dylib`) at runtime. **Install the official
-build — no patched or custom fork is needed**; the extension ships its own
-lightweight native bridge on top of the stock RenderDoc API.
+The extension loads RenderDoc's replay library (`renderdoc.dll` / `librenderdoc.so`) at runtime. Install the official build — no patched fork needed.
 
-Download and install from the official site:
-**👉 [renderdoc.org/builds](https://renderdoc.org/builds)**
+**[renderdoc.org/builds](https://renderdoc.org/builds)** — any stable version **v1.30 or newer**.
 
-> 💡 Any recent stable version (**v1.30 or newer**) works. The default install
-> location is auto-detected, so if you accept the installer defaults there's
-> nothing else to configure.
+| Platform | Auto-detected path                                 |
+| -------- | -------------------------------------------------- |
+| Windows  | `C:\Program Files\RenderDoc\`                      |
+| Linux    | `/usr/lib/x86_64-linux-gnu/librenderdoc.so`        |
+| macOS    | `/Applications/RenderDoc.app/`                     |
 
-| Platform | Auto-detected path                       |
-| -------- | ---------------------------------------- |
-| Windows  | `C:\Program Files\RenderDoc\`            |
-| Linux    | `/usr/lib/x86_64-linux-gnu/librenderdoc` |
-| macOS    | `/Applications/RenderDoc.app/`           |
+For non-default paths, run **`RenderDoc: Configure RenderDoc Path`** or set `renderdoc.installPath` in Settings.
 
-If installed elsewhere (portable ZIP, custom path, etc.), run
-**`RenderDoc: Configure RenderDoc Path`** from the command palette, or set
-`renderdoc.installPath` in Settings to the folder containing
-`renderdoc.dll` / `librenderdoc.*`.
+---
 
-### 3 · Opening a capture
+### 3 · Opening a Capture
 
-Three equivalent ways:
-
-- **File explorer:** right-click a `.rdc` file → **Open RDC Capture**
+- **File explorer:** right-click a `.rdc` → **Open RDC Capture**
 - **Command palette:** `RenderDoc: Open RDC Capture`
 - **Drag & drop** a `.rdc` onto the VS Code window
 
-Once loaded, the **RenderDoc** activity-bar icon (🎥) shows three sidebar
-views: `Capture Info`, `Draw Calls`, and `Resources`.
-
-### 4 · The Inspector workflow
-
-Click any draw call in the **Draw Calls** tree — or press the `Open Inspector`
-button on the sidebar title — to open the tabbed Inspector panel beside your
-editor.
-
-| Tab         | Workflow tip                                                                      |
-| ----------- | --------------------------------------------------------------------------------- |
-| **Overview**  | Start here to see frame thumbnail + capture metadata                              |
-| **Pipeline**  | Click a shader stage chip to jump to its source                                   |
-| **Shaders**   | `Open in Editor` button pipes the source to a new VS Code tab for diff/search    |
-| **Textures**  | Thumbnails load automatically; click to open the full preview modal              |
-| **Mesh**      | Inspect vertex buffers, index buffer, and input layout                           |
-| **Events**    | Use the EID search box to jump to any event                                       |
-
-Navigation shortcuts inside the Inspector:
-- **‹ / ›** — previous/next event
-- **EID input → Go** — jump to a specific event by number
-
-### 5 · Asking Copilot Chat (`@renderdoc`)
-
-Open VS Code Chat (`Ctrl+Alt+I`) and mention `@renderdoc`:
-
-```
-@renderdoc 你看下这个draw的开销
-@renderdoc Find all draw calls that render to the depth buffer
-@renderdoc Show the fragment shader for event 246
-@renderdoc Analyze this frame for potential optimization opportunities
-@renderdoc Which textures are sampled by the currently selected draw?
-```
-
-The participant automatically reads your **current selection** from the
-Inspector (focused EID, draw call, sidebar item), so "this draw" / "the
-selected event" always refers to what you're looking at.
-
-Under the hood it has access to these tools — which you can also invoke
-directly via `#tool-name` in chat:
-
-```
-#selectionContext  #captureInfo    #drawCalls       #resources
-#resourceDetail    #eventDetails   #pipelineState   #shaderSource
-#textureInfo       #analyzeFrame
-```
-
-### 6 · Exporting resources
-
-- **Export a texture to disk:** right-click a texture in the `Resources` tree
-  → **Export Texture** (saves as PNG, handles ASTC / HDR / sRGB automatically)
-- **Copy shader source:** open a shader in Inspector → toolbar **Copy** button,
-  or `Open in Editor` for a full editor buffer
-
-### 7 · Troubleshooting
-
-| Symptom                                        | Fix                                                              |
-| ---------------------------------------------- | ---------------------------------------------------------------- |
-| "Native bridge not available" / empty shaders  | Install RenderDoc and set `renderdoc.installPath`                |
-| Inspector stays blank after clicking a draw    | Reload window (`Developer: Reload Window`) — auto-recreates panel |
-| Textures tab shows nothing in current-draw mode | The draw has no sampled inputs / RTs, or pipeline is still loading |
-| `@renderdoc` not available in Chat             | Make sure GitHub Copilot Chat is signed in and enabled           |
+The activity bar shows three sidebar views: **Capture Info**, **Draw Calls**, and **Resources**.
 
 ---
 
-## 🧭 Feature Tour
+### 4 · Inspector Workflow
 
-### The Inspector
+Click any draw call in the **Draw Calls** tree to open the tabbed Inspector panel.
 
-A webview panel dedicated to a single capture, with six tabs engineered for specific workflows:
+| Tab          | What you get                                                                           |
+| ------------ | -------------------------------------------------------------------------------------- |
+| **Overview** | Frame thumbnail, capture metadata, API, GPU driver, file sections                     |
+| **Pipeline** | Stage-by-stage flow diagram (IA → VS → RS → FS → OM) with bound shader names         |
+| **Shaders**  | Per-stage GLSL/HLSL source with Mali Offline Compiler analysis in a split-pane view   |
+| **Textures** | Bound texture grid (scoped to the current draw) with auto-loaded thumbnails            |
+| **Mesh**     | Vertex buffer layout, index buffer, input assembly configuration                       |
+| **Events**   | Flat EID timeline; GPU `durationUs` shown per row after Fetch GPU Timings             |
 
-| Tab         | What you get                                                                  |
-| ----------- | ----------------------------------------------------------------------------- |
-| **Overview**  | Capture metadata, API, GPU driver, frame thumbnail, section list              |
-| **Pipeline**  | Stage-by-stage flow diagram (IA → VS → RS → FS → OM) with bound shader names |
-| **Shaders**   | Per-stage source / disassembly with program name header, openable in editor  |
-| **Textures**  | Grid of bound textures (current draw scope) with auto-loaded previews         |
-| **Mesh**      | Vertex buffer layout and index buffer info                                    |
-| **Events**    | Flat EID timeline for fast navigation                                         |
-
-### Sidebar Views
-
-- **Capture Info** — quick summary & action buttons
-- **Draw Calls** — hierarchical event tree with per-group ranges
-- **Resources** — all textures / buffers / shaders, filterable
-
-### Copilot Chat Tools
-
-Invoke `@renderdoc` in VS Code Chat. The agent has access to nine tools:
-
-```
-selectionContext · captureInfo · drawCalls · resources · resourceDetail
-eventDetails · pipelineState · shaderSource · textureInfo · analyzeFrame
-```
-
-Example prompts:
-- *"你看下这个draw的开销"* — analyzes the currently selected draw
-- *"Find all draw calls using the depth buffer"*
-- *"Show me the fragment shader for event 246"*
+Navigation:
+- **‹ / ›** buttons — step to previous/next event
+- **EID input → Go** — jump directly to any event by number
 
 ---
 
-## 🏗️ Architecture
+### 5 · GPU Timing Profiling
 
-```
-┌────────────────────────────────────────────────────────────────────┐
-│                    VS Code Extension Host                          │
-│  ┌──────────────┐  ┌─────────────┐  ┌─────────────────────────┐    │
-│  │   Sidebar    │  │   Inspector │  │    Copilot Participant  │    │
-│  │   Views      │  │   Webview   │  │    + LM Tools (9×)      │    │
-│  └──────┬───────┘  └──────┬──────┘  └────────────┬────────────┘    │
-│         └─────────────────┼──────────────────────┘                 │
-│                           ▼                                        │
-│                 ┌────────────────────┐                             │
-│                 │  RenderDocBridge   │  ◀── TypeScript wrapper    │
-│                 │  (JSON-RPC stdio)  │                             │
-│                 └─────────┬──────────┘                             │
-└───────────────────────────┼────────────────────────────────────────┘
-                            │ stdin/stdout
-                            ▼
-                ┌─────────────────────────┐
-                │  renderdoc_bridge.exe   │  ◀── C++ native bridge
-                │  (links to RenderDoc)   │
-                └─────────┬───────────────┘
-                          │ IReplayController
-                          ▼
-                ┌─────────────────────────┐
-                │   renderdoc_replay.dll  │
-                └─────────────────────────┘
-```
-
-The native bridge keeps a long-lived replay session alive, caches pipeline state, and streams results as JSON — meaning shader disassembly, descriptor access, and texture readback all run at native speed.
+1. Open the **Draw Calls** sidebar.
+2. Click the **Fetch GPU Timings** button (⏱).
+3. Each draw call is annotated with its measured GPU time (`durationUs`).
+4. Ask `@renderdoc` to rank draws by cost — it reads the timing data directly.
 
 ---
 
-## 📦 Project Layout
+### 6 · Mali Offline Compiler Integration
+
+1. Install the [Mali Offline Compiler](https://developer.arm.com/Tools%20and%20Software/Mali%20Offline%20Compiler) from Arm Developer.
+2. Set `renderdoc.maliOfflineCompilerPath` to the path of `malioc.exe` in VS Code Settings.
+3. In the Inspector → **Shaders** tab, click **Analyze with Mali Offline Compiler**.
+4. The analysis result appears in a resizable pane beside the shader source.
+5. Ask `@renderdoc` for optimization suggestions — it has access to the Mali analysis output.
+
+---
+
+### 7 · Copilot Chat (`@renderdoc`)
+
+Open VS Code Chat (`Ctrl+Alt+I`) and address `@renderdoc`:
+
+```
+@renderdoc 帮我找出当前帧耗时最高的前20个Draw，带完整层级名称
+@renderdoc Analyze the fragment shader for EID 495 and suggest optimizations
+@renderdoc Find all draw calls rendering to the shadow map
+@renderdoc Show pipeline state diff between EID 300 and EID 355
+@renderdoc Which textures are bound at the currently selected draw?
+```
+
+The participant reads your **active Inspector selection** (focused EID, draw call, sidebar resource) so natural references like *"this draw"* or *"the current event"* resolve automatically.
+
+Available tools (also invokable via `#tool-name`):
+
+| Tool | Description |
+| ---- | ----------- |
+| `#selectionContext` | Current Inspector focus: EID, draw call, pipeline state, Mali analysis |
+| `#captureInfo` | Capture metadata: API, driver, version, sections |
+| `#drawCalls` | Full draw call tree with GPU `durationUs` timings and pre-sorted `expensiveDraws` |
+| `#resources` | All GPU resources: textures, buffers, shaders |
+| `#resourceDetail` | Detail for a specific resource by ID |
+| `#eventDetails` | Full event info including pipeline state |
+| `#pipelineState` | Complete pipeline state at a given EID (native bridge required) |
+| `#shaderSource` | GLSL/HLSL source for all bound stages at an EID |
+| `#textureInfo` | Texture-specific metadata |
+| `#analyzeFrame` | Comprehensive frame summary with flagged issues |
+
+---
+
+### 8 · Exporting Resources
+
+- **Texture → PNG:** right-click a texture in **Resources** → **Export Texture** (ASTC, HDR, sRGB handled automatically)
+- **Shader source:** Inspector → Shaders tab → **Copy** button, or **Open in Editor** for a full VS Code buffer
+
+---
+
+### 9 · Troubleshooting
+
+| Symptom | Fix |
+| ------- | --- |
+| "Native bridge not available" / empty shaders | Install RenderDoc and set `renderdoc.installPath` |
+| Inspector stays blank after clicking a draw | `Developer: Reload Window` — auto-recreates the panel |
+| Textures tab shows nothing | The draw has no sampled inputs/RTs, or pipeline is still loading |
+| Mali Offline Compiler button missing | Set `renderdoc.maliOfflineCompilerPath` to the path of `malioc.exe` |
+| `@renderdoc` not available in Chat | Ensure GitHub Copilot Chat is signed in and enabled |
+| GPU timings show `N/A` | Click **Fetch GPU Timings** in the Draw Calls sidebar first |
+
+---
+
+## Architecture
+
+```
+┌──────────────────────────────────────────────────────────────────────┐
+│                        VS Code Extension Host                        │
+│  ┌──────────────┐   ┌──────────────────┐   ┌──────────────────────┐  │
+│  │   Sidebar    │   │    Inspector     │   │  Copilot Participant  │  │
+│  │   Views      │   │    Webview       │   │  + LM Tools (10×)    │  │
+│  └──────┬───────┘   └────────┬─────────┘   └──────────┬───────────┘  │
+│         └────────────────────┼────────────────────────┘              │
+│                              ▼                                       │
+│                   ┌─────────────────────┐                            │
+│                   │   RenderDocBridge   │  ← TypeScript JSON-RPC     │
+│                   └──────────┬──────────┘                            │
+└──────────────────────────────┼───────────────────────────────────────┘
+                               │ stdin / stdout
+                               ▼
+                   ┌───────────────────────┐
+                   │  renderdoc_bridge.exe │  ← C++ native bridge
+                   │  (links to RenderDoc) │
+                   └───────────┬───────────┘
+                               │ IReplayController
+                               ▼
+                   ┌───────────────────────┐
+                   │  renderdoc_replay.dll │
+                   └───────────────────────┘
+```
+
+The native bridge maintains a long-lived replay session, caches pipeline state per EID, and streams results as JSON — shader disassembly, descriptor access, GPU timings, and texture readback all execute at native speed.
+
+---
+
+## Project Layout
 
 ```
 renderdoc-for-vscode/
-├── src/                      # TypeScript extension source
-│   ├── extension.ts            # Activation & command registration
-│   ├── renderdocBridge.ts      # Native bridge client (JSON-RPC)
-│   ├── rdcParser.ts            # Standalone .rdc header parser
-│   ├── views/                  # Sidebar providers + Inspector webview
-│   └── copilot/                # Chat participant & language-model tools
-├── native/                   # C++ native bridge
-│   ├── include/                # RenderDoc public headers (vendored)
-│   ├── 3rdparty/               # ASTC decoder + stb_image_write
-│   ├── src/                    # main.cpp, dll_loader, json.hpp
+├── src/
+│   ├── extension.ts              # Activation, command registration
+│   ├── renderdocBridge.ts        # Native bridge client (JSON-RPC over stdio)
+│   ├── rdcParser.ts              # Pure-TS .rdc header/section parser
+│   ├── views/                    # Sidebar tree providers + Inspector webview
+│   │   ├── inspectorPanel.ts     # Main Inspector panel (IPC, Mali analysis)
+│   │   └── inspector/html.ts     # Inspector HTML template generation
+│   └── copilot/
+│       ├── chatParticipant.ts    # @renderdoc Copilot Chat handler
+│       └── tools.ts              # Language model tool implementations
+├── native/
+│   ├── include/                  # RenderDoc public headers (vendored)
+│   ├── 3rdparty/                 # ASTC decoder, stb_image_write
+│   ├── src/                      # main.cpp, dll_loader.cpp, json.hpp
 │   └── CMakeLists.txt
-├── package.json              # Extension manifest
+├── media/inspector/              # Webview frontend (JS + CSS)
+├── package.json
 ├── tsconfig.json
 └── LICENSE
 ```
 
 ---
 
-## 🛠️ Building from Source
+## Building from Source
 
 ### Prerequisites
-- **Node.js** 18+ and npm
-- **CMake** 3.20+ and a C++17 compiler (MSVC / Clang / GCC)
-- **RenderDoc** installed locally (for the replay DLL at runtime)
 
-### Build steps
+- **Node.js** 18+ and npm
+- **CMake** 3.20+ with a C++17 compiler (MSVC 2019+ / Clang 12+ / GCC 10+)
+- **RenderDoc** installed locally (replay DLL required at runtime)
+
+### Build
 
 ```powershell
-# 1. TypeScript
+# TypeScript extension
 npm install
 npm run compile
 
-# 2. Native bridge (Windows / MSVC)
+# C++ native bridge (Windows / MSVC)
 cd native
 cmake -B build -A x64
 cmake --build build --config Release
 ```
 
-The `renderdoc_bridge.exe` output is loaded automatically by the extension.
+The compiled `renderdoc_bridge.exe` is discovered automatically by the extension at runtime.
 
-### Run the extension
-Press `F5` in VS Code — an Extension Development Host launches with the extension loaded.
+### Run in Development
 
----
-
-## ⚙️ Configuration
-
-| Setting                            | Purpose                                                |
-| ---------------------------------- | ------------------------------------------------------ |
-| `renderdoc.path`                   | Override RenderDoc install directory                   |
-| `renderdoc.nativeBridge.enabled`   | Toggle the native replay bridge                        |
-| `renderdoc.nativeBridge.path`      | Override path to `renderdoc_bridge.exe`                |
-
-Run the command **`RenderDoc: Configure RenderDoc Path`** for a guided setup.
+Press `F5` in VS Code — launches an Extension Development Host with the extension loaded and the debugger attached.
 
 ---
 
-## 🗺️ Supported APIs
+## Configuration
 
-|  API         | Capture Load | Pipeline State | Shader Source | Texture Preview |
-| ------------ | :----------: | :------------: | :-----------: | :-------------: |
-| **Vulkan**     | ✅           | ✅             | ✅            | ✅              |
-| **D3D12**      | ✅           | ✅             | ✅            | ✅              |
-| **D3D11**      | ✅           | ✅             | ✅            | ✅              |
-| **OpenGL**     | ✅           | ✅             | ✅            | ✅              |
-| **OpenGL ES**  | ✅           | ✅             | ✅            | ✅              |
+| Setting | Default | Description |
+| ------- | ------- | ----------- |
+| `renderdoc.installPath` | *(auto-detect)* | RenderDoc installation directory |
+| `renderdoc.nativeBridge.path` | *(auto-detect)* | Path to `renderdoc_bridge.exe` |
+| `renderdoc.maliOfflineCompilerPath` | *(empty)* | Path to `malioc.exe` for shader analysis |
 
----
-
-## 🤝 Contributing
-
-Pull requests welcome! For major changes, please open an issue first to discuss what you'd like to change.
-
-1. Fork the repo
-2. Create a feature branch (`git checkout -b feat/my-feature`)
-3. Commit with conventional messages
-4. Open a PR against `main`
+Run **`RenderDoc: Configure RenderDoc Path`** for a guided setup wizard.
 
 ---
 
-## 📄 License
+## Supported APIs
+
+| API | Capture Load | Pipeline State | Shader Source | Texture Preview | GPU Timings |
+| --- | :---: | :---: | :---: | :---: | :---: |
+| **Vulkan** | ✅ | ✅ | ✅ | ✅ | ✅ |
+| **D3D12** | ✅ | ✅ | ✅ | ✅ | ✅ |
+| **D3D11** | ✅ | ✅ | ✅ | ✅ | ✅ |
+| **OpenGL** | ✅ | ✅ | ✅ | ✅ | ✅ |
+| **OpenGL ES** | ✅ | ✅ | ✅ | ✅ | ✅ |
+
+---
+
+## Contributing
+
+Pull requests are welcome. For significant changes, open an issue first to discuss the design.
+
+1. Fork the repository
+2. Create a feature branch: `git checkout -b feat/my-feature`
+3. Write conventional commit messages
+4. Open a PR targeting `main`
+
+---
+
+## License
 
 Released under the [MIT License](LICENSE).
-RenderDoc itself is © Baldur Karlsson and contributors, licensed under the MIT License.
+
+RenderDoc is © Baldur Karlsson and contributors, licensed under the MIT License.
 
 ---
 
 <div align="center">
 
-*Built with ❤️ for graphics engineers who live in VS Code.*
+*Built for graphics engineers who live in VS Code.*
 
 </div>
