@@ -171,7 +171,7 @@ export class ThumbnailPanel {
 </html>`;
     }
 
-    private dispose() {
+    public dispose() {
         ThumbnailPanel.currentPanel = undefined;
         this.panel.dispose();
         while (this.disposables.length) {

@@ -125,7 +125,7 @@ export class DrawOverlayPanel {
 </body></html>`;
     }
 
-    private dispose() {
+    public dispose() {
         DrawOverlayPanel.currentPanel = undefined;
         this.panel.dispose();
         while (this.disposables.length) { this.disposables.pop()?.dispose(); }
