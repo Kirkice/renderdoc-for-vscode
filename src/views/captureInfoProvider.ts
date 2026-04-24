@@ -12,8 +12,11 @@ export class CaptureInfoProvider implements vscode.TreeDataProvider<CaptureInfoI
         return this.captureInfo;
     }
 
-    update(info: CaptureInfo) {
+    update(info: CaptureInfo | undefined) {
         this.captureInfo = info;
+        if (!info) {
+            this.replayStatus = 'none';
+        }
         this._onDidChangeTreeData.fire(undefined);
     }
 

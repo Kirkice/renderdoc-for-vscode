@@ -273,7 +273,9 @@ export class RenderDocBridge {
         const res: TGetTimingsResponse = await this.nativeCallT('getTimings', GetTimingsResponse, {});
         const map = new Map<number, number>();
         for (const t of res.timings) {
-            map.set(t.eventId, t.durationUs);
+            if (t.durationUs != null) {
+                map.set(t.eventId, t.durationUs);
+            }
         }
         return map;
     }

@@ -147,6 +147,7 @@ export async function activate(context: vscode.ExtensionContext) {
     // Register commands
     context.subscriptions.push(
         vscode.commands.registerCommand('renderdoc.openCapture', () => openCapture(context)),
+        vscode.commands.registerCommand('renderdoc.closeCapture', () => closeCapture()),
         vscode.commands.registerCommand('renderdoc.showThumbnail', () => showThumbnail(context)),
         vscode.commands.registerCommand('renderdoc.refreshCapture', () => refreshCapture()),
         vscode.commands.registerCommand('renderdoc.configureRenderdocPath', () => configureRenderdocPath()),
@@ -196,15 +197,6 @@ export async function activate(context: vscode.ExtensionContext) {
     statusBarItem.show();
     context.subscriptions.push(statusBarItem);
 
-    // Auto-restore the previously loaded capture, so the Inspector tab that
-    // VS Code serialized across window reloads has real data to render.
-    const lastPath = context.workspaceState.get<string>('renderdoc.lastCapturePath');
-    if (lastPath && fs.existsSync(lastPath)) {
-        loadCapture(context, lastPath, /* silent */ true).catch(err => {
-            console.warn('[RenderDoc] auto-restore failed:', err?.message);
-        });
-    }
-
     // Revive Inspector webview panels that VS Code serialized across reloads.
     context.subscriptions.push(
         vscode.window.registerWebviewPanelSerializer('renderdoc-inspector', {
@@ -232,21 +224,51 @@ async function openCapture(context: vscode.ExtensionContext) {
     await loadCapture(context, filePath);
 }
 
+function closeCapture() {
+    if (!currentCapturePath) return;
+    
+    // Clear state
+    currentCapturePath = undefined;
+    bridgeLoadedCapturePath = undefined;
+    currentSelectedDrawCall = undefined;
+    currentSelectedResource = undefined;
+    currentDrawCalls = [];
+
+    // Shut down the bridge to cleanly release all memory and file locks
+    console.log('[RenderDoc] User requested close capture; killing bridge.');
+    bridge.restartNativeBridge();
+
+    // Reset UI providers
+    captureInfoProvider.update(undefined);
+    drawCallProvider.update([]);
+    resourceProvider.update([]);
+    apiInspectorProvider.clear();
+
+    // Reset webview if open
+    if (InspectorPanel.currentPanel) {
+        InspectorPanel.currentPanel.setCapture(undefined, [], []);
+    }
+    if (ThumbnailPanel.currentPanel) {
+        ThumbnailPanel.currentPanel.panel.dispose();
+    }
+    if (DrawOverlayPanel.currentPanel) {
+        DrawOverlayPanel.currentPanel.panel.dispose();
+    }
+}
+
 async function loadCapture(context: vscode.ExtensionContext, filePath: string, silent = false) {
     currentCapturePath = filePath;
-    context.workspaceState.update('renderdoc.lastCapturePath', filePath);
     console.log('[RenderDoc] loadCapture called:', filePath, 'silent:', silent);
     console.log('[RenderDoc] hasNativeBridge:', bridge.hasNativeBridge());
 
     // ── Fast path: serve from cache ──────────────────────────────────────
     // If we've previously loaded this exact rdc (same path, mtime, size),
     // the draw-call tree and resource list are on disk. Populate the UI
-    // instantly and skip the 50+ s replay init. The user can still click
-    // "Try Local Replay" to upgrade to a live replay when they want to
-    // inspect shaders / pipeline state / textures.
+    // instantly so the user can browse the tree while the 50+ s replay init
+    // happens transparently in the background!
     const cached = captureCache.get(filePath);
     if (cached) {
-        console.log('[RenderDoc] loadCapture: cache hit, skipping replay init.');
+        console.log('[RenderDoc] loadCapture: cache hit, populating UI instantly.');
         captureInfoProvider.update(cached.captureInfo);
         currentDrawCalls = cached.drawCalls;
         drawCallProvider.update(cached.drawCalls);
@@ -265,10 +287,9 @@ async function loadCapture(context: vscode.ExtensionContext, filePath: string, s
         }).catch(() => { /* best-effort */ });
         if (!silent) {
             vscode.window.showInformationMessage(
-                `RenderDoc: Loaded ${path.basename(filePath)} from cache. Click "Try Local Replay" for live shader/pipeline inspection.`
+                `RenderDoc: Loaded UI from cache instantly. Starting local replay in background...`
             );
         }
-        return;
     }
 
     // Only one capture can be replayed at a time. If the bridge already has a
@@ -434,26 +455,33 @@ async function loadCapture(context: vscode.ExtensionContext, filePath: string, s
             let drawCalls: DrawCall[] = [];
             let resources: ResourceInfo[] = [];
             let replayErr: Error | undefined;
-            try {
-                if (token.isCancellationRequested) { return; }
-                progress.report({ message: 'Loading draw calls...', increment: 10 });
-                drawCalls = await bridge.getDrawCalls(filePath);
-                currentDrawCalls = drawCalls;
-                drawCallProvider.update(drawCalls);
+            if (cached) {
+                // If we hit the cache initially, use those to save the expensive JSON fetch time
+                drawCalls = cached.drawCalls;
+                resources = cached.resources;
+                progress.report({ message: 'Loading draw calls & resources... (done from cache)', increment: 20 });
+            } else {
+                try {
+                    if (token.isCancellationRequested) { return; }
+                    progress.report({ message: 'Loading draw calls...', increment: 10 });
+                    drawCalls = await bridge.getDrawCalls(filePath);
+                    currentDrawCalls = drawCalls;
+                    drawCallProvider.update(drawCalls);
 
-                if (token.isCancellationRequested) { return; }
-                progress.report({ message: 'Loading resources...', increment: 10 });
-                resources = await bridge.getResources(filePath);
-                resourceProvider.update(resources);
-            } catch (err: any) {
-                replayErr = err;
-                drawCallProvider.update([]);
-                resourceProvider.update([]);
+                    if (token.isCancellationRequested) { return; }
+                    progress.report({ message: 'Loading resources...', increment: 10 });
+                    resources = await bridge.getResources(filePath);
+                    resourceProvider.update(resources);
+                } catch (err: any) {
+                    replayErr = err;
+                    drawCallProvider.update([]);
+                    resourceProvider.update([]);
+                }
             }
             apiInspectorProvider.clear();
 
             // Persist successful results so the next open of this capture
-            // is instant (skips the expensive replay init).
+            // can populate the UI instantly (avoiding expensive JSON fetch again).
             if (!replayErr && captureInfo && drawCalls.length > 0) {
                 try {
                     captureCache.put(filePath, captureInfo, drawCalls, resources);
@@ -523,15 +551,34 @@ async function refreshCapture() {
     }
 }
 
-/** Walk draw call tree and attach GPU timings by eventId. */
-function applyTimingsToTree(calls: DrawCall[], timings: Map<number, number>): void {
+/** Walk draw call tree and attach GPU timings by eventId, aggregating sums for parents. */
+function applyTimingsToTree(calls: DrawCall[], timings: Map<number, number>): number {
+    let aggregatedTotal = 0;
+    
     for (const dc of calls) {
-        const t = timings.get(dc.eventId);
-        if (t !== undefined) { dc.durationUs = t; }
+        let nodeDuration = timings.get(dc.eventId);
+        let childrenTotal = 0;
+        
         if (dc.children && dc.children.length > 0) {
-            applyTimingsToTree(dc.children, timings);
+            childrenTotal = applyTimingsToTree(dc.children, timings);
+        }
+
+        // If the native backend didn't report a duration for this specific group/marker,
+        // but its children have accumulated time, use the children's total time (just like qrenderdoc).
+        if ((nodeDuration === undefined || nodeDuration < 0.0) && childrenTotal > 0) {
+            nodeDuration = childrenTotal;
+        }
+
+        if (nodeDuration !== undefined && nodeDuration > 0) {
+            dc.durationUs = nodeDuration;
+            aggregatedTotal += nodeDuration;
+        } else if (childrenTotal > 0) {
+            // Even if node itself has no valid time, still pass children total up for ancestry.
+            aggregatedTotal += childrenTotal;
         }
     }
+    
+    return aggregatedTotal;
 }
 
 async function fetchTimings() {
@@ -733,7 +780,7 @@ async function tryLocalReplay() {
     // Auto-recover: the bridge process may have died (e.g. from a previous
     // replay crash). If the binary is installed, transparently restart it
     // and re-open the capture before proceeding.
-    if (!bridge.hasNativeBridge()) {
+    if (!bridge.hasNativeBridge() || bridgeLoadedCapturePath !== currentCapturePath) {
         if (!bridge.isNativeBridgeInstalled()) {
             const action = await vscode.window.showWarningMessage(
                 'Native bridge binary is not installed. Local replay requires it.',
@@ -746,9 +793,16 @@ async function tryLocalReplay() {
             }
             return;
         }
-        console.log('[RenderDoc] Native bridge not running; attempting restart before replay...');
-        bridge.restartNativeBridge();
+
+        if (bridge.hasNativeBridge() && bridgeLoadedCapturePath) {
+            console.log('[RenderDoc] Different capture open; restarting bridge before replay...');
+            bridge.restartNativeBridge();
+        } else if (!bridge.hasNativeBridge()) {
+            console.log('[RenderDoc] Native bridge not running; attempting start before replay...');
+            bridge.tryStartNativeBridge();
+        }
         bridgeLoadedCapturePath = undefined;
+        
         // Give the process a moment to spawn; hasNativeBridge() flips synchronously on spawn.
         if (!bridge.hasNativeBridge()) {
             vscode.window.showWarningMessage(
@@ -771,27 +825,62 @@ async function tryLocalReplay() {
     );
     if (confirm !== 'Try Replay') { return; }
 
-    try {
-        const result = await bridge.nativeTryReplay();
-        if (result && result.replay) {
-            captureInfoProvider.setReplayStatus('active');
-            vscode.window.showInformationMessage('Local replay active! Shader/pipeline/texture features are now available.');
-        } else {
-            captureInfoProvider.setReplayStatus('failed');
-            vscode.window.showWarningMessage(`Replay failed: ${result?.replayError || 'Unknown error'}`);
+    await vscode.window.withProgress(
+        {
+            location: vscode.ProgressLocation.Notification,
+            title: 'RenderDoc — Initialising local replay...',
+            cancellable: true,
+        },
+        async (progress, token) => {
+            let lastPct = 0;
+            let cancelled = false;
+            const unsubscribe = bridge.onNativeNotification('tryReplayProgress', (params) => {
+                const p = Math.max(0, Math.min(1, Number(params?.progress ?? 0)));
+                const pct = Math.round(p * 100);
+                const delta = pct - lastPct;
+                if (delta > 0) {
+                    lastPct = pct;
+                    progress.report({ message: `${pct}%`, increment: delta });
+                }
+            });
+            const cancelSub = token.onCancellationRequested(() => {
+                cancelled = true;
+                console.log('[RenderDoc] User cancelled replay init — killing bridge.');
+                bridge.restartNativeBridge();
+            });
+
+            try {
+                const result = await bridge.nativeTryReplay();
+                if (cancelled) {
+                    captureInfoProvider.setReplayStatus('unavailable');
+                } else if (result && result.replay) {
+                    captureInfoProvider.setReplayStatus('active');
+                    vscode.window.showInformationMessage('Local replay active! Shader/pipeline/texture features are now available.');
+                } else {
+                    captureInfoProvider.setReplayStatus('failed');
+                    vscode.window.showWarningMessage(`Replay failed: ${result?.replayError || 'Unknown error'}`);
+                }
+            } catch (err: any) {
+                if (cancelled) {
+                    captureInfoProvider.setReplayStatus('unavailable');
+                    return;
+                }
+                captureInfoProvider.setReplayStatus('failed');
+                console.log('[RenderDoc] tryLocalReplay crashed, restarting bridge...');
+                bridge.tryStartNativeBridge();
+                if (bridge.hasNativeBridge()) {
+                    try { await bridge.nativeOpenCapture(currentCapturePath!); } catch { /* ignore */ }
+                }
+                vscode.window.showWarningMessage(
+                    'Local replay crashed — this capture cannot be replayed on this GPU. ' +
+                    'Inspection features are disabled for this capture.'
+                );
+            } finally {
+                unsubscribe();
+                cancelSub.dispose();
+            }
         }
-    } catch (err: any) {
-        captureInfoProvider.setReplayStatus('failed');
-        console.log('[RenderDoc] tryLocalReplay crashed, restarting bridge...');
-        bridge.tryStartNativeBridge();
-        if (bridge.hasNativeBridge()) {
-            try { await bridge.nativeOpenCapture(currentCapturePath); } catch { /* ignore */ }
-        }
-        vscode.window.showWarningMessage(
-            'Local replay crashed — this capture cannot be replayed on this GPU. ' +
-            'Inspection features are disabled for this capture.'
-        );
-    }
+    );
 }
 
 async function clearCaptureCache() {

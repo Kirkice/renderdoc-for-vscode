@@ -1514,6 +1514,41 @@
         window.addEventListener('resize', () => {
             if (state.activeTab === 'mesh') renderMeshPreview();
         });
+
+        // Mesh View Splitter
+        const meshSplitter = document.getElementById('mesh-splitter');
+        const meshPreviewPaneEl = document.getElementById('mesh-preview-pane');
+        if (meshSplitter && meshPreviewPaneEl) {
+            let isDraggingSplitter = false;
+            let startY = 0;
+            let startHeight = 0;
+
+            meshSplitter.addEventListener('pointerdown', (e) => {
+                isDraggingSplitter = true;
+                startY = e.clientY;
+                startHeight = meshPreviewPaneEl.getBoundingClientRect().height;
+                meshSplitter.classList.add('dragging');
+                meshSplitter.setPointerCapture(e.pointerId);
+                e.preventDefault();
+            });
+
+            meshSplitter.addEventListener('pointermove', (e) => {
+                if (!isDraggingSplitter) return;
+                const dy = startY - e.clientY; // invert because preview is at bottom
+                const newHeight = Math.max(100, Math.min(window.innerHeight - 150, startHeight + dy));
+                meshPreviewPaneEl.style.flex = `0 0 ${newHeight}px`;
+                if (state.activeTab === 'mesh') {
+                    // Small delay to allow DOM to layout before updating canvas size
+                    requestAnimationFrame(() => renderMeshPreview());
+                }
+            });
+
+            meshSplitter.addEventListener('pointerup', (e) => {
+                isDraggingSplitter = false;
+                meshSplitter.classList.remove('dragging');
+                try { meshSplitter.releasePointerCapture(e.pointerId); } catch {}
+            });
+        }
     })();
 
     // ── Utils ──────────────────────────────────────────────────────

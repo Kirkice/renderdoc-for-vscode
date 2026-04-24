@@ -35,7 +35,7 @@ export function buildInspectorHtml(
     const csp = [
         `default-src 'none'`,
         `img-src ${cspSource} data: https:`,
-        `style-src ${cspSource}`,
+        `style-src ${cspSource} 'unsafe-inline'`,
         `script-src 'nonce-${nonce}'`,
         `font-src ${cspSource}`,
     ].join('; ');
@@ -116,6 +116,7 @@ export function buildInspectorHtml(
                 </div>
                 <div id="mesh-split" class="mesh-split">
                     <div id="mesh-body" class="mesh-table-wrap empty-state">Select an event to view mesh data.</div>
+                    <div id="mesh-splitter" class="horizontal-splitter"></div>
                     <div id="mesh-preview-pane" class="mesh-preview-pane">
                         <canvas id="mesh-canvas"></canvas>
                         <div id="mesh-preview-hint" class="mesh-preview-hint">Drag: rotate · Shift+Drag: pan · Wheel: zoom</div>

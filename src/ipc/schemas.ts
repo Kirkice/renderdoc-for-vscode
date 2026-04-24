@@ -133,7 +133,7 @@ export const GetTexturesResponse = z.object({
 
 export const TimingEntry = z.object({
     eventId: z.number(),
-    durationUs: z.number(),
+    durationUs: z.number().nullable().optional(),
 });
 
 export const GetTimingsResponse = z.object({

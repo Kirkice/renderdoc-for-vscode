@@ -118,7 +118,7 @@ export class InspectorPanel {
 
     /** Called from extension.ts when a new capture has been loaded/refreshed. */
     public setCapture(
-        captureInfo: CaptureInfo,
+        captureInfo: CaptureInfo | undefined,
         drawCalls: DrawCall[],
         resources: ResourceInfo[]
     ) {

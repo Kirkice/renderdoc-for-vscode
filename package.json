@@ -334,6 +334,30 @@
         "title": "Clear Capture Cache",
         "category": "RenderDoc",
         "icon": "$(clear-all)"
+      },
+      {
+        "command": "renderdoc.closeCapture",
+        "title": "Close Capture",
+        "category": "RenderDoc",
+        "icon": ""
+      },
+      {
+        "command": "renderdoc.closeCapture",
+        "title": "Close Capture",
+        "category": "RenderDoc",
+        "icon": "\\"
+      },
+      {
+        "command": "renderdoc.closeCapture",
+        "title": "Close Capture",
+        "category": "RenderDoc",
+        "icon": ""
+      },
+      {
+        "command": "renderdoc.closeCapture",
+        "title": "Close Capture",
+        "category": "RenderDoc",
+        "icon": "$(close)"
       }
     ],
     "viewsContainers": {
@@ -385,6 +409,26 @@
         },
         {
           "command": "renderdoc.openCapture",
+          "when": "view == renderdoc-captureInfo",
+          "group": "navigation"
+        },
+        {
+          "command": "renderdoc.closeCapture",
+          "when": "view == renderdoc-captureInfo || view == renderdoc-drawCalls",
+          "group": "navigation"
+        },
+        {
+          "command": "renderdoc.closeCapture",
+          "when": "view == renderdoc-captureInfo",
+          "group": "navigation"
+        },
+        {
+          "command": "renderdoc.closeCapture",
+          "when": "view == renderdoc-captureInfo || view == renderdoc-drawCalls",
+          "group": "navigation"
+        },
+        {
+          "command": "renderdoc.closeCapture",
           "when": "view == renderdoc-captureInfo",
           "group": "navigation"
         },

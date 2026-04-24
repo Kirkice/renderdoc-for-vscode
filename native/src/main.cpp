@@ -568,30 +568,25 @@ static json handleGetTimings(int id) {
     if (!found)
         return makeError(id, -2, "EventGPUDuration counter not available for this capture");
 
-    // Determine result value type from counter description
-    CounterDescription desc = g_replay->DescribeCounter(GPUCounter::EventGPUDuration);
-
     rdcarray<CounterResult> results = g_replay->FetchCounters(counters);
 
     json arr = json::array();
     for (size_t i = 0; i < results.size(); i++) {
         const CounterResult &r = results[i];
         if (r.counter != GPUCounter::EventGPUDuration) continue;
-        // EventGPUDuration: 8-byte double = microseconds; 4-byte float = microseconds
-        double us = 0.0;
-        if (desc.resultByteWidth == 8 && desc.resultType == CompType::Float) {
-            us = r.value.d;   // stored as double
-        } else if (desc.resultByteWidth == 4 && desc.resultType == CompType::Float) {
-            us = (double)r.value.f;
-        } else if (desc.resultByteWidth >= 8) {
-            us = r.value.d;   // treat 8-byte non-float as double too
-        } else {
-            us = (double)r.value.u32;
-        }
+        
+        // Native RenderDoc backend always stores duration as double in CounterResult union.
+        // Therefore, we can bypass CompType/enum checking here, mirroring qrenderdoc's behavior.
+        // NOTE: RenderDoc returns EventGPUDuration natively in SECONDS! We must convert to microseconds.
+        double us = r.value.d * 1000000.0;
+        
+        // RenderDoc backends fallback to -1.0 for invalid/unavailable queries.
+        if (us < 0.0) continue;
+        
         json entry;
         entry["eventId"]    = r.eventId;
         entry["durationUs"] = us;
-        arr.push_back(std::move(entry));
+        arr.push_back(entry);
     }
     return makeResult(id, {{"timings", arr}, {"count", arr.size()}});
 }
