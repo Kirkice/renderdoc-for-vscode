@@ -37,6 +37,7 @@ export interface ResourceInfo {
     resourceId: string;
     name: string;
     type: string;       // "Texture" | "Buffer" | "Shader" | "Other"
+    shaderStages?: string[];
     format: string;
     width: number;
     height: number;

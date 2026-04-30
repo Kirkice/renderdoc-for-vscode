@@ -5,6 +5,7 @@
         captureInfo: null,
         drawCalls: [],
         resources: [],
+        resourceAliases: {},
         eventId: null,
         drawCall: null,
         shaders: null,
@@ -34,10 +35,30 @@
         for (const r of state.resources) m.set(String(r.resourceId), r);
         return m;
     };
+    const resourceDisplayName = (resource) => {
+        if (!resource) return '';
+        return state.resourceAliases[String(resource.resourceId)] || resource.name || ('Resource ' + resource.resourceId);
+    };
     const resName = (rid) => {
         const r = resById().get(String(rid));
-        return r ? (r.name || ('Resource ' + rid)) : ('Resource ' + rid);
+        return r ? resourceDisplayName(r) : ('Resource ' + rid);
     };
+
+    function updateShaderAliasesFromPipeline(pipeline) {
+        const shaders = pipeline && pipeline.shaders;
+        if (!shaders) return false;
+        let changed = false;
+        for (const info of Object.values(shaders)) {
+            if (!info || info.resourceId == null) continue;
+            const alias = info.programName || info.shaderName || info.name;
+            if (!alias) continue;
+            const resourceId = String(info.resourceId);
+            if (state.resourceAliases[resourceId] === alias) continue;
+            state.resourceAliases[resourceId] = alias;
+            changed = true;
+        }
+        return changed;
+    }
 
     // ── Tab switching ──────────────────────────────────────────────
     document.querySelectorAll('.tab').forEach(t => {
@@ -123,6 +144,7 @@
                 state.captureInfo = m.captureInfo;
                 state.drawCalls = m.drawCalls || [];
                 state.resources = m.resources || [];
+                state.resourceAliases = {};
                 render();
                 break;
             case 'eventChanged':
@@ -150,7 +172,9 @@
             case 'pipelineLoaded':
                 if (m.eventId === state.eventId) {
                     state.pipeline = m.data;
+                    const aliasesChanged = updateShaderAliasesFromPipeline(m.data);
                     if (state.activeTab === 'pipeline' || state.activeTab === 'overview') render();
+                    else if (aliasesChanged && state.activeTab === 'resources') renderResources();
                 }
                 break;
             case 'texturePreview':
@@ -727,6 +751,44 @@
         document.getElementById('texture-modal').hidden = false;
         requestTexture();
     }
+
+    function findShaderStageByResourceId(resId) {
+        const shaders = state.shaders && state.shaders.shaders;
+        if (!shaders) return null;
+        const target = String(resId);
+        for (const [stage, info] of Object.entries(shaders)) {
+            if (String(info && info.resourceId) === target) return stage;
+        }
+        return null;
+    }
+
+    function handleResourceActivation(resource) {
+        if (!resource || !resource.resourceId) return;
+        if (resource.type === 'Texture') {
+            openTextureModal(String(resource.resourceId));
+            return;
+        }
+        if (resource.type === 'Shader') {
+            const stage = findShaderStageByResourceId(resource.resourceId);
+            if (stage) {
+                state.activeShaderStage = stage;
+                switchTab('shaders');
+                return;
+            }
+            vscode.postMessage({
+                type: 'showShaderSource',
+                resourceId: String(resource.resourceId),
+                label: resourceDisplayName(resource),
+            });
+            return;
+        }
+        vscode.postMessage({
+            type: 'showResourceDetails',
+            resourceId: String(resource.resourceId),
+            label: resourceDisplayName(resource) || (resource.type + ' ' + resource.resourceId),
+        });
+    }
+
     function requestTexture() {
         if (!state.modalResource) return;
         vscode.postMessage({
@@ -848,8 +910,9 @@
         const f = state.resFilter;
         if (f) {
             list = list.filter(r =>
-                (r.name || '').toLowerCase().includes(f) ||
+                resourceDisplayName(r).toLowerCase().includes(f) ||
                 String(r.resourceId).includes(f) ||
+                ((r.shaderStages || []).join(' ').toLowerCase().includes(f)) ||
                 (r.format || '').toLowerCase().includes(f) ||
                 (r.type || '').toLowerCase().includes(f)
             );
@@ -862,16 +925,18 @@
         }
         body.className = 'resource-list';
         let html = '<table class="res-table"><thead><tr>'
-            + '<th>Type</th><th>ID</th><th>Name</th><th>Format</th><th>Size</th><th>Bytes</th>'
+            + '<th>Type</th><th>Stage</th><th>ID</th><th>Name</th><th>Format</th><th>Size</th><th>Bytes</th>'
             + '</tr></thead><tbody>';
         for (const r of list) {
             const dim = (r.width && r.height)
                 ? (r.width + '\u00d7' + r.height + (r.depth > 1 ? ('\u00d7' + r.depth) : ''))
                 : '';
+            const stageLabel = (r.shaderStages && r.shaderStages.length > 0) ? r.shaderStages.join(' / ') : '';
             html += '<tr class="res-row" data-type="' + esc(r.type) + '" data-resid="' + esc(r.resourceId) + '">'
                 + '<td>' + esc(r.type || '') + '</td>'
+                + '<td>' + esc(stageLabel) + '</td>'
                 + '<td class="mono">' + esc(r.resourceId) + '</td>'
-                + '<td>' + esc(r.name || '') + '</td>'
+                + '<td>' + esc(resourceDisplayName(r)) + '</td>'
                 + '<td>' + esc(r.format || '') + '</td>'
                 + '<td>' + esc(dim) + '</td>'
                 + '<td class="mono">' + esc(r.byteSize != null ? r.byteSize : '') + '</td>'
@@ -881,9 +946,8 @@
         body.innerHTML = html;
         body.querySelectorAll('.res-row').forEach(el => {
             el.addEventListener('click', () => {
-                if (el.dataset.type === 'Texture') {
-                    openTextureModal(el.dataset.resid);
-                }
+                const resource = all.find(r => String(r.resourceId) === String(el.dataset.resid));
+                if (resource) handleResourceActivation(resource);
             });
         });
     }

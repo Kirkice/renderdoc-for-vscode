@@ -59,6 +59,12 @@ export interface MsgShowResourceDetails {
     label?: string;
 }
 
+export interface MsgShowShaderSource {
+    type: 'showShaderSource';
+    resourceId: string;
+    label?: string;
+}
+
 export interface MsgRequestMesh {
     type: 'requestMesh';
     eventId: number;
@@ -76,6 +82,7 @@ export type WebviewToExtensionMessage =
     | MsgCopyToClipboard
     | MsgExportTexture
     | MsgShowResourceDetails
+    | MsgShowShaderSource
     | MsgRequestMesh;
 
 // ───────────────────────────── Extension → Webview ─────────────────────────────
@@ -85,6 +92,7 @@ export interface WebviewResourceSummary {
     resourceId: string;
     name: string;
     type: string;
+    shaderStages?: string[];
     format: string;
     width: number;
     height: number;

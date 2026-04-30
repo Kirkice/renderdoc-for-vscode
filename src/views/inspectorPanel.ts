@@ -149,6 +149,7 @@ export class InspectorPanel {
                 resourceId: r.resourceId,
                 name: r.name,
                 type: r.type,
+                shaderStages: r.shaderStages,
                 format: r.format,
                 width: r.width,
                 height: r.height,
@@ -483,6 +484,9 @@ export class InspectorPanel {
                 break;
             case 'exportTexture':
                 vscode.commands.executeCommand('renderdoc.exportTexture', { resourceId: msg.resourceId, label: msg.label });
+                break;
+            case 'showShaderSource':
+                vscode.commands.executeCommand('renderdoc.viewShaderSource', { resourceId: msg.resourceId, label: msg.label });
                 break;
             case 'showResourceDetails':
                 vscode.commands.executeCommand('renderdoc.showResourceDetails', { resourceId: msg.resourceId, label: msg.label });

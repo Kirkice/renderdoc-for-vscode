@@ -503,7 +503,7 @@
             height: 100%;
             min-height: 0;
         }
-        #tab-mesh { display: flex; flex-direction: column; }
+        #tab-mesh.tab-panel.active { display: flex; flex-direction: column; }
         #tab-mesh .mesh-split { flex: 1; min-height: 0; }
         .mesh-split .mesh-table-wrap {
             flex: 1 1 55%;

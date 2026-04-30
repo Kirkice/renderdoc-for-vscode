@@ -129,6 +129,168 @@ const RESOURCE_TYPE_NAMES: Record<number, string> = {
     19: 'DescriptorStore',
 };
 
+const HIDDEN_RESOURCE_TYPES = new Set<string>(['StateObject']);
+
+function isGenericShaderName(name: string | undefined): boolean {
+    return /^Shader\s+\d+$/i.test((name || '').trim());
+}
+
+function isWeakShaderDisplayName(name: string | undefined): boolean {
+    const value = (name || '').trim();
+    if (!value) { return true; }
+    if (isGenericShaderName(value)) { return true; }
+    return isGenericShaderLabel(value);
+}
+
+function fileLeaf(filePath: string | undefined): string {
+    const value = (filePath || '').trim();
+    if (!value) { return ''; }
+    const parts = value.split(/[\\/]/);
+    return parts[parts.length - 1] || value;
+}
+
+function stripExtension(fileName: string): string {
+    return fileName.replace(/\.[^.]+$/, '');
+}
+
+function isGenericShaderLabel(label: string | undefined): boolean {
+    const value = (label || '').trim().toLowerCase();
+    return value === ''
+        || value === 'shader'
+        || value === 'main'
+        || value === 'vertex'
+        || value === 'fragment'
+        || value === 'pixel'
+        || value === 'compute'
+        || value === 'geometry'
+        || value === 'hull'
+        || value === 'domain'
+        || value === 'vert'
+        || value === 'frag'
+        || value === 'comp'
+        || value === 'geom'
+        || value === 'vs'
+        || value === 'ps'
+        || value === 'fs'
+        || value === 'gs'
+        || value === 'hs'
+        || value === 'ds';
+}
+
+function derivePathLabel(filePath: string | undefined): string {
+    const parts = (filePath || '')
+        .split(/[\\/]/)
+        .map((part) => stripExtension(part.trim()))
+        .filter((part) => part && !isGenericShaderLabel(part));
+    if (parts.length === 0) { return ''; }
+    return parts.slice(-3).join('/');
+}
+
+function stageToLabel(stage: number): string {
+    const labels: Record<number, string> = {
+        0: 'Vertex',
+        1: 'Hull',
+        2: 'Domain',
+        3: 'Geometry',
+        4: 'Pixel',
+        5: 'Compute',
+    };
+    return labels[stage] || `Stage ${stage}`;
+}
+
+function normalizeShaderStageLabel(label: string): string {
+    const normalized = (label || '').trim();
+    const map: Record<string, string> = {
+        Pixel: 'Fragment',
+        Fragment: 'Fragment',
+        Vertex: 'Vertex',
+        Compute: 'Compute',
+        Geometry: 'Geometry',
+        Hull: 'Hull',
+        Domain: 'Domain',
+    };
+    return map[normalized] || normalized;
+}
+
+function collectPipelineEventIds(drawCalls: DrawCall[], out: number[] = []): number[] {
+    for (const drawCall of drawCalls) {
+        if (/drawcall|dispatch/i.test(drawCall.flags || '')) {
+            out.push(drawCall.eventId);
+        }
+        if (drawCall.children?.length) {
+            collectPipelineEventIds(drawCall.children, out);
+        }
+    }
+    return out;
+}
+
+function pickPipelineShaderAlias(info: any): string {
+    const candidates = [info?.programName, info?.shaderName, info?.name];
+    for (const candidate of candidates) {
+        if (!isWeakShaderDisplayName(candidate)) {
+            return String(candidate).trim();
+        }
+    }
+    for (const candidate of candidates) {
+        if ((candidate || '').trim()) {
+            return String(candidate).trim();
+        }
+    }
+    return '';
+}
+
+function pipelineStageKeyToLabel(stageKey: string, info: any): string {
+    const normalized = String(stageKey || '').trim().toLowerCase();
+    const keyMap: Record<string, string> = {
+        vertex: 'Vertex',
+        fragment: 'Fragment',
+        pixel: 'Fragment',
+        compute: 'Compute',
+        geometry: 'Geometry',
+        hull: 'Hull',
+        tesscontrol: 'Hull',
+        tess_control: 'Hull',
+        domain: 'Domain',
+        tesseval: 'Domain',
+        tess_eval: 'Domain',
+    };
+    if (keyMap[normalized]) {
+        return keyMap[normalized];
+    }
+
+    const numericStage = typeof info?.stage === 'number' ? stageToLabel(info.stage) : '';
+    const numericMap: Record<string, string> = {
+        Vertex: 'Vertex',
+        Pixel: 'Fragment',
+        Compute: 'Compute',
+        Geometry: 'Geometry',
+        Hull: 'Hull',
+        Domain: 'Domain',
+    };
+    return numericMap[numericStage] || normalizeShaderStageLabel(numericStage) || stageKey;
+}
+
+function deriveShaderDisplayName(source: TGetShaderSourceResponse, fallbackName: string, resourceId: string): string {
+    for (const file of source.sourceFiles || []) {
+        const shaderDecl = (file.contents || '').match(/\bShader\s+"([^"]+)"/);
+        if (shaderDecl?.[1]) {
+            return shaderDecl[1];
+        }
+
+        const pathLabel = derivePathLabel(file.filename);
+        if (pathLabel) {
+            return pathLabel;
+        }
+
+        const leaf = fileLeaf(file.filename);
+        const stem = stripExtension(leaf);
+        if (!isGenericShaderLabel(stem)) {
+            return stem;
+        }
+    }
+    return fallbackName || `Shader ${resourceId}`;
+}
+
 /** Convert a native `ResourceDescription` (+ optional matching texture detail) to our `ResourceInfo`. */
 function nativeResourceToInfo(r: any, textures: Map<string, any>): ResourceInfo {
     const id = String(r.resourceId ?? '');
@@ -168,6 +330,7 @@ export class RenderDocBridge {
     private renderdocCmd: string | undefined;
     /** Global-storage directory where we cache a downloaded renderdoc_bridge.exe. */
     private downloadedBridgeDir: string | undefined;
+    private shaderDisplayNameCache = new Map<string, string>();
 
     constructor() {}
 
@@ -294,7 +457,180 @@ export class RenderDocBridge {
         for (const t of texRes.textures) {
             textures.set(String(t.resourceId), t);
         }
-        return resRes.resources.map((r) => nativeResourceToInfo(r, textures));
+        const resources = resRes.resources
+            .map((r) => nativeResourceToInfo(r, textures))
+            .filter((resource) => !HIDDEN_RESOURCE_TYPES.has(resource.type));
+
+        const shaderResources = resources.filter((resource) => resource.type === 'Shader' && isGenericShaderName(resource.name));
+        await this.enrichShaderResourceNames(shaderResources);
+
+        return resources;
+    }
+
+    private async enrichShaderResourceNames(resources: ResourceInfo[]): Promise<void> {
+        const maxConcurrency = 4;
+        let index = 0;
+        const runWorker = async () => {
+            while (index < resources.length) {
+                const current = resources[index++];
+                try {
+                    const metadata = await this.resolveShaderResourceMetadata(current.resourceId, current.name);
+                    current.name = metadata.name;
+                    current.shaderStages = metadata.stages;
+                } catch {
+                    // Keep the original resource name if reflection lookup fails.
+                }
+            }
+        };
+
+        await Promise.all(Array.from({ length: Math.min(maxConcurrency, resources.length) }, () => runWorker()));
+    }
+
+    async resolveShaderResourceMetadata(resourceId: string, fallbackName = ''): Promise<{ name: string; stages: string[] }> {
+        const cached = this.shaderDisplayNameCache.get(resourceId);
+        const rid = parseInt(resourceId, 10) || 0;
+        let entries: TGetShaderEntryPointsResponse['entryPoints'] = [];
+        try {
+            const epRes = await this.nativeCallT('getShaderEntryPoints', GetShaderEntryPointsResponse, { resourceId: rid });
+            entries = epRes.entryPoints;
+        } catch {
+            const fallback = fallbackName || `Shader ${resourceId}`;
+            this.shaderDisplayNameCache.set(resourceId, fallback);
+            return { name: cached || fallback, stages: [] };
+        }
+
+        if (entries.length === 0) {
+            entries = [{ name: 'main', stage: 0 }];
+        }
+
+        const stages = Array.from(new Set(entries.map((entry) => normalizeShaderStageLabel(stageToLabel(entry.stage))))).filter(Boolean).sort();
+
+        if (cached && stages.length > 0) {
+            return { name: cached, stages };
+        }
+
+        for (const entry of entries) {
+            try {
+                const source = await this.nativeCallT(
+                    'getShaderSource',
+                    GetShaderSourceResponse,
+                    { resourceId: rid, entryPoint: entry.name, stage: entry.stage },
+                );
+                const resolved = deriveShaderDisplayName(source, fallbackName, resourceId);
+                this.shaderDisplayNameCache.set(resourceId, resolved);
+                return { name: resolved, stages };
+            } catch {
+                // Try the next entry point.
+            }
+        }
+
+        const fallback = fallbackName || `Shader ${resourceId}`;
+        this.shaderDisplayNameCache.set(resourceId, fallback);
+        return { name: cached || fallback, stages };
+    }
+
+    async resolveShaderDisplayName(resourceId: string, fallbackName = ''): Promise<string> {
+        const metadata = await this.resolveShaderResourceMetadata(resourceId, fallbackName);
+        return metadata.name;
+    }
+
+    async getShaderSourceByResource(resourceId: string): Promise<{ displayName: string; panelData: Record<string, string> }> {
+        if (!this.hasNativeBridge()) {
+            throw new Error(NATIVE_REPLAY_REQUIRED_MSG);
+        }
+
+        const rid = parseInt(resourceId, 10) || 0;
+        let entries: TGetShaderEntryPointsResponse['entryPoints'] = [];
+        const epRes = await this.nativeCallT('getShaderEntryPoints', GetShaderEntryPointsResponse, { resourceId: rid });
+        entries = epRes.entryPoints;
+        if (entries.length === 0) {
+            entries = [{ name: 'main', stage: 0 }];
+        }
+
+        const displayName = await this.resolveShaderDisplayName(resourceId, `Shader ${resourceId}`);
+        const panelData: Record<string, string> = {};
+
+        for (const entry of entries) {
+            const source = await this.nativeCallT(
+                'getShaderSource',
+                GetShaderSourceResponse,
+                { resourceId: rid, entryPoint: entry.name, stage: entry.stage },
+            );
+            const files = source.sourceFiles || [];
+            let code = '';
+            if (files.length > 0) {
+                code = files.map((file) => file.contents || '').join('\n\n');
+            } else if (typeof source.disassembly === 'string') {
+                code = source.disassembly;
+            }
+            if (!code.trim()) {
+                continue;
+            }
+            const entrySuffix = source.entryPoint && source.entryPoint !== 'main' ? ` (${source.entryPoint})` : '';
+            panelData[`${stageToLabel(source.stage)}  ${displayName}${entrySuffix}`] = code;
+        }
+
+        if (Object.keys(panelData).length === 0) {
+            throw new Error(`No shader source returned for resource ${resourceId}.`);
+        }
+
+        return { displayName, panelData };
+    }
+
+    async buildShaderMetadataMap(
+        drawCalls: DrawCall[],
+        onProgress?: (completed: number, total: number) => void,
+    ): Promise<Map<string, { name: string; stages: string[] }>> {
+        if (!this.hasNativeBridge()) {
+            throw new Error(NATIVE_REPLAY_REQUIRED_MSG);
+        }
+
+        const eventIds = collectPipelineEventIds(drawCalls);
+        const metadata = new Map<string, { name: string; stages: Set<string> }>();
+        const total = eventIds.length;
+
+        for (let index = 0; index < eventIds.length; index++) {
+            const eventId = eventIds[index];
+            try {
+                const pipeline = await this.nativeGetPipelineState(eventId);
+                const shaders = pipeline?.shaders || {};
+                for (const [stageKey, info] of Object.entries(shaders) as [string, any][]) {
+                    if (!info || info.resourceId == null) { continue; }
+                    const resourceId = String(info.resourceId);
+                    const alias = pickPipelineShaderAlias(info);
+                    const stage = pipelineStageKeyToLabel(stageKey, info);
+
+                    const existing = metadata.get(resourceId) || {
+                        name: this.shaderDisplayNameCache.get(resourceId) || '',
+                        stages: new Set<string>(),
+                    };
+                    if (stage) {
+                        existing.stages.add(stage);
+                    }
+                    if (alias && (!existing.name || (isWeakShaderDisplayName(existing.name) && !isWeakShaderDisplayName(alias)))) {
+                        existing.name = alias;
+                        this.shaderDisplayNameCache.set(resourceId, alias);
+                    }
+                    metadata.set(resourceId, existing);
+                }
+            } catch {
+                // Some events don't expose valid pipeline state; keep scanning.
+            }
+
+            if (onProgress) {
+                onProgress(index + 1, total);
+            }
+        }
+
+        return new Map(
+            Array.from(metadata.entries()).map(([resourceId, value]) => [
+                resourceId,
+                {
+                    name: value.name,
+                    stages: Array.from(value.stages).sort(),
+                },
+            ])
+        );
     }
 
     /** Get capture thumbnail using renderdoccmd thumb */
@@ -680,6 +1016,7 @@ export class RenderDocBridge {
 
     /** Open a capture in the native replay controller */
     async nativeOpenCapture(filePath: string): Promise<any> {
+        this.shaderDisplayNameCache.clear();
         return this.nativeCall('openCapture', { path: filePath });
     }
 

@@ -46,6 +46,10 @@ export class ResourceProvider implements vscode.TreeDataProvider<ResourceItem> {
                     desc = `${r.width}x${r.height} ${r.format}`;
                 } else if (r.type === 'Buffer') {
                     desc = formatBytes(r.byteSize);
+                } else if (r.type === 'Shader') {
+                    desc = (r.shaderStages && r.shaderStages.length > 0)
+                        ? r.shaderStages.join(' / ')
+                        : (r.format || '');
                 } else {
                     desc = r.format || '';
                 }

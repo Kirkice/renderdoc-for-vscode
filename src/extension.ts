@@ -18,6 +18,7 @@ import {
     getShaderPanelHtml,
     getPipelineStateHtml,
     getTexturePreviewHtml,
+    getResourceDetailHtml,
 } from './views/panelHtml';
 
 let bridge: RenderDocBridge;
@@ -32,6 +33,8 @@ let currentCapturePath: string | undefined;
 let currentSelectedDrawCall: any | undefined;
 let currentSelectedResource: any | undefined;
 let currentDrawCalls: DrawCall[] = [];
+let currentResources: ResourceInfo[] = [];
+let shaderAliasScanGeneration = 0;
 
 // Path of the capture currently known to the native bridge process.
 // Used to force-restart the bridge before loading a different capture,
@@ -233,6 +236,8 @@ function closeCapture() {
     currentSelectedDrawCall = undefined;
     currentSelectedResource = undefined;
     currentDrawCalls = [];
+    currentResources = [];
+    shaderAliasScanGeneration += 1;
 
     // Shut down the bridge to cleanly release all memory and file locks
     console.log('[RenderDoc] User requested close capture; killing bridge.');
@@ -256,6 +261,78 @@ function closeCapture() {
     }
 }
 
+function isWeakShaderResourceName(name: string | undefined): boolean {
+    const value = (name || '').trim();
+    return value === '' || /^Shader\s+\d+$/i.test(value) || /^main$/i.test(value);
+}
+
+function needsShaderMetadata(resource: ResourceInfo): boolean {
+    if (resource.type !== 'Shader') {
+        return false;
+    }
+    return isWeakShaderResourceName(resource.name)
+        || !resource.shaderStages
+        || resource.shaderStages.length === 0;
+}
+
+function applyShaderMetadata(resources: ResourceInfo[], metadata: Map<string, { name: string; stages: string[] }>): boolean {
+    let changed = false;
+    for (const resource of resources) {
+        if (resource.type !== 'Shader') { continue; }
+        const value = metadata.get(resource.resourceId);
+        if (!value) { continue; }
+
+        if (value.stages.length > 0) {
+            const currentStages = resource.shaderStages || [];
+            const sameStages = currentStages.length === value.stages.length
+                && currentStages.every((stage, index) => stage === value.stages[index]);
+            if (!sameStages) {
+                resource.shaderStages = value.stages;
+                changed = true;
+            }
+        }
+
+        if (value.name && resource.name !== value.name && (isWeakShaderResourceName(resource.name) || !resource.name.trim())) {
+            resource.name = value.name;
+            changed = true;
+        }
+    }
+    return changed;
+}
+
+async function startShaderAliasScan(captureInfo: CaptureInfo, drawCalls: DrawCall[], resources: ResourceInfo[]) {
+    if (!bridge.hasNativeBridge()) {
+        return;
+    }
+    if (drawCalls.length === 0 || resources.every((resource) => !needsShaderMetadata(resource))) {
+        return;
+    }
+
+    const generation = ++shaderAliasScanGeneration;
+    try {
+        const metadata = await bridge.buildShaderMetadataMap(drawCalls);
+        if (generation !== shaderAliasScanGeneration) {
+            return;
+        }
+        if (!applyShaderMetadata(resources, metadata)) {
+            return;
+        }
+
+        currentResources = resources;
+        resourceProvider.update(resources);
+        if (InspectorPanel.currentPanel) {
+            InspectorPanel.currentPanel.setCapture(captureInfo, drawCalls, resources);
+        }
+        try {
+            captureCache.put(captureInfo.filePath, captureInfo, drawCalls, resources);
+        } catch (err: any) {
+            console.warn('[RenderDoc] captureCache.put after alias scan failed:', err?.message);
+        }
+    } catch (err: any) {
+        console.warn('[RenderDoc] shader alias scan failed:', err?.message);
+    }
+}
+
 async function loadCapture(context: vscode.ExtensionContext, filePath: string, silent = false) {
     currentCapturePath = filePath;
     console.log('[RenderDoc] loadCapture called:', filePath, 'silent:', silent);
@@ -271,6 +348,7 @@ async function loadCapture(context: vscode.ExtensionContext, filePath: string, s
         console.log('[RenderDoc] loadCapture: cache hit, populating UI instantly.');
         captureInfoProvider.update(cached.captureInfo);
         currentDrawCalls = cached.drawCalls;
+        currentResources = cached.resources;
         drawCallProvider.update(cached.drawCalls);
         resourceProvider.update(cached.resources);
         apiInspectorProvider.clear();
@@ -459,6 +537,8 @@ async function loadCapture(context: vscode.ExtensionContext, filePath: string, s
                 // If we hit the cache initially, use those to save the expensive JSON fetch time
                 drawCalls = cached.drawCalls;
                 resources = cached.resources;
+                currentDrawCalls = drawCalls;
+                currentResources = resources;
                 progress.report({ message: 'Loading draw calls & resources... (done from cache)', increment: 20 });
             } else {
                 try {
@@ -471,6 +551,7 @@ async function loadCapture(context: vscode.ExtensionContext, filePath: string, s
                     if (token.isCancellationRequested) { return; }
                     progress.report({ message: 'Loading resources...', increment: 10 });
                     resources = await bridge.getResources(filePath);
+                    currentResources = resources;
                     resourceProvider.update(resources);
                 } catch (err: any) {
                     replayErr = err;
@@ -493,6 +574,10 @@ async function loadCapture(context: vscode.ExtensionContext, filePath: string, s
             // Push whatever we have into an open Inspector
             if (InspectorPanel.currentPanel && captureInfo) {
                 InspectorPanel.currentPanel.setCapture(captureInfo, drawCalls, resources);
+            }
+
+            if (!replayErr && captureInfo) {
+                void startShaderAliasScan(captureInfo, drawCalls, resources);
             }
 
             // Step 4: Thumbnail — uses renderdoccmd binary, no replay needed.
@@ -545,10 +630,12 @@ async function refreshCapture() {
     currentDrawCalls = drawCalls;
     drawCallProvider.update(drawCalls);
     const resources = await bridge.getResources(info.filePath);
+    currentResources = resources;
     resourceProvider.update(resources);
     if (InspectorPanel.currentPanel) {
         InspectorPanel.currentPanel.setCapture(captureInfo, drawCalls, resources);
     }
+    void startShaderAliasScan(captureInfo, drawCalls, resources);
 }
 
 /** Walk draw call tree and attach GPU timings by eventId, aggregating sums for parents. */
@@ -653,20 +740,31 @@ async function showDrawCallDetails(context: vscode.ExtensionContext, item: any) 
 
 async function showResourceDetails(context: vscode.ExtensionContext, item: any) {
     if (!item) { return; }
-
-    // Open the Inspector on the Textures tab (if a texture) or show in a quick
-    // pick. Resource details are available to Copilot via the
-    // renderdoc_getResourceDetail tool.
     const info = captureInfoProvider.getCaptureInfo();
-    const inspector = InspectorPanel.createOrShow(context, bridge);
-    if (info) {
-        try {
-            const drawCalls = await bridge.getDrawCalls(info.filePath);
-            const resources = await bridge.getResources(info.filePath);
-            inspector.setCapture(info, drawCalls, resources);
-        } catch { /* best-effort */ }
+    const resourceId = item.resourceId;
+    if (!info || !resourceId) {
+        vscode.window.showWarningMessage('Open a capture and select a resource first.');
+        return;
     }
-    inspector.reveal();
+
+    await vscode.window.withProgress(
+        { location: vscode.ProgressLocation.Notification, title: 'RenderDoc: Loading resource details...' },
+        async () => {
+            try {
+                const detail = await bridge.getResourceDetail(info.filePath, String(resourceId));
+                const title = item.label ? `Resource: ${item.label}` : `Resource ${resourceId}`;
+                const panel = vscode.window.createWebviewPanel(
+                    'renderdoc-resource-detail',
+                    title,
+                    vscode.ViewColumn.One,
+                    { enableScripts: false }
+                );
+                panel.webview.html = getResourceDetailHtml(detail);
+            } catch (err: any) {
+                vscode.window.showErrorMessage(`Failed to get resource details: ${err.message}`);
+            }
+        }
+    );
 }
 
 // ── Advanced Feature Commands ────────────────────────────────────────
@@ -680,11 +778,17 @@ async function viewShaderSource(context: vscode.ExtensionContext, item: any) {
 
     // item can come from DrawCallItem (has drawCall.eventId) or ResourceItem (has resourceId)
     const eventId = item.drawCall?.eventId ?? item.eventId;
+    const resourceId = item.resourceId ? String(item.resourceId) : undefined;
 
-    if (!bridge.hasNativeBridge() || eventId === undefined) {
+    if (!bridge.hasNativeBridge()) {
         vscode.window.showWarningMessage(
-            'Shader source requires an active local replay. Open a capture that can replay on this machine, or select a draw call first.'
+            'Shader source requires an active local replay. Open a capture that can replay on this machine first.'
         );
+        return;
+    }
+
+    if (eventId === undefined && !resourceId) {
+        vscode.window.showWarningMessage('Select a draw call or shader resource first.');
         return;
     }
 
@@ -692,6 +796,12 @@ async function viewShaderSource(context: vscode.ExtensionContext, item: any) {
         { location: vscode.ProgressLocation.Notification, title: 'RenderDoc: Loading shader source...' },
         async () => {
             try {
+                if (resourceId && eventId === undefined) {
+                    const result = await bridge.getShaderSourceByResource(resourceId);
+                    showShaderPanel(context, result.panelData, parseInt(resourceId, 10) || 0);
+                    return;
+                }
+
                 const result = await bridge.nativeGetShaderSource(eventId);
                 if (!result || !result.shaders || Object.keys(result.shaders).length === 0) {
                     vscode.window.showInformationMessage('No shader sources returned by the native bridge for this event.');
