@@ -161,7 +161,7 @@ Analyze any shader directly from the Inspector's Shaders tab using the **Mali Of
 <table>
 <tr>
 <td width="100%" valign="top" align="center">
-    <img src="screenshots/Chat%20with%20Copilot.jpeg" alt="Chat with Copilot" width="72%" />
+    <img src="screenshots/Chat-with-Copilot.jpeg" alt="Chat with Copilot" width="72%" />
     <br />
     <sub><b>Chat with Copilot</b> — use <code>@renderdoc</code> to analyze the current frame, draw calls, resources, and shaders.</sub>
 </td>
