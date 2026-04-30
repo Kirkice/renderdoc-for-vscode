@@ -27,6 +27,9 @@
         meshPending: {},
         meshShowPreview: true,
         meshCam: { yaw: 0.6, pitch: 0.4, zoom: 1.0, panX: 0, panY: 0, auto: true },
+        graphZoom: 1,
+        graphMinZoom: 0.35,
+        graphMaxZoom: 2.5,
     };
 
     // Build resourceId -> resource info lookup (strings for consistent key match)
@@ -104,6 +107,17 @@
         }
         return null;
     }
+    function findEventPath(list, eventId, trail = []) {
+        for (const dc of list) {
+            const next = trail.concat(dc);
+            if (dc.eventId === eventId) return next;
+            if (dc.children?.length) {
+                const found = findEventPath(dc.children, eventId, next);
+                if (found) return found;
+            }
+        }
+        return null;
+    }
     function navigateEvent(delta) {
         const flat = flattenEvents(state.drawCalls);
         if (!flat.length) return;
@@ -173,7 +187,7 @@
                 if (m.eventId === state.eventId) {
                     state.pipeline = m.data;
                     const aliasesChanged = updateShaderAliasesFromPipeline(m.data);
-                    if (state.activeTab === 'pipeline' || state.activeTab === 'overview') render();
+                    if (state.activeTab === 'pipeline' || state.activeTab === 'overview' || state.activeTab === 'pipelinegraph') render();
                     else if (aliasesChanged && state.activeTab === 'resources') renderResources();
                 }
                 break;
@@ -403,6 +417,382 @@
         }
         html += '</div>';
         return html;
+    }
+
+    function renderGraphStat(label, value) {
+        return '<div class="stat-card pg-stat"><div class="n">' + esc(value) + '</div><div class="l">' + esc(label) + '</div></div>';
+    }
+    function renderGraphBadge(label, kind) {
+        return '<span class="pg-badge' + (kind ? ' ' + kind : '') + '">' + esc(label) + '</span>';
+    }
+    function renderGraphTextChip(label, kind) {
+        return '<span class="pg-chip' + (kind ? ' ' + kind : '') + '">' + esc(label) + '</span>';
+    }
+    function renderGraphList(items) {
+        if (!items || items.length === 0) return '<div class="pg-note">None</div>';
+        return '<div class="pg-list">' + items.map(item => '<div class="pg-list-item">' + esc(item) + '</div>').join('') + '</div>';
+    }
+    function renderGraphSection(title, items) {
+        return '<div class="pg-section">'
+            + '<div class="pg-section-title">' + esc(title) + '</div>'
+            + renderGraphList(items)
+            + '</div>';
+    }
+    function formatEidRange(min, max) {
+        if (!isFinite(min) || !isFinite(max)) return 'n/a';
+        return min === max ? String(min) : (min + '-' + max);
+    }
+    function inferFlowKind(name, flags, stats, hasChildren) {
+        const text = ((name || '') + ' ' + (flags || '')).toLowerCase();
+        if (/present|swapchain|backbuffer/.test(text)) return 'present';
+        if (/shadow|cascade|depth prepass|depthprepass|depth-only|depth only|shadowmap/.test(text)) return 'shadow';
+        if (/opaque|gbuffer|deferred|prepass|depthnormal/.test(text)) return 'opaque';
+        if (/transparent|translucent|alpha|particle|glass/.test(text)) return 'transparent';
+        if (/imageeffect|postfx|post fx|post-process|post process|bloom|tonemap|taa|fxaa|smaa|dof|ssao|ssr|blur|upscale|color.?grading/.test(text)) return 'postfx';
+        if (/ui|canvas|imgui|hud|overlay|gizmo/.test(text)) return 'ui';
+        if (/copy|blit|resolve|genmips/.test(text)) return 'transfer';
+        if (/clear/.test(text) && (!stats || stats.draws === 0)) return 'clear';
+        if (/compute|dispatch/.test(text) || (stats && stats.dispatches > 0 && stats.draws === 0)) return 'compute';
+        if (/camera|render view|main pass|render scene/.test(text) && hasChildren) return 'camera';
+        if (hasChildren) return 'group';
+        return 'draw';
+    }
+    function kindLabel(kind) {
+        const map = {
+            camera: 'Camera / View',
+            shadow: 'Shadow Pass',
+            opaque: 'Opaque Pass',
+            transparent: 'Transparent Pass',
+            postfx: 'Post FX',
+            ui: 'UI / Overlay',
+            compute: 'Compute',
+            transfer: 'Copy / Resolve',
+            clear: 'Clear',
+            present: 'Present',
+            group: 'Marker Group',
+            draw: 'Draw Sequence',
+        };
+        return map[kind] || 'Pass';
+    }
+    function collectNodeStats(node) {
+        const stats = {
+            minEid: node && node.eventId != null ? node.eventId : Infinity,
+            maxEid: node && node.eventId != null ? node.eventId : -Infinity,
+            events: node ? 1 : 0,
+            draws: /drawcall/i.test(node?.flags || '') ? 1 : 0,
+            dispatches: /dispatch/i.test(node?.flags || '') ? 1 : 0,
+            clears: /clear/i.test(node?.flags || '') ? 1 : 0,
+            copies: /(copy|resolve|genmips)/i.test(node?.flags || '') ? 1 : 0,
+            presents: /present/i.test(node?.flags || '') ? 1 : 0,
+            markers: node?.children?.length ? 1 : 0,
+            leaves: !node?.children?.length ? 1 : 0,
+        };
+        (node.children || []).forEach(child => {
+            const sub = collectNodeStats(child);
+            stats.minEid = Math.min(stats.minEid, sub.minEid);
+            stats.maxEid = Math.max(stats.maxEid, sub.maxEid);
+            stats.events += sub.events;
+            stats.draws += sub.draws;
+            stats.dispatches += sub.dispatches;
+            stats.clears += sub.clears;
+            stats.copies += sub.copies;
+            stats.presents += sub.presents;
+            stats.markers += sub.markers;
+            stats.leaves += sub.leaves;
+        });
+        return stats;
+    }
+    function gatherLeafPreview(node, limit, out = []) {
+        if (!node || out.length >= limit) return out;
+        if (!node.children?.length) {
+            out.push(node);
+            return out;
+        }
+        node.children.forEach(child => {
+            if (out.length < limit) gatherLeafPreview(child, limit, out);
+        });
+        return out;
+    }
+    function compressLeafNodes(nodes) {
+        if (!nodes.length) return [];
+        const groups = [];
+        let bucket = [];
+        const flush = () => {
+            if (!bucket.length) return;
+            const first = bucket[0];
+            const last = bucket[bucket.length - 1];
+            const stats = bucket.reduce((acc, node) => {
+                acc.minEid = Math.min(acc.minEid, node.eventId);
+                acc.maxEid = Math.max(acc.maxEid, node.eventId);
+                if (/drawcall/i.test(node.flags || '')) acc.draws += 1;
+                if (/dispatch/i.test(node.flags || '')) acc.dispatches += 1;
+                if (/clear/i.test(node.flags || '')) acc.clears += 1;
+                if (/(copy|resolve|genmips)/i.test(node.flags || '')) acc.copies += 1;
+                if (/present/i.test(node.flags || '')) acc.presents += 1;
+                return acc;
+            }, { minEid: Infinity, maxEid: -Infinity, draws: 0, dispatches: 0, clears: 0, copies: 0, presents: 0 });
+            const selected = bucket.some(node => node.eventId === state.eventId);
+            const labelParts = [];
+            if (stats.draws) labelParts.push(stats.draws + ' draw' + (stats.draws === 1 ? '' : 's'));
+            if (stats.dispatches) labelParts.push(stats.dispatches + ' dispatch' + (stats.dispatches === 1 ? '' : 'es'));
+            if (stats.clears) labelParts.push(stats.clears + ' clear' + (stats.clears === 1 ? '' : 's'));
+            if (stats.copies) labelParts.push(stats.copies + ' copy/resolve');
+            if (stats.presents) labelParts.push(stats.presents + ' present');
+            groups.push({
+                synthetic: true,
+                title: bucket.length === 1 ? first.name : 'Inline Commands',
+                subtitle: bucket.length === 1 ? (first.flags || 'Event') : labelParts.join(' · '),
+                kind: inferFlowKind(first.name, first.flags, stats, false),
+                stats,
+                events: bucket,
+                selected,
+                preview: bucket.slice(0, 5),
+                eid: first.eventId,
+            });
+            bucket = [];
+        };
+        nodes.forEach(node => {
+            if (node.children?.length) {
+                flush();
+                groups.push(node);
+            } else {
+                bucket.push(node);
+            }
+        });
+        flush();
+        return groups;
+    }
+    function getFlowChildren(node) {
+        const rawChildren = (node.children || []).filter(child => child != null);
+        return compressLeafNodes(rawChildren);
+    }
+    function summarizeStats(stats) {
+        const parts = [];
+        if (stats.draws) parts.push(stats.draws + ' draw' + (stats.draws === 1 ? '' : 's'));
+        if (stats.dispatches) parts.push(stats.dispatches + ' dispatch' + (stats.dispatches === 1 ? '' : 'es'));
+        if (stats.clears) parts.push(stats.clears + ' clear' + (stats.clears === 1 ? '' : 's'));
+        if (stats.copies) parts.push(stats.copies + ' copy/resolve');
+        if (stats.presents) parts.push(stats.presents + ' present');
+        if (!parts.length) parts.push(stats.events + ' event' + (stats.events === 1 ? '' : 's'));
+        return parts.join(' · ');
+    }
+    function renderLeafPreview(items) {
+        if (!items || !items.length) return '<div class="pg-note">No representative commands.</div>';
+        return '<div class="pg-list">' + items.map(item => {
+            const current = item.eventId === state.eventId ? ' current' : '';
+            return '<div class="pg-list-item pg-command' + current + '">'
+                + '<span class="pg-command-eid">EID ' + esc(item.eventId) + '</span>'
+                + '<span class="pg-command-name">' + esc(item.name || '(unnamed)') + '</span>'
+                + '<span class="pg-command-flag">' + esc(item.flags || 'Event') + '</span>'
+                + '</div>';
+        }).join('') + '</div>';
+    }
+    function renderFlowNode(node, depth, selectedSet) {
+        const synthetic = !!node.synthetic;
+        const stats = synthetic ? node.stats : collectNodeStats(node);
+        const hasChildren = synthetic ? false : !!(node.children && node.children.length);
+        const kind = synthetic ? node.kind : inferFlowKind(node.name, node.flags, stats, hasChildren);
+        const current = synthetic
+            ? !!node.selected
+            : (selectedSet.has(node.eventId) || (state.eventId != null && stats.minEid <= state.eventId && state.eventId <= stats.maxEid && selectedSet.has(node.eventId)));
+        const title = synthetic ? node.title : (node.name || 'Unnamed pass');
+        const subtitle = synthetic
+            ? node.subtitle
+            : (kindLabel(kind) + ' · ' + summarizeStats(stats));
+        const badges = [
+            renderGraphBadge(kindLabel(kind), kind),
+            renderGraphBadge('EID ' + formatEidRange(stats.minEid, stats.maxEid), 'mono'),
+        ];
+        if (stats.draws) badges.push(renderGraphBadge(stats.draws + ' draws', 'mono'));
+        if (stats.dispatches) badges.push(renderGraphBadge(stats.dispatches + ' dispatches', 'mono'));
+        const preview = synthetic ? node.preview : gatherLeafPreview(node, hasChildren ? 5 : 3);
+        const sections = [
+            renderGraphSection('Summary', [
+                summarizeStats(stats),
+                stats.markers > 1 ? (stats.markers - 1) + ' nested pass groups' : 'No nested pass groups',
+                'Leaf events ' + stats.leaves,
+            ]),
+            '<div class="pg-section"><div class="pg-section-title">Representative Commands</div>' + renderLeafPreview(preview) + '</div>',
+        ];
+        const childModels = synthetic ? [] : getFlowChildren(node);
+        let html = '<div class="pg-tree-node depth-' + depth + '">';
+        html += renderGraphNode({
+            kind: 'flow-' + kind + (current ? ' current' : ''),
+            active: true,
+            title,
+            subtitle,
+            badges,
+            chips: current && state.eventId != null ? [renderGraphTextChip('Selected EID ' + state.eventId, 'current')] : [],
+            note: !synthetic && node.flags && !hasChildren ? node.flags : undefined,
+            sections,
+        });
+        if (childModels.length) {
+            html += '<div class="pg-children">';
+            childModels.forEach((child, idx) => {
+                html += '<div class="pg-child-link">';
+                if (idx > 0) html += '<div class="pg-child-spacer"></div>';
+                html += '<div class="pg-child-connector"></div>';
+                html += renderFlowNode(child, Math.min(depth + 1, 4), selectedSet);
+                html += '</div>';
+            });
+            html += '</div>';
+        }
+        html += '</div>';
+        return html;
+    }
+    function renderGraphNode(options) {
+        const badges = options.badges || [];
+        const breadcrumbs = options.breadcrumbs || [];
+        const chips = options.chips || [];
+        const sections = options.sections || [];
+        let html = '<div class="pg-node' + (options.kind ? ' ' + options.kind : '') + (!options.active ? ' inactive' : '') + '">';
+        html += '<div class="pg-node-header">';
+        html += '<div class="pg-node-title-wrap">';
+        html += '<div class="pg-node-title">' + esc(options.title || '') + '</div>';
+        if (options.subtitle) html += '<div class="pg-node-subtitle">' + esc(options.subtitle) + '</div>';
+        html += '</div>';
+        if (badges.length) {
+            html += '<div class="pg-badges">' + badges.join('') + '</div>';
+        }
+        html += '</div>';
+        if (breadcrumbs.length) {
+            html += '<div class="pg-breadcrumbs">' + breadcrumbs.map(label => '<span class="pg-crumb">' + esc(label) + '</span>').join('') + '</div>';
+        }
+        if (chips.length) {
+            html += '<div class="pg-chip-row">' + chips.join('') + '</div>';
+        }
+        if (sections.length) {
+            html += '<div class="pg-sections">' + sections.join('') + '</div>';
+        }
+        if (options.note) {
+            html += '<div class="pg-note">' + esc(options.note) + '</div>';
+        }
+        html += '</div>';
+        return html;
+    }
+    function renderGraphConnector(label) {
+        return '<div class="pg-connector">'
+            + '<span class="pg-connector-line"></span>'
+            + '<span class="pg-connector-arrow"></span>'
+            + (label ? '<span class="pg-connector-label">' + esc(label) + '</span>' : '')
+            + '</div>';
+    }
+    function clampGraphZoom(zoom) {
+        return Math.max(state.graphMinZoom, Math.min(state.graphMaxZoom, zoom));
+    }
+    function updatePipelineGraphZoomUi() {
+        const resetBtn = document.getElementById('pg-zoom-reset');
+        const zoomLabel = document.getElementById('pg-zoom-label');
+        const percent = Math.round(state.graphZoom * 100);
+        if (resetBtn) {
+            resetBtn.textContent = percent + '%';
+            resetBtn.classList.toggle('active', Math.abs(state.graphZoom - 1) < 0.001);
+        }
+        if (zoomLabel) zoomLabel.textContent = percent + '%';
+    }
+    function applyPipelineGraphTransform() {
+        const viewport = document.getElementById('pipeline-graph-viewport');
+        const stage = document.getElementById('pipeline-graph-stage');
+        const body = document.getElementById('pipeline-graph-body');
+        if (!viewport || !stage || !body) return;
+        const naturalWidth = Math.max(body.scrollWidth, body.offsetWidth, 1);
+        const naturalHeight = Math.max(body.scrollHeight, body.offsetHeight, 1);
+        const scaledWidth = Math.ceil(naturalWidth * state.graphZoom);
+        const scaledHeight = Math.ceil(naturalHeight * state.graphZoom);
+        const horizontalPad = 32;
+        const verticalPad = 24;
+        const stageWidth = Math.max(viewport.clientWidth, scaledWidth + horizontalPad * 2);
+        const stageHeight = Math.max(viewport.clientHeight, scaledHeight + verticalPad * 2);
+        stage.style.width = stageWidth + 'px';
+        stage.style.height = stageHeight + 'px';
+        body.style.transform = 'scale(' + state.graphZoom + ')';
+        body.style.transformOrigin = 'top left';
+        body.style.left = Math.max(horizontalPad, Math.floor((stageWidth - scaledWidth) * 0.5)) + 'px';
+        body.style.top = verticalPad + 'px';
+        updatePipelineGraphZoomUi();
+    }
+    function setPipelineGraphZoom(nextZoom, anchor) {
+        const viewport = document.getElementById('pipeline-graph-viewport');
+        const body = document.getElementById('pipeline-graph-body');
+        if (!viewport || !body) return;
+        const prevZoom = state.graphZoom;
+        const zoom = clampGraphZoom(nextZoom);
+        if (Math.abs(prevZoom - zoom) < 0.0001) {
+            updatePipelineGraphZoomUi();
+            return;
+        }
+        const anchorX = anchor?.x ?? viewport.clientWidth * 0.5;
+        const anchorY = anchor?.y ?? viewport.clientHeight * 0.5;
+        const contentX = (viewport.scrollLeft + anchorX) / prevZoom;
+        const contentY = (viewport.scrollTop + anchorY) / prevZoom;
+        state.graphZoom = zoom;
+        applyPipelineGraphTransform();
+        viewport.scrollLeft = Math.max(0, contentX * zoom - anchorX);
+        viewport.scrollTop = Math.max(0, contentY * zoom - anchorY);
+    }
+    function fitPipelineGraphToWidth() {
+        const viewport = document.getElementById('pipeline-graph-viewport');
+        const body = document.getElementById('pipeline-graph-body');
+        if (!viewport || !body) return;
+        const naturalWidth = Math.max(body.scrollWidth, body.offsetWidth, 1);
+        const fitted = clampGraphZoom((viewport.clientWidth - 24) / naturalWidth);
+        setPipelineGraphZoom(fitted, { x: 0, y: 0 });
+        viewport.scrollLeft = 0;
+    }
+    function renderPipelineGraph() {
+        const body = document.getElementById('pipeline-graph-body');
+        if (!state.captureInfo || !state.drawCalls.length) {
+            body.textContent = 'Load a capture to view its render flow graph.';
+            body.className = 'empty-state';
+            return;
+        }
+        const selectedPath = state.eventId != null ? (findEventPath(state.drawCalls, state.eventId) || []) : [];
+        const selectedSet = new Set(selectedPath.map(dc => dc.eventId));
+        const topLevel = compressLeafNodes(state.drawCalls);
+        const topStats = state.drawCalls.reduce((acc, node) => {
+            const sub = collectNodeStats(node);
+            acc.events += sub.events;
+            acc.draws += sub.draws;
+            acc.dispatches += sub.dispatches;
+            acc.clears += sub.clears;
+            acc.presents += sub.presents;
+            return acc;
+        }, { events: 0, draws: 0, dispatches: 0, clears: 0, presents: 0 });
+        const topKinds = new Set();
+        topLevel.forEach(node => {
+            if (node.synthetic) topKinds.add(node.kind);
+            else topKinds.add(inferFlowKind(node.name, node.flags, collectNodeStats(node), !!node.children?.length));
+        });
+
+        let html = '<div class="pipeline-graph-shell">';
+        html += '<div class="stat-row pg-summary">';
+        html += renderGraphStat('Top-Level Steps', topLevel.length);
+        html += renderGraphStat('Events', topStats.events);
+        html += renderGraphStat('Draws', topStats.draws);
+        html += renderGraphStat('Dispatches', topStats.dispatches);
+        html += renderGraphStat('Pass Kinds', topKinds.size);
+        html += '</div>';
+        html += '<div class="pg-hero">';
+        html += '<div class="pg-hero-title">Capture Render Flow</div>';
+        html += '<div class="pg-hero-text">This graph is built from the full RDC EventBrowser hierarchy. Marker groups become render passes, consecutive leaf events are compressed into inline command blocks, and the currently selected EID is highlighted in context.</div>';
+        html += '<div class="pg-chip-row">';
+        html += renderGraphTextChip('API: ' + (state.captureInfo.api || 'Unknown'));
+        html += renderGraphTextChip('Driver: ' + (state.captureInfo.driver || 'Unknown'));
+        if (state.eventId != null) html += renderGraphTextChip('Focused EID ' + state.eventId, 'current');
+        html += '</div>';
+        html += '</div>';
+
+        html += '<div class="pg-tree">';
+        topLevel.forEach((node, idx) => {
+            if (idx > 0) html += renderGraphConnector('next stage');
+            html += renderFlowNode(node, 0, selectedSet);
+        });
+        html += '</div>';
+
+        html += '</div>';
+        body.className = '';
+        body.innerHTML = html;
+        applyPipelineGraphTransform();
     }
 
     // ── Shaders ────────────────────────────────────────────────────
@@ -956,6 +1346,7 @@
     function render() {
         if (state.activeTab === 'overview') renderOverview();
         else if (state.activeTab === 'pipeline') renderPipeline();
+        else if (state.activeTab === 'pipelinegraph') renderPipelineGraph();
         else if (state.activeTab === 'shaders') renderShaders();
         else if (state.activeTab === 'textures') renderTextures();
         else if (state.activeTab === 'resources') renderResources();
@@ -1607,7 +1998,61 @@
         // Redraw on resize.
         window.addEventListener('resize', () => {
             if (state.activeTab === 'mesh') renderMeshPreview();
+            if (state.activeTab === 'pipelinegraph') applyPipelineGraphTransform();
         });
+
+        // PipelineGraph zoom/pan controls.
+        const pgViewport = document.getElementById('pipeline-graph-viewport');
+        const pgZoomIn = document.getElementById('pg-zoom-in');
+        const pgZoomOut = document.getElementById('pg-zoom-out');
+        const pgZoomReset = document.getElementById('pg-zoom-reset');
+        const pgZoomFit = document.getElementById('pg-zoom-fit');
+        if (pgZoomIn) pgZoomIn.addEventListener('click', () => setPipelineGraphZoom(state.graphZoom * 1.15));
+        if (pgZoomOut) pgZoomOut.addEventListener('click', () => setPipelineGraphZoom(state.graphZoom / 1.15));
+        if (pgZoomReset) pgZoomReset.addEventListener('click', () => setPipelineGraphZoom(1, { x: 0, y: 0 }));
+        if (pgZoomFit) pgZoomFit.addEventListener('click', () => fitPipelineGraphToWidth());
+        if (pgViewport) {
+            pgViewport.addEventListener('wheel', (e) => {
+                if (state.activeTab !== 'pipelinegraph') return;
+                e.preventDefault();
+                const rect = pgViewport.getBoundingClientRect();
+                const anchor = { x: e.clientX - rect.left, y: e.clientY - rect.top };
+                const factor = e.deltaY < 0 ? 1.1 : (1 / 1.1);
+                setPipelineGraphZoom(state.graphZoom * factor, anchor);
+            }, { passive: false });
+
+            let draggingGraph = false;
+            let dragStartX = 0;
+            let dragStartY = 0;
+            let dragScrollLeft = 0;
+            let dragScrollTop = 0;
+            pgViewport.addEventListener('pointerdown', (e) => {
+                if (state.activeTab !== 'pipelinegraph') return;
+                draggingGraph = true;
+                dragStartX = e.clientX;
+                dragStartY = e.clientY;
+                dragScrollLeft = pgViewport.scrollLeft;
+                dragScrollTop = pgViewport.scrollTop;
+                pgViewport.classList.add('dragging');
+                pgViewport.setPointerCapture(e.pointerId);
+            });
+            pgViewport.addEventListener('pointermove', (e) => {
+                if (!draggingGraph) return;
+                const dx = e.clientX - dragStartX;
+                const dy = e.clientY - dragStartY;
+                pgViewport.scrollLeft = dragScrollLeft - dx;
+                pgViewport.scrollTop = dragScrollTop - dy;
+            });
+            const stopGraphDrag = (e) => {
+                if (!draggingGraph) return;
+                draggingGraph = false;
+                pgViewport.classList.remove('dragging');
+                try { pgViewport.releasePointerCapture(e.pointerId); } catch {}
+            };
+            pgViewport.addEventListener('pointerup', stopGraphDrag);
+            pgViewport.addEventListener('pointercancel', stopGraphDrag);
+        }
+        updatePipelineGraphZoomUi();
 
         // Mali Offline Splitter
         const maliSplitter = document.getElementById('mali-offline-splitter');

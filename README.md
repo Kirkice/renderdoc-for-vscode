@@ -72,6 +72,104 @@ Analyze any shader directly from the Inspector's Shaders tab using the **Mali Of
 
 ---
 
+## Screenshots
+
+<p align="center">
+    <a href="#capture-overview"><b>Capture Overview</b></a>
+    ·
+    <a href="#inspector-views"><b>Inspector Views</b></a>
+    ·
+    <a href="#copilot-workflow"><b>Copilot Workflow</b></a>
+    ·
+    <a href="#4--inspector-workflow"><b>Usage Guide</b></a>
+</p>
+
+<p align="center">
+    A quick visual tour of the extension: capture metadata, inspector tabs, render-flow analysis, resource views, and the Copilot-assisted workflow.
+</p>
+
+### Capture Overview
+
+<table>
+<tr>
+<td width="50%" valign="top" align="center">
+        <img src="screenshots/PreView.jpeg" alt="Capture preview" width="96%" />
+    <br />
+    <sub><b>Preview</b> — quick visual confirmation of the captured frame output.</sub>
+</td>
+</tr>
+</table>
+
+### Inspector Views
+
+<table>
+<tr>
+<td width="33.3%" valign="top" align="center">
+    <img src="screenshots/PipelineState.jpeg" alt="Pipeline State" width="94%" />
+    <br />
+    <sub><b>Pipeline State</b> — inspect bound stages and per-draw graphics state.</sub>
+</td>
+<td width="33.3%" valign="top" align="center">
+    <img src="screenshots/PipelineGraph01.jpeg" alt="Pipeline Graph overview" width="94%" />
+    <br />
+    <sub><b>PipelineGraph</b> — render-flow visualization derived from the full EventBrowser hierarchy.</sub>
+</td>
+<td width="33.3%" valign="top" align="center">
+    <img src="screenshots/PipelineGraph02.jpeg" alt="Pipeline Graph detail" width="94%" />
+    <br />
+    <sub><b>PipelineGraph Detail</b> — drill into pass groups, representative commands, and selected-event context.</sub>
+</td>
+</tr>
+<tr>
+<td width="33.3%" valign="top" align="center">
+    <img src="screenshots/Shaders.jpeg" alt="Shaders tab" width="94%" />
+    <br />
+    <sub><b>Shaders</b> — source, disassembly, and shader-stage analysis in one place.</sub>
+</td>
+<td width="33.3%" valign="top" align="center">
+    <img src="screenshots/TextureView.jpeg" alt="Texture Viewer" width="94%" />
+    <br />
+    <sub><b>Texture View</b> — inspect render targets and sampled textures for the current draw.</sub>
+</td>
+<td width="33.3%" valign="top" align="center">
+    <img src="screenshots/TextureInfo.jpeg" alt="Texture Info" width="94%" />
+    <br />
+    <sub><b>Texture Info</b> — zoom into an individual texture with focused metadata.</sub>
+</td>
+</tr>
+<tr>
+<td width="33.3%" valign="top" align="center">
+    <img src="screenshots/MeshView.jpeg" alt="Mesh View" width="94%" />
+    <br />
+    <sub><b>Mesh View</b> — inspect vertex/index data and geometry layout at a selected event.</sub>
+</td>
+<td width="33.3%" valign="top" align="center">
+    <img src="screenshots/ResourceInspector.jpeg" alt="Resource Inspector" width="94%" />
+    <br />
+    <sub><b>Resource Inspector</b> — browse textures, buffers, and shader resources across the capture.</sub>
+</td>
+<td width="33.3%" valign="top" align="center">
+    <img src="screenshots/OverView.jpeg" alt="Frame preview detail" width="94%" />
+    <br />
+    <sub><b>Overview</b> — capture metadata, API/driver details, and frame summary.</sub>
+</td>
+</tr>
+</table>
+
+### Copilot Workflow
+
+<table>
+<tr>
+<td width="100%" valign="top" align="center">
+    <img src="screenshots/Chat%20with%20Copilot.jpeg" alt="Chat with Copilot" width="72%" />
+    <br />
+    <sub><b>Chat with Copilot</b> — use <code>@renderdoc</code> to analyze the current frame, draw calls, resources, and shaders.</sub>
+</td>
+</tr>
+</table>
+
+---
+
 ## Quick Start
 
 ```

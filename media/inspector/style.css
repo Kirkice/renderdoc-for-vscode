@@ -207,6 +207,286 @@
         .resource-chip:hover { background: var(--vscode-button-hoverBackground, var(--vscode-badge-background)); }
         .resource-chip.depth { background: rgba(220, 120, 120, 0.3); color: rgb(250, 180, 180); }
 
+        /* PipelineGraph */
+        #tab-pipelinegraph.tab-panel.active {
+            display: flex;
+            flex-direction: column;
+            padding: 0;
+            overflow: hidden;
+        }
+        #pipeline-graph-toolbar {
+            margin: 0;
+            top: 0;
+            z-index: 3;
+        }
+        #pipeline-graph-viewport {
+            flex: 1;
+            min-height: 0;
+            overflow: auto;
+            padding: 12px;
+            cursor: grab;
+            background:
+                radial-gradient(circle at top, color-mix(in srgb, var(--vscode-textLink-foreground) 8%, transparent), transparent 38%),
+                var(--vscode-editor-background);
+        }
+        #pipeline-graph-viewport.dragging { cursor: grabbing; }
+        #pipeline-graph-stage {
+            position: relative;
+            min-width: 100%;
+            min-height: 100%;
+        }
+        #pipeline-graph-body {
+            width: min(1000px, calc(100vw - 96px));
+            max-width: 1000px;
+            position: absolute;
+            left: 0;
+            top: 0;
+        }
+        .pipeline-graph-shell {
+            display: flex;
+            flex-direction: column;
+            gap: 16px;
+            align-items: center;
+        }
+        .pg-summary {
+            margin-bottom: 0;
+            justify-content: center;
+        }
+        .pg-stat { min-width: 132px; }
+        .pg-tree {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            gap: 0;
+            width: 100%;
+        }
+        .pg-hero {
+            background: linear-gradient(180deg, color-mix(in srgb, var(--vscode-textLink-foreground) 10%, transparent), transparent 70%), var(--vscode-sideBar-background);
+            border: 1px solid var(--vscode-panel-border);
+            border-radius: 12px;
+            padding: 16px 18px;
+            width: min(100%, 760px);
+            text-align: center;
+        }
+        .pg-hero-title {
+            font-size: 1.12em;
+            font-weight: 700;
+            margin-bottom: 8px;
+        }
+        .pg-hero-text {
+            color: var(--vscode-descriptionForeground);
+            line-height: 1.5;
+            margin-bottom: 10px;
+        }
+        .pg-node {
+            width: min(100%, 760px);
+            background: var(--vscode-sideBar-background);
+            border: 1px solid var(--vscode-panel-border);
+            border-left: 4px solid var(--vscode-textLink-foreground);
+            border-radius: 12px;
+            padding: 14px 16px;
+            box-shadow: 0 10px 28px rgba(0, 0, 0, 0.09);
+        }
+        .pg-tree-node {
+            width: 100%;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+        }
+        .pg-tree-node.depth-1 > .pg-node { width: min(100%, 430px); }
+        .pg-tree-node.depth-2 > .pg-node,
+        .pg-tree-node.depth-3 > .pg-node,
+        .pg-tree-node.depth-4 > .pg-node { width: min(100%, 360px); }
+        .pg-node + .pg-node { margin-top: 0; }
+        .pg-node.flow-camera { border-left-color: #4ea1ff; }
+        .pg-node.flow-shadow { border-left-color: #8b7bff; }
+        .pg-node.flow-opaque { border-left-color: #4ecb71; }
+        .pg-node.flow-transparent { border-left-color: #f0a85c; }
+        .pg-node.flow-postfx { border-left-color: #e96ba8; }
+        .pg-node.flow-ui { border-left-color: #c6a0ff; }
+        .pg-node.flow-compute { border-left-color: #62c7c7; }
+        .pg-node.flow-transfer { border-left-color: #d1b25c; }
+        .pg-node.flow-clear { border-left-color: #b9b9b9; }
+        .pg-node.flow-present { border-left-color: #ff756b; }
+        .pg-node.flow-group { border-left-color: var(--vscode-textLink-foreground); }
+        .pg-node.flow-draw { border-left-color: var(--vscode-descriptionForeground); }
+        .pg-node.current {
+            box-shadow: 0 0 0 1px color-mix(in srgb, var(--vscode-textLink-foreground) 65%, transparent), 0 10px 26px rgba(0, 0, 0, 0.12);
+        }
+        .pg-node.inactive { opacity: 0.5; }
+        .pg-node-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: flex-start;
+            gap: 12px;
+            flex-wrap: wrap;
+        }
+        .pg-node-title-wrap { min-width: 0; }
+        .pg-node-title {
+            font-size: 1.04em;
+            font-weight: 600;
+            color: var(--vscode-foreground);
+        }
+        .pg-node-subtitle {
+            margin-top: 4px;
+            color: var(--vscode-descriptionForeground);
+            font-family: var(--vscode-editor-font-family);
+            font-size: 0.85em;
+            word-break: break-word;
+        }
+        .pg-badges {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 6px;
+        }
+        .pg-badge,
+        .pg-chip,
+        .pg-crumb {
+            display: inline-flex;
+            align-items: center;
+            gap: 4px;
+            padding: 3px 8px;
+            border-radius: 999px;
+            background: var(--vscode-badge-background);
+            color: var(--vscode-badge-foreground);
+            font-size: 0.78em;
+        }
+        .pg-chip.current,
+        .pg-badge.current { background: var(--vscode-button-background); color: var(--vscode-button-foreground); }
+        .pg-badge.mono,
+        .pg-chip.mono { font-family: var(--vscode-editor-font-family); }
+        .pg-breadcrumbs,
+        .pg-chip-row {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 6px;
+            margin-top: 10px;
+            justify-content: center;
+        }
+        .pg-sections {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+            gap: 12px;
+            width: min(100%, 430px);
+        }
+        .pg-section {
+            background: var(--vscode-editor-background);
+            border: 1px solid var(--vscode-panel-border);
+            border-radius: 10px;
+            padding: 12px;
+        }
+        .pg-section-title {
+            margin-bottom: 8px;
+            font-size: 0.78em;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            color: var(--vscode-descriptionForeground);
+        }
+        .pg-list {
+            display: flex;
+            flex-direction: column;
+            gap: 6px;
+        }
+        .pg-list-item {
+            font-family: var(--vscode-editor-font-family);
+            font-size: 0.84em;
+            line-height: 1.35;
+            word-break: break-word;
+        }
+        .pg-note {
+            margin-top: 10px;
+            color: var(--vscode-descriptionForeground);
+            font-size: 0.82em;
+            line-height: 1.45;
+        }
+        .pg-command {
+            display: grid;
+            grid-template-columns: 90px 1fr auto;
+            gap: 8px;
+            align-items: baseline;
+            padding: 4px 0;
+            border-bottom: 1px dashed color-mix(in srgb, var(--vscode-panel-border) 70%, transparent);
+        }
+        .pg-command:last-child { border-bottom: none; }
+        .pg-command.current {
+            background: color-mix(in srgb, var(--vscode-list-activeSelectionBackground) 22%, transparent);
+            border-radius: 4px;
+            padding-left: 6px;
+            padding-right: 6px;
+        }
+        .pg-command-eid,
+        .pg-command-flag { font-family: var(--vscode-editor-font-family); font-size: 0.78em; color: var(--vscode-descriptionForeground); }
+        .pg-command-name { min-width: 0; word-break: break-word; }
+        .pg-connector {
+            position: relative;
+            width: min(100%, 760px);
+            height: 28px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+        .pg-connector-line {
+            position: absolute;
+            top: 2px;
+            bottom: 9px;
+            width: 2px;
+            background: var(--vscode-panel-border);
+        }
+        .pg-connector-arrow {
+            position: absolute;
+            bottom: 0;
+            width: 0;
+            height: 0;
+            border-left: 6px solid transparent;
+            border-right: 6px solid transparent;
+            border-top: 8px solid var(--vscode-panel-border);
+        }
+        .pg-connector-label {
+            position: relative;
+            z-index: 1;
+            padding: 2px 8px;
+            border-radius: 999px;
+            background: var(--vscode-editor-background);
+            color: var(--vscode-descriptionForeground);
+            font-size: 0.72em;
+            text-transform: uppercase;
+            letter-spacing: 0.4px;
+        }
+        .pg-children {
+            position: relative;
+            width: 100%;
+            margin-top: 12px;
+            padding-top: 8px;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            gap: 12px;
+        }
+        .pg-child-link {
+            position: relative;
+            width: min(100%, 680px);
+            padding-top: 14px;
+        }
+        .pg-child-connector {
+            position: absolute;
+            left: 50%;
+            top: 0;
+            width: 2px;
+            height: 14px;
+            transform: translateX(-50%);
+            background: color-mix(in srgb, var(--vscode-panel-border) 80%, transparent);
+        }
+        .pg-child-spacer { height: 0; }
+        @media (max-width: 760px) {
+            .pg-node { width: 100%; }
+            .pg-connector { width: 100%; }
+            .pg-sections { grid-template-columns: 1fr; }
+            .pg-command { grid-template-columns: 1fr; }
+            #pipeline-graph-body { width: min(100%, calc(100vw - 56px)); }
+            .pg-hero { width: 100%; }
+            .pg-child-link { width: 100%; }
+        }
+
         /* Scope toggle (used in tab toolbars) */
         .scope-toggle { display: inline-flex; border: 1px solid var(--vscode-panel-border); border-radius: 3px; overflow: hidden; }
         .scope-toggle .scope {

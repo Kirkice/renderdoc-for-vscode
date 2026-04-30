@@ -2,7 +2,7 @@
   "name": "renderdoc-for-vscode",
   "displayName": "RenderDoc for VS Code",
   "description": "View and analyze RenderDoc capture (.rdc) files in VS Code",
-  "version": "0.0.2",
+  "version": "0.0.4",
   "publisher": "Kirkice",
   "icon": "logo.png",
   "galleryBanner": {

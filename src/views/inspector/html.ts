@@ -72,6 +72,7 @@ export function buildInspectorHtml(
             <button class="tab" data-tab="mesh" role="tab">Mesh View</button>
             <button class="tab" data-tab="overview" role="tab">Overview</button>
             <button class="tab" data-tab="resources" role="tab">Resource Inspector</button>
+            <button class="tab" data-tab="pipelinegraph" role="tab">PipelineGraph</button>
         </nav>
 
         <main class="content">
@@ -149,6 +150,24 @@ export function buildInspectorHtml(
                     <span id="res-count" class="muted"></span>
                 </div>
                 <div id="resources-body" class="resource-list empty-state">Load a capture to see resources.</div>
+            </section>
+
+            <section id="tab-pipelinegraph" class="tab-panel">
+                <div id="pipeline-graph-toolbar" class="sub-toolbar">
+                    <div class="scope-toggle" data-scope="pipelinegraph-zoom">
+                        <button id="pg-zoom-out" class="scope" title="Zoom out">-</button>
+                        <button id="pg-zoom-reset" class="scope active" title="Reset zoom">100%</button>
+                        <button id="pg-zoom-in" class="scope" title="Zoom in">+</button>
+                        <button id="pg-zoom-fit" class="scope" title="Fit graph to width">Fit</button>
+                    </div>
+                    <span id="pg-zoom-label" class="muted">100%</span>
+                    <span class="muted">Wheel: zoom · Drag: pan</span>
+                </div>
+                <div id="pipeline-graph-viewport" class="pg-viewport">
+                    <div id="pipeline-graph-stage" class="pg-stage">
+                        <div id="pipeline-graph-body" class="empty-state">Load a capture to view its render flow graph.</div>
+                    </div>
+                </div>
             </section>
         </main>
 
