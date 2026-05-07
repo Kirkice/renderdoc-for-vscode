@@ -53,13 +53,18 @@ export class InspectorPanel {
 
     // Mesh decode cache keyed by "eventId:stage:maxVerts:instance".
     private meshCache = new LruCache<string, any>(64);
+    private captureTimings: Record<string, number> = {};
+    private captureTimingsAvailable = false;
+    private captureTimingsError: string | undefined;
+    private timingCapturePath: string | undefined;
+    private timingsLoadingForPath: string | undefined;
 
     private latestMaliAnalysis?: { source: string, stage: string, result: string };
 
     private disposables: vscode.Disposable[] = [];
 
     public static createOrShow(context: vscode.ExtensionContext, bridge: RenderDocBridge) {
-        const column = vscode.ViewColumn.Beside;
+        const column = vscode.ViewColumn.Active;
 
         if (InspectorPanel.currentPanel) {
             InspectorPanel.currentPanel.panel.reveal(column, true);
@@ -139,6 +144,11 @@ export class InspectorPanel {
             this.shaderCache.clear();
             this.pipelineCache.clear();
             this.texturePreviewCache.clear();
+            this.captureTimings = {};
+            this.captureTimingsAvailable = false;
+            this.captureTimingsError = undefined;
+            this.timingCapturePath = undefined;
+            this.timingsLoadingForPath = undefined;
         }
 
         this.panel.webview.postMessage({
@@ -157,6 +167,10 @@ export class InspectorPanel {
             })),
         });
 
+        if (captureInfo?.filePath) {
+            this.loadCaptureTimings(captureInfo.filePath).catch(() => { /* best effort */ });
+        }
+
         // After (re-)pushing capture, if we already have a focused event,
         // re-post its shader/pipeline state from cache so the webview doesn't
         // get stuck on Loading after the captureLoaded reset.
@@ -167,6 +181,63 @@ export class InspectorPanel {
             }
             if (this.pipelineCache.has(eid)) {
                 this.panel.webview.postMessage({ type: 'pipelineLoaded', eventId: eid, data: this.pipelineCache.get(eid) });
+            }
+        }
+    }
+
+    private postCaptureTimings() {
+        this.panel.webview.postMessage({
+            type: 'timingsLoaded',
+            timings: this.captureTimings,
+            available: this.captureTimingsAvailable,
+            error: this.captureTimingsError,
+        });
+    }
+
+    private async loadCaptureTimings(filePath: string) {
+        if (!this.bridge.hasNativeBridge()) {
+            this.captureTimings = {};
+            this.captureTimingsAvailable = false;
+            this.captureTimingsError = 'Native bridge unavailable (local replay required).';
+            this.timingCapturePath = filePath;
+            this.postCaptureTimings();
+            return;
+        }
+        if (this.timingCapturePath === filePath && (this.captureTimingsAvailable || this.captureTimingsError)) {
+            this.postCaptureTimings();
+            return;
+        }
+        if (this.timingsLoadingForPath === filePath) {
+            return;
+        }
+
+        this.timingsLoadingForPath = filePath;
+        try {
+            const timings = await withTimeout(
+                this.bridge.getDrawTimings(),
+                45000,
+                'GPU timing request timed out after 45s.',
+            );
+            if (this.captureInfo?.filePath !== filePath) {
+                return;
+            }
+            this.captureTimings = Object.fromEntries(Array.from(timings.entries()).map(([eventId, durationUs]) => [String(eventId), durationUs]));
+            this.captureTimingsAvailable = true;
+            this.captureTimingsError = undefined;
+            this.timingCapturePath = filePath;
+            this.postCaptureTimings();
+        } catch (e: any) {
+            if (this.captureInfo?.filePath !== filePath) {
+                return;
+            }
+            this.captureTimings = {};
+            this.captureTimingsAvailable = false;
+            this.captureTimingsError = e?.message ?? String(e);
+            this.timingCapturePath = filePath;
+            this.postCaptureTimings();
+        } finally {
+            if (this.timingsLoadingForPath === filePath) {
+                this.timingsLoadingForPath = undefined;
             }
         }
     }
@@ -226,7 +297,7 @@ export class InspectorPanel {
     }
 
     public reveal() {
-        this.panel.reveal(vscode.ViewColumn.Beside, true);
+        this.panel.reveal(vscode.ViewColumn.Active, true);
     }
 
     /** Current focused event ID, or undefined if none selected. */
@@ -442,6 +513,9 @@ export class InspectorPanel {
                     }
                     if (captureToPush) {
                         this.setCapture(captureToPush.captureInfo, captureToPush.drawCalls, captureToPush.resources);
+                    }
+                    if (this.timingCapturePath && (this.captureTimingsAvailable || this.captureTimingsError)) {
+                        this.postCaptureTimings();
                     }
                     if (this.currentEventId !== undefined) {
                         // Re-post eventChanged directly (don't re-trigger loads

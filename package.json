@@ -242,6 +242,42 @@
         "icon": "$(file-binary)"
       },
       {
+        "command": "renderdoc.launchCapture",
+        "title": "Launch Application",
+        "category": "RenderDoc",
+        "icon": "$(play-circle)"
+      },
+      {
+        "command": "renderdoc.refreshCaptureTargets",
+        "title": "Refresh Capture Targets",
+        "category": "RenderDoc",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "renderdoc.attachCapture",
+        "title": "Attach To Process",
+        "category": "RenderDoc",
+        "icon": "$(plug)"
+      },
+      {
+        "command": "renderdoc.triggerCapture",
+        "title": "Capture Frame",
+        "category": "RenderDoc",
+        "icon": "$(device-camera-video)"
+      },
+      {
+        "command": "renderdoc.disconnectLiveTarget",
+        "title": "Disconnect Live Target",
+        "category": "RenderDoc",
+        "icon": "$(debug-disconnect)"
+      },
+      {
+        "command": "renderdoc.clearSavedCaptures",
+        "title": "Clear Saved RDC Files",
+        "category": "RenderDoc",
+        "icon": "$(trash)"
+      },
+      {
         "command": "renderdoc.showThumbnail",
         "title": "Show Capture Thumbnail",
         "category": "RenderDoc",
@@ -372,6 +408,11 @@
     "views": {
       "renderdoc-explorer": [
         {
+          "id": "renderdoc-launchTarget",
+          "name": "Capture Target",
+          "type": "webview"
+        },
+        {
           "id": "renderdoc-captureInfo",
           "name": "Capture Info"
         },
@@ -391,12 +432,46 @@
     },
     "viewsWelcome": [
       {
+        "view": "renderdoc-launchTarget",
+        "contents": "Choose **Local** or a connected device, then use [Launch Application](command:renderdoc.launchCapture) or [Attach To Process](command:renderdoc.attachCapture)."
+      },
+      {
         "view": "renderdoc-captureInfo",
         "contents": "No RDC capture file opened.\n[Open Capture File](command:renderdoc.openCapture)\n[Open Inspector](command:renderdoc.openInspector)"
       }
     ],
     "menus": {
       "view/title": [
+        {
+          "command": "renderdoc.launchCapture",
+          "when": "view == renderdoc-launchTarget",
+          "group": "navigation@0"
+        },
+        {
+          "command": "renderdoc.attachCapture",
+          "when": "view == renderdoc-launchTarget",
+          "group": "navigation@1"
+        },
+        {
+          "command": "renderdoc.triggerCapture",
+          "when": "view == renderdoc-launchTarget && renderdoc.liveTargetActive",
+          "group": "navigation@2"
+        },
+        {
+          "command": "renderdoc.disconnectLiveTarget",
+          "when": "view == renderdoc-launchTarget && renderdoc.liveTargetActive",
+          "group": "navigation@3"
+        },
+        {
+          "command": "renderdoc.refreshCaptureTargets",
+          "when": "view == renderdoc-launchTarget",
+          "group": "navigation@4"
+        },
+        {
+          "command": "renderdoc.clearSavedCaptures",
+          "when": "view == renderdoc-launchTarget",
+          "group": "navigation@5"
+        },
         {
           "command": "renderdoc.openInspector",
           "when": "view == renderdoc-captureInfo",

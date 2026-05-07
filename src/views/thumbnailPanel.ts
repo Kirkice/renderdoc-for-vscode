@@ -13,9 +13,7 @@ export class ThumbnailPanel {
         thumbnail: ThumbnailData,
         captureInfo: CaptureInfo
     ) {
-        const column = vscode.window.activeTextEditor
-            ? vscode.window.activeTextEditor.viewColumn
-            : undefined;
+        const column = vscode.ViewColumn.Active;
 
         // If we already have a panel, update it
         if (ThumbnailPanel.currentPanel) {
@@ -28,7 +26,7 @@ export class ThumbnailPanel {
         const panel = vscode.window.createWebviewPanel(
             ThumbnailPanel.viewType,
             `RenderDoc: ${captureInfo.api} Capture`,
-            column || vscode.ViewColumn.One,
+            column,
             {
                 enableScripts: false,
                 localResourceRoots: []
@@ -66,106 +64,176 @@ export class ThumbnailPanel {
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Capture Preview</title>
     <style>
+        :root {
+            color-scheme: dark;
+            --bg-0: #10151c;
+            --bg-1: #171e27;
+            --line: rgba(133, 152, 173, 0.18);
+            --text-dim: rgba(234, 240, 245, 0.66);
+            --shadow: 0 24px 56px rgba(0, 0, 0, 0.28);
+        }
+        * { box-sizing: border-box; }
         body {
-            font-family: var(--vscode-font-family);
-            color: var(--vscode-foreground);
-            background: var(--vscode-editor-background);
-            padding: 20px;
+            margin: 0;
+            font-family: "Segoe UI Variable Text", "Bahnschrift", "Segoe UI", sans-serif;
+            color: #eef4f8;
+            background:
+                radial-gradient(circle at top left, rgba(112, 208, 198, 0.12), transparent 28%),
+                radial-gradient(circle at top right, rgba(201, 139, 82, 0.14), transparent 24%),
+                linear-gradient(180deg, var(--bg-1), var(--bg-0) 60%, #0d1217 100%);
+        }
+        .shell {
+            max-width: 1080px;
+            margin: 0 auto;
+            padding: 22px;
+            display: grid;
+            gap: 16px;
+        }
+        .hero,
+        .preview,
+        .info-grid {
+            position: relative;
+            overflow: hidden;
+            border: 1px solid var(--line);
+            border-radius: 18px;
+            background: linear-gradient(180deg, rgba(30, 38, 49, 0.98), rgba(18, 24, 31, 0.98));
+            box-shadow: var(--shadow);
+        }
+        .hero::after,
+        .preview::after,
+        .info-grid::after {
+            content: "";
+            position: absolute;
+            inset: 0;
+            pointer-events: none;
+            background: linear-gradient(135deg, rgba(112, 208, 198, 0.07), transparent 36%, rgba(201, 139, 82, 0.08));
+        }
+        .hero {
+            padding: 18px 20px;
+            display: grid;
+            gap: 8px;
+        }
+        .eyebrow {
+            font-size: 10px;
+            text-transform: uppercase;
+            letter-spacing: 0.16em;
+            color: var(--text-dim);
+        }
+        .heroTitle {
+            font-size: 26px;
+            line-height: 1.08;
+            font-weight: 760;
             display: flex;
-            flex-direction: column;
             align-items: center;
+            flex-wrap: wrap;
+            gap: 10px;
         }
-        .capture-header {
-            text-align: center;
-            margin-bottom: 20px;
+        .subtitle {
+            color: var(--text-dim);
+            font-size: 12px;
+            line-height: 1.55;
+            word-break: break-all;
         }
-        .capture-header h1 {
-            font-size: 1.4em;
-            margin: 0 0 8px 0;
-            color: var(--vscode-foreground);
+        .badge {
+            display: inline-flex;
+            align-items: center;
+            padding: 5px 10px;
+            border-radius: 999px;
+            font-size: 10px;
+            text-transform: uppercase;
+            letter-spacing: 0.08em;
+            border: 1px solid rgba(112, 208, 198, 0.28);
+            background: rgba(112, 208, 198, 0.12);
+            color: #def8f4;
         }
-        .capture-header .subtitle {
-            color: var(--vscode-descriptionForeground);
-            font-size: 0.9em;
+        .preview {
+            padding: 18px;
         }
         .thumbnail-container {
-            border: 1px solid var(--vscode-panel-border);
-            border-radius: 6px;
-            overflow: hidden;
-            max-width: 100%;
-            box-shadow: 0 2px 8px rgba(0, 0, 0, 0.15);
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            padding: 18px;
+            min-height: 280px;
+            border: 1px solid rgba(133, 152, 173, 0.14);
+            border-radius: 16px;
+            background:
+                linear-gradient(45deg, #1d232b 25%, transparent 25%) 0 0 / 18px 18px,
+                linear-gradient(-45deg, #1d232b 25%, transparent 25%) 0 9px / 18px 18px,
+                linear-gradient(45deg, transparent 75%, #1d232b 75%) 9px -9px / 18px 18px,
+                linear-gradient(-45deg, transparent 75%, #1d232b 75%) 9px 0 / 18px 18px,
+                #28313d;
         }
         .thumbnail-container img {
             display: block;
             max-width: 100%;
             height: auto;
+            border-radius: 10px;
+            box-shadow: 0 18px 36px rgba(0, 0, 0, 0.26);
         }
         .info-grid {
             display: grid;
             grid-template-columns: auto 1fr;
-            gap: 6px 16px;
-            margin-top: 20px;
-            padding: 16px;
-            background: var(--vscode-sideBar-background);
-            border: 1px solid var(--vscode-panel-border);
-            border-radius: 6px;
-            width: 100%;
-            max-width: 600px;
+            gap: 10px 18px;
+            padding: 18px;
         }
         .info-grid .label {
-            color: var(--vscode-descriptionForeground);
+            color: var(--text-dim);
             font-weight: 600;
-            font-size: 0.85em;
+            font-size: 10px;
             text-transform: uppercase;
-            letter-spacing: 0.5px;
+            letter-spacing: 0.12em;
         }
         .info-grid .value {
-            color: var(--vscode-foreground);
+            color: #eef4f8;
+            font-family: Consolas, "Cascadia Code", monospace;
+            word-break: break-word;
         }
-        .badge {
-            display: inline-block;
-            padding: 2px 8px;
-            border-radius: 10px;
-            font-size: 0.8em;
-            font-weight: 600;
-        }
-        .badge-api {
-            background: var(--vscode-badge-background);
-            color: var(--vscode-badge-foreground);
+        @media (max-width: 760px) {
+            .shell { padding: 14px; }
+            .heroTitle { font-size: 22px; }
+            .info-grid {
+                grid-template-columns: 1fr;
+            }
         }
     </style>
 </head>
 <body>
-    <div class="capture-header">
-        <h1><span class="badge badge-api">${escapeHtml(info.api)}</span> Capture</h1>
-        <div class="subtitle">${escapeHtml(info.filePath)}</div>
-    </div>
+    <div class="shell">
+        <div class="hero">
+            <div class="eyebrow">Capture Preview</div>
+            <div class="heroTitle"><span class="badge">${escapeHtml(info.api)}</span> RenderDoc Capture</div>
+            <div class="subtitle">${escapeHtml(info.filePath)}</div>
+        </div>
 
-    <div class="thumbnail-container">
-        <img src="${imgSrc}" alt="Capture Thumbnail" width="${thumbnail.width}" height="${thumbnail.height}" />
-    </div>
+        <div class="preview">
+            <div class="thumbnail-container">
+                <img src="${imgSrc}" alt="Capture Thumbnail" width="${thumbnail.width}" height="${thumbnail.height}" />
+            </div>
+        </div>
 
-    <div class="info-grid">
-        <span class="label">Graphics API</span>
-        <span class="value">${escapeHtml(info.api)}</span>
+        <div class="info-grid">
+            <span class="label">Graphics API</span>
+            <span class="value">${escapeHtml(info.api)}</span>
 
-        <span class="label">Driver</span>
-        <span class="value">${escapeHtml(info.driver)}</span>
+            <span class="label">Driver</span>
+            <span class="value">${escapeHtml(info.driver)}</span>
 
-        <span class="label">RenderDoc</span>
-        <span class="value">${escapeHtml(info.rdocVersion)}</span>
+            <span class="label">RenderDoc</span>
+            <span class="value">${escapeHtml(info.rdocVersion)}</span>
 
-        <span class="label">Machine</span>
-        <span class="value">${escapeHtml(info.machineIdent)}</span>
+            <span class="label">Machine</span>
+            <span class="value">${escapeHtml(info.machineIdent)}</span>
 
-        <span class="label">Timestamp</span>
-        <span class="value">${escapeHtml(info.timestamp)}</span>
+            <span class="label">Timestamp</span>
+            <span class="value">${escapeHtml(info.timestamp)}</span>
 
-        <span class="label">Thumbnail</span>
-        <span class="value">${thumbnail.width} x ${thumbnail.height}</span>
+            <span class="label">Thumbnail</span>
+            <span class="value">${thumbnail.width} x ${thumbnail.height}</span>
 
-        <span class="label">Sections</span>
-        <span class="value">${info.sectionCount}</span>
+            <span class="label">Sections</span>
+            <span class="value">${info.sectionCount}</span>
+        </div>
     </div>
 </body>
 </html>`;

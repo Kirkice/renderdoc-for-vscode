@@ -98,14 +98,25 @@ export function buildInspectorHtml(
                     <div id="shader-stage-tabs" class="stage-tabs"></div>
                 </div>
                 <div id="shader-file-tabs" class="stage-tabs shader-file-tabs" hidden></div>
-                <div style="display:flex; flex-direction:row; height:calc(100vh - 180px); gap: 0;">
-                    <div id="shaders-container" style="flex: 2; display: flex; flex-direction: column; min-width: 0; min-height: 0;">
-                        <pre id="shaders-body" class="code-view empty-state" style="flex: 1; height: 100%; margin: 0; min-width: 0;">Select an event to view its shaders.</pre>
+                <div class="shader-workspace">
+                    <div id="shaders-container" class="shader-pane shader-source-pane">
+                        <div class="shader-pane-header">
+                            <div>
+                                <div class="shader-pane-title">Shader Source</div>
+                                <div id="shader-pane-meta" class="shader-pane-meta">Select an event to inspect bound shader stages.</div>
+                            </div>
+                        </div>
+                        <pre id="shaders-body" class="code-view empty-state shader-code-view">Select an event to view its shaders.</pre>
                     </div>
                     <div id="mali-offline-splitter" class="vertical-splitter" style="display:none;"></div>
-                    <div id="mali-offline-result-container" style="display:none; flex: 1; flex-direction: column; min-width: 0; border: 1px solid var(--vscode-panel-border); border-radius: 3px; background: var(--vscode-editor-background);">
-                        <div style="padding: 6px 12px; background: var(--vscode-sideBar-background); border-bottom: 1px solid var(--vscode-panel-border); font-weight: 600; font-size: 0.9em; flex-shrink: 0;">Mali Offline Compiler Analysis</div>
-                        <div id="mali-offline-result" style="padding: 12px; font-family: var(--vscode-editor-font-family); font-size: var(--vscode-editor-font-size, 13px); overflow: auto; white-space: pre; flex: 1;"></div>
+                    <div id="mali-offline-result-container" class="shader-pane shader-analysis-pane" style="display:none;">
+                        <div class="shader-pane-header shader-pane-header-accent">
+                            <div>
+                                <div class="shader-pane-title">Mali Offline Compiler Analysis</div>
+                                <div class="shader-pane-meta">Performance-oriented static analysis for the selected shader stage.</div>
+                            </div>
+                        </div>
+                        <div id="mali-offline-result" class="shader-analysis-result"></div>
                     </div>
                 </div>
             </section>
@@ -175,7 +186,10 @@ export function buildInspectorHtml(
             <div class="modal-backdrop"></div>
             <div class="modal-panel">
                 <div class="modal-header">
-                    <span id="tex-modal-title">Texture</span>
+                    <div class="modal-title-stack">
+                        <span id="tex-modal-title" class="modal-title">Texture</span>
+                        <span id="tex-modal-subtitle" class="modal-subtitle">Inspect channels, zoom level, and texture metadata.</span>
+                    </div>
                     <div class="modal-actions">
                         <div class="channel-toggle" id="channel-toggle">
                             <button data-ch="-1" class="ch active">RGBA</button>
@@ -194,6 +208,7 @@ export function buildInspectorHtml(
                     </div>
                     <div id="tex-modal-meta" class="tex-meta"></div>
                 </div>
+                <div class="modal-resize-handle" aria-hidden="true"></div>
             </div>
         </div>
     </div>

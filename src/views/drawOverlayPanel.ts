@@ -134,19 +134,97 @@ export class DrawOverlayPanel {
 
 function baseCss(): string {
     return `
-        body { font-family: var(--vscode-font-family); color: var(--vscode-foreground);
-               background: var(--vscode-editor-background); margin: 0; padding: 12px;
-               display: flex; flex-direction: column; height: 100vh; box-sizing: border-box; }
-        .header { margin-bottom: 8px; }
-        .title { font-size: 1.1em; font-weight: 600; }
-        .sub { color: var(--vscode-descriptionForeground); font-size: 0.85em; margin-top: 2px; }
-        .stage { flex: 1; display: flex; align-items: center; justify-content: center;
-                 border: 1px solid var(--vscode-panel-border); border-radius: 6px;
-                 overflow: auto; background: #1a1a1a; }
-        .stage img { max-width: 100%; max-height: 100%; display: block;
-                     image-rendering: -webkit-optimize-contrast; }
-        .placeholder { color: var(--vscode-descriptionForeground); padding: 24px; text-align: center; }
-        .legend { margin-top: 8px; font-size: 0.85em; color: var(--vscode-descriptionForeground); }
+        :root {
+            color-scheme: dark;
+            --bg-0: #10151c;
+            --bg-1: #171e27;
+            --line: rgba(133, 152, 173, 0.18);
+            --text-dim: rgba(234, 240, 245, 0.66);
+            --shadow: 0 24px 56px rgba(0, 0, 0, 0.28);
+        }
+        * { box-sizing: border-box; }
+        html, body { margin: 0; min-height: 100%; }
+        body {
+            font-family: "Segoe UI Variable Text", "Bahnschrift", "Segoe UI", sans-serif;
+            color: #eef4f8;
+            background:
+                radial-gradient(circle at top left, rgba(112, 208, 198, 0.12), transparent 30%),
+                radial-gradient(circle at top right, rgba(201, 139, 82, 0.12), transparent 24%),
+                linear-gradient(180deg, var(--bg-1), var(--bg-0) 60%, #0d1217 100%);
+        }
+        .shell {
+            max-width: 1180px;
+            margin: 0 auto;
+            padding: 20px;
+            display: grid;
+            gap: 16px;
+            min-height: 100vh;
+        }
+        .hero,
+        .stage,
+        .legend {
+            position: relative;
+            overflow: hidden;
+            border: 1px solid var(--line);
+            border-radius: 18px;
+            background: linear-gradient(180deg, rgba(30, 38, 49, 0.98), rgba(18, 24, 31, 0.98));
+            box-shadow: var(--shadow);
+        }
+        .hero::after,
+        .stage::after,
+        .legend::after {
+            content: "";
+            position: absolute;
+            inset: 0;
+            pointer-events: none;
+            background: linear-gradient(135deg, rgba(112, 208, 198, 0.07), transparent 36%, rgba(201, 139, 82, 0.08));
+        }
+        .hero {
+            padding: 18px 20px;
+        }
+        .title { font-size: 24px; line-height: 1.08; font-weight: 760; }
+        .sub { color: var(--text-dim); font-size: 12px; margin-top: 8px; line-height: 1.5; }
+        .stage {
+            flex: 1;
+            min-height: 420px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            overflow: auto;
+            padding: 18px;
+            background:
+                linear-gradient(45deg, #1d232b 25%, transparent 25%) 0 0 / 18px 18px,
+                linear-gradient(-45deg, #1d232b 25%, transparent 25%) 0 9px / 18px 18px,
+                linear-gradient(45deg, transparent 75%, #1d232b 75%) 9px -9px / 18px 18px,
+                linear-gradient(-45deg, transparent 75%, #1d232b 75%) 9px 0 / 18px 18px,
+                #28313d;
+        }
+        .stage img {
+            max-width: 100%;
+            max-height: min(76vh, 900px);
+            display: block;
+            border-radius: 12px;
+            box-shadow: 0 18px 36px rgba(0, 0, 0, 0.24);
+            image-rendering: -webkit-optimize-contrast;
+        }
+        .placeholder {
+            color: var(--text-dim);
+            padding: 24px;
+            text-align: center;
+            line-height: 1.55;
+            max-width: 48ch;
+        }
+        .legend {
+            padding: 14px 16px;
+            font-size: 12px;
+            line-height: 1.5;
+            color: var(--text-dim);
+        }
+        @media (max-width: 760px) {
+            .shell { padding: 14px; }
+            .title { font-size: 21px; }
+            .stage { min-height: 280px; }
+        }
     `;
 }
 

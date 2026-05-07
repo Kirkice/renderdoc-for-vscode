@@ -65,6 +65,14 @@ bool DllLoader::load(const std::string &renderdocPath) {
     OpenCaptureFile  = (pfn_OpenCaptureFile)GetProcAddress(hDll, "RENDERDOC_OpenCaptureFile");
     GetVersionString = (pfn_GetVersionString)GetProcAddress(hDll, "RENDERDOC_GetVersionString");
     GetCommitHash    = (pfn_GetCommitHash)GetProcAddress(hDll, "RENDERDOC_GetCommitHash");
+    GetDefaultCaptureOptions = (pfn_GetDefaultCaptureOptions)GetProcAddress(hDll, "RENDERDOC_GetDefaultCaptureOptions");
+    ExecuteAndInject = (pfn_ExecuteAndInject)GetProcAddress(hDll, "RENDERDOC_ExecuteAndInject");
+    InjectIntoProcess = (pfn_InjectIntoProcess)GetProcAddress(hDll, "RENDERDOC_InjectIntoProcess");
+    CreateTargetControl = (pfn_CreateTargetControl)GetProcAddress(hDll, "RENDERDOC_CreateTargetControl");
+    EnumerateRemoteTargets = (pfn_EnumerateRemoteTargets)GetProcAddress(hDll, "RENDERDOC_EnumerateRemoteTargets");
+    CreateRemoteServerConnection = (pfn_CreateRemoteServerConnection)GetProcAddress(hDll, "RENDERDOC_CreateRemoteServerConnection");
+    GetSupportedDeviceProtocols = (pfn_GetSupportedDeviceProtocols)GetProcAddress(hDll, "RENDERDOC_GetSupportedDeviceProtocols");
+    GetDeviceProtocolController = (pfn_GetDeviceProtocolController)GetProcAddress(hDll, "RENDERDOC_GetDeviceProtocolController");
 
     if (!InitialiseReplay || !ShutdownReplay || !OpenCaptureFile || !GetVersionString) {
         fprintf(stderr, "Failed to resolve one or more RENDERDOC_* functions\n");
@@ -95,6 +103,14 @@ bool DllLoader::load(const std::string &renderdocPath) {
     OpenCaptureFile  = (pfn_OpenCaptureFile)dlsym(handle, "RENDERDOC_OpenCaptureFile");
     GetVersionString = (pfn_GetVersionString)dlsym(handle, "RENDERDOC_GetVersionString");
     GetCommitHash    = (pfn_GetCommitHash)dlsym(handle, "RENDERDOC_GetCommitHash");
+    GetDefaultCaptureOptions = (pfn_GetDefaultCaptureOptions)dlsym(handle, "RENDERDOC_GetDefaultCaptureOptions");
+    ExecuteAndInject = (pfn_ExecuteAndInject)dlsym(handle, "RENDERDOC_ExecuteAndInject");
+    InjectIntoProcess = (pfn_InjectIntoProcess)dlsym(handle, "RENDERDOC_InjectIntoProcess");
+    CreateTargetControl = (pfn_CreateTargetControl)dlsym(handle, "RENDERDOC_CreateTargetControl");
+    EnumerateRemoteTargets = (pfn_EnumerateRemoteTargets)dlsym(handle, "RENDERDOC_EnumerateRemoteTargets");
+    CreateRemoteServerConnection = (pfn_CreateRemoteServerConnection)dlsym(handle, "RENDERDOC_CreateRemoteServerConnection");
+    GetSupportedDeviceProtocols = (pfn_GetSupportedDeviceProtocols)dlsym(handle, "RENDERDOC_GetSupportedDeviceProtocols");
+    GetDeviceProtocolController = (pfn_GetDeviceProtocolController)dlsym(handle, "RENDERDOC_GetDeviceProtocolController");
 
     if (!s_allocImpl || !s_freeImpl || !InitialiseReplay ||
         !ShutdownReplay || !OpenCaptureFile || !GetVersionString) {
@@ -127,4 +143,12 @@ void DllLoader::unload() {
     OpenCaptureFile  = nullptr;
     GetVersionString = nullptr;
     GetCommitHash    = nullptr;
+    GetDefaultCaptureOptions = nullptr;
+    ExecuteAndInject = nullptr;
+    InjectIntoProcess = nullptr;
+    CreateTargetControl = nullptr;
+    EnumerateRemoteTargets = nullptr;
+    CreateRemoteServerConnection = nullptr;
+    GetSupportedDeviceProtocols = nullptr;
+    GetDeviceProtocolController = nullptr;
 }

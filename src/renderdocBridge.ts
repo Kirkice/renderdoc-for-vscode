@@ -4,13 +4,33 @@ import * as path from 'path';
 import * as fs from 'fs';
 import * as os from 'os';
 import { z } from 'zod';
-import { CaptureInfo, DrawCall, ResourceInfo, ResourceDetail, ThumbnailData } from './types';
+import {
+    AttachCaptureOptions,
+    CaptureInfo,
+    CaptureAttachTarget,
+    CaptureLaunchTarget,
+    DrawCall,
+    LiveTargetInfo,
+    LaunchCaptureOptions,
+    LaunchCaptureResult,
+    ResourceInfo,
+    ResourceDetail,
+    ThumbnailData,
+    TriggerCaptureOptions,
+    TriggerCaptureResult,
+} from './types';
 import { parseRdcFile } from './rdcParser';
 import { withTimeout } from './util/async';
 import {
+    InitResponse,
     GetRootActionsResponse,
     GetResourcesResponse,
     GetTexturesResponse,
+    GetCaptureStatisticsResponse,
+    LiveTargetInfoResponse,
+    ListAttachTargetsResponse,
+    ListCaptureTargetsResponse,
+    TriggerCaptureResponse,
     GetShaderEntryPointsResponse,
     GetShaderSourceResponse,
     GetShaderSourceForEventResponse,
@@ -23,6 +43,11 @@ import {
     type TGetRootActionsResponse,
     type TGetResourcesResponse,
     type TGetTexturesResponse,
+    type TGetCaptureStatisticsResponse,
+    type TLiveTargetInfoResponse,
+    type TListAttachTargetsResponse,
+    type TListCaptureTargetsResponse,
+    type TTriggerCaptureResponse,
     type TGetShaderEntryPointsResponse,
     type TGetShaderSourceResponse,
     type TGetShaderSourceForEventResponse,
@@ -1014,14 +1039,35 @@ export class RenderDocBridge {
         }
     }
 
+    async ensureNativeBridgeReady(): Promise<void> {
+        if (!this.renderdocPath) {
+            const available = await this.checkAvailability();
+            if (!available || !this.renderdocPath) {
+                throw new Error('RenderDoc not found. Please install RenderDoc or configure the path.');
+            }
+        }
+
+        if (!this.hasNativeBridge()) {
+            this.tryStartNativeBridge();
+        }
+
+        if (!this.hasNativeBridge()) {
+            throw new Error('RenderDoc native bridge is not available.');
+        }
+
+        await this.nativeCallT('init', InitResponse, { renderdocPath: this.renderdocPath });
+    }
+
     /** Open a capture in the native replay controller */
     async nativeOpenCapture(filePath: string): Promise<any> {
+        await this.ensureNativeBridgeReady();
         this.shaderDisplayNameCache.clear();
         return this.nativeCall('openCapture', { path: filePath });
     }
 
     /** Explicitly try local replay for SuggestRemote captures (user-initiated) */
     async nativeTryReplay(): Promise<any> {
+        await this.ensureNativeBridgeReady();
         // Initialising a replay driver can be very expensive for large
         // captures (Unity GLES, big D3D12 frames): compiling shaders,
         // creating a GL/D3D context, uploading resources, etc. RenderDoc's
@@ -1056,6 +1102,78 @@ export class RenderDocBridge {
     async nativeGetTextureThumbBatch(eventId: number, resourceIds: string[]): Promise<any> {
         const textures = resourceIds.map(id => ({ resourceId: parseInt(id, 10) || 0, mip: 0 }));
         return this.nativeCall('getTextureThumbBatch', { eventId, textures });
+    }
+
+    /** Get RenderDoc-style capture statistics via the native replay bridge. */
+    async nativeGetCaptureStatistics(): Promise<TGetCaptureStatisticsResponse> {
+        return this.nativeCallT('getCaptureStatistics', GetCaptureStatisticsResponse, {});
+    }
+
+    async nativeListCaptureTargets(): Promise<CaptureLaunchTarget[]> {
+        await this.ensureNativeBridgeReady();
+        const result: TListCaptureTargetsResponse = await this.nativeCallT(
+            'listCaptureTargets',
+            ListCaptureTargetsResponse,
+            {},
+        );
+        return result.targets;
+    }
+
+    async nativeListAttachTargets(url = ''): Promise<CaptureAttachTarget[]> {
+        await this.ensureNativeBridgeReady();
+        const result: TListAttachTargetsResponse = await this.nativeCallT(
+            'listAttachTargets',
+            ListAttachTargetsResponse,
+            { url },
+        );
+        return result.targets;
+    }
+
+    async nativeLaunchCapture(options: LaunchCaptureOptions): Promise<LaunchCaptureResult> {
+        await this.ensureNativeBridgeReady();
+        const result: TLiveTargetInfoResponse = await this.nativeCallT(
+            'launchCapture',
+            LiveTargetInfoResponse,
+            options,
+            0,
+        );
+        return result;
+    }
+
+    async nativeAttachCapture(options: AttachCaptureOptions): Promise<LaunchCaptureResult> {
+        await this.ensureNativeBridgeReady();
+        const result: TLiveTargetInfoResponse = await this.nativeCallT(
+            'attachCapture',
+            LiveTargetInfoResponse,
+            options,
+            0,
+        );
+        return result;
+    }
+
+    async nativeGetLiveTarget(): Promise<LiveTargetInfo | undefined> {
+        await this.ensureNativeBridgeReady();
+        const result = await this.nativeCall('getLiveTarget', {});
+        if (!result) {
+            return undefined;
+        }
+        return validateResponse(LiveTargetInfoResponse, result, 'getLiveTarget');
+    }
+
+    async nativeTriggerCapture(options: TriggerCaptureOptions): Promise<TriggerCaptureResult> {
+        await this.ensureNativeBridgeReady();
+        const result: TTriggerCaptureResponse = await this.nativeCallT(
+            'triggerCapture',
+            TriggerCaptureResponse,
+            options,
+            0,
+        );
+        return result;
+    }
+
+    async nativeDisconnectLiveTarget(): Promise<void> {
+        await this.ensureNativeBridgeReady();
+        await this.nativeCall('disconnectLiveTarget', {}, 0);
     }
 
     /** Render the first bound color RT at `eventId` with a Drawcall overlay. */

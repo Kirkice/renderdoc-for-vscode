@@ -4,7 +4,7 @@ import * as path from 'path';
 import * as crypto from 'crypto';
 import { CaptureInfo, DrawCall, ResourceInfo } from '../types';
 
-const CACHE_VERSION = 4;
+const CACHE_VERSION = 5;
 
 export interface CachedCapture {
     version: number;

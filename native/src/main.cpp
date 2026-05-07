@@ -61,6 +61,9 @@ static inline void writeJsonLine(const json &j) {
     std::cout << j.dump() << "\n" << std::flush;
 }
 
+static uint32_t findMaxEventId(const rdcarray<ActionDescription> &actions);
+static std::string resultMessage(const ResultDetails &r);
+
 // Cached headless replay output for drawcall-overlay rendering.
 // Reused across events as long as the backing dimensions don't change.
 static IReplayOutput    *g_overlayOut  = nullptr;
@@ -83,6 +86,18 @@ static void resetEventCache() { g_currentEventId = UINT32_MAX; }
 // SaveTexture-to-file for small preview images (no temp-file I/O, GPU-scaled).
 static IReplayOutput    *g_thumbOut    = nullptr;
 static const int32_t     THUMB_DIM     = 256;
+// Live target-control session used for launch/attach workflows where the
+// user starts a program now and decides later when to trigger a capture.
+static IRemoteServer    *g_liveRemote = nullptr;
+static ITargetControl   *g_liveTarget = nullptr;
+static std::atomic<bool> g_liveRemoteKeepAlive{false};
+static std::thread       g_liveRemotePingThread;
+static std::string       g_liveTargetUrl;
+static std::string       g_liveTargetName;
+static std::string       g_liveTargetAPI;
+static uint32_t          g_liveTargetPID = 0;
+static uint32_t          g_liveTargetIdent = 0;
+static bool              g_liveTargetLocal = true;
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -96,6 +111,250 @@ static json makeResult(int id, const json &result) {
 
 static std::string rdcToStr(const rdcstr &s) {
     return std::string(s.c_str(), s.size());
+}
+
+static void emitStatusNote(const std::string &message) {
+    writeJsonLine({
+        {"method", "launchCaptureStatus"},
+        {"params", {{"message", message}}},
+    });
+}
+
+static CaptureOptions getDefaultCaptureOptions() {
+    CaptureOptions opts = {};
+    if (g_dll.GetDefaultCaptureOptions) {
+        g_dll.GetDefaultCaptureOptions(&opts);
+    }
+    return opts;
+}
+
+static std::string protocolFromUrl(const std::string &url) {
+    const size_t split = url.find("://");
+    if (split == std::string::npos) return "";
+    return url.substr(0, split);
+}
+
+static bool ensureParentDirectory(const std::string &filePath, std::string &errorMessage) {
+    if (filePath.empty()) return true;
+    try {
+        const std::filesystem::path outPath(filePath);
+        const std::filesystem::path parent = outPath.parent_path();
+        if (!parent.empty()) {
+            std::filesystem::create_directories(parent);
+        }
+        return true;
+    } catch (const std::exception &e) {
+        errorMessage = e.what();
+        return false;
+    }
+}
+
+static bool connectRemoteServer(const std::string &url, IRemoteServer **remote, std::string &errorMessage) {
+    if (!g_dll.CreateRemoteServerConnection) {
+        errorMessage = "RenderDoc remote server APIs are unavailable in the loaded DLL.";
+        return false;
+    }
+
+    ResultDetails result = g_dll.CreateRemoteServerConnection(rdcstr(url.c_str()), remote);
+    if (result.code == ResultCode::Succeeded && *remote) {
+        return true;
+    }
+
+    const std::string protocol = protocolFromUrl(url);
+    if (!protocol.empty() && g_dll.GetDeviceProtocolController) {
+        if (IDeviceProtocolController *controller = g_dll.GetDeviceProtocolController(rdcstr(protocol.c_str()))) {
+            emitStatusNote("Starting remote server on device...");
+            ResultDetails startResult = controller->StartRemoteServer(rdcstr(url.c_str()));
+            if (startResult.code == ResultCode::Succeeded) {
+                result = g_dll.CreateRemoteServerConnection(rdcstr(url.c_str()), remote);
+                if (result.code == ResultCode::Succeeded && *remote) {
+                    return true;
+                }
+            } else {
+                errorMessage = resultMessage(startResult);
+                return false;
+            }
+        }
+    }
+
+    errorMessage = resultMessage(result);
+    return false;
+}
+
+static ITargetControl *waitForTargetControl(const std::string &url, uint32_t ident, int timeoutMs) {
+    if (!g_dll.CreateTargetControl) return nullptr;
+
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeoutMs);
+    while (std::chrono::steady_clock::now() < deadline) {
+        ITargetControl *target = g_dll.CreateTargetControl(
+            rdcstr(url.c_str()), ident, rdcstr("renderdoc-for-vscode"), true);
+        if (target) {
+            return target;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    }
+
+    return nullptr;
+}
+
+static void startRemoteKeepAlive(IRemoteServer *remote,
+                                 std::atomic<bool> &keepRemoteAlive,
+                                 std::thread &remotePingThread) {
+    if (!remote) return;
+    keepRemoteAlive.store(true, std::memory_order_release);
+    remotePingThread = std::thread([remote, &keepRemoteAlive]() {
+        while (keepRemoteAlive.load(std::memory_order_acquire)) {
+            if (remote->Ping().code != ResultCode::Succeeded) {
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+        }
+    });
+}
+
+static void stopRemoteKeepAlive(std::atomic<bool> &keepRemoteAlive,
+                                std::thread &remotePingThread) {
+    keepRemoteAlive.store(false, std::memory_order_release);
+    if (remotePingThread.joinable()) {
+        remotePingThread.join();
+    }
+}
+
+static void clearLiveTargetSession() {
+    if (g_liveTarget) {
+        g_liveTarget->Shutdown();
+        g_liveTarget = nullptr;
+    }
+    stopRemoteKeepAlive(g_liveRemoteKeepAlive, g_liveRemotePingThread);
+    if (g_liveRemote) {
+        g_liveRemote->ShutdownConnection();
+        g_liveRemote = nullptr;
+    }
+
+    g_liveTargetUrl.clear();
+    g_liveTargetName.clear();
+    g_liveTargetAPI.clear();
+    g_liveTargetPID = 0;
+    g_liveTargetIdent = 0;
+    g_liveTargetLocal = true;
+}
+
+static json currentLiveTargetJson() {
+    if (!g_liveTarget) {
+        return nullptr;
+    }
+
+    std::string targetName = rdcToStr(g_liveTarget->GetTarget());
+    if (targetName.empty()) {
+        targetName = g_liveTargetName;
+    }
+    std::string apiName = rdcToStr(g_liveTarget->GetAPI());
+    if (apiName.empty()) {
+        apiName = g_liveTargetAPI;
+    }
+
+    json result = {
+        {"target", targetName},
+        {"local", g_liveTargetLocal},
+        {"pid", g_liveTarget->GetPID() ? g_liveTarget->GetPID() : g_liveTargetPID},
+        {"ident", g_liveTargetIdent},
+    };
+    if (!apiName.empty()) {
+        result["api"] = apiName;
+    }
+    if (!g_liveTargetUrl.empty()) {
+        result["url"] = g_liveTargetUrl;
+    }
+    return result;
+}
+
+static json buildTriggerCaptureResponse(const TargetControlMessage &captureMessage,
+                                       const std::string &finalCapturePath) {
+    json result = currentLiveTargetJson();
+    if (result.is_null()) {
+        result = json::object();
+    }
+    result["capturePath"] = finalCapturePath;
+    result["frameNumber"] = captureMessage.newCapture.frameNumber;
+    const std::string apiName = rdcToStr(captureMessage.newCapture.api);
+    if (!apiName.empty()) {
+        result["api"] = apiName;
+    }
+    result["local"] = captureMessage.newCapture.local;
+    return result;
+}
+
+static bool waitForCaptureMessage(ITargetControl *target,
+                                  int timeoutSeconds,
+                                  TargetControlMessage &captureMessage,
+                                  std::string &errorMessage) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(timeoutSeconds);
+    while (std::chrono::steady_clock::now() < deadline && target && target->Connected()) {
+        TargetControlMessage message = target->ReceiveMessage(nullptr);
+        if (message.type == TargetControlMessageType::NewCapture) {
+            captureMessage = message;
+            return true;
+        }
+        if (message.type == TargetControlMessageType::RegisterAPI && !rdcToStr(message.apiUse.name).empty()) {
+            emitStatusNote("Target initialised API: " + rdcToStr(message.apiUse.name));
+        }
+        if (message.type == TargetControlMessageType::Busy) {
+            emitStatusNote("Target is busy: " + rdcToStr(message.busy.clientName));
+        }
+    }
+
+    errorMessage = "Timed out waiting for the target to produce a capture.";
+    return false;
+}
+
+static bool copyCaptureToLocal(IRemoteServer *remote,
+                               const TargetControlMessage &captureMessage,
+                               const std::string &localCopyPath,
+                               std::string &finalCapturePath,
+                               std::string &errorMessage) {
+    finalCapturePath = rdcToStr(captureMessage.newCapture.path);
+    if (captureMessage.newCapture.local) {
+        return true;
+    }
+    if (!remote) {
+        errorMessage = "Remote capture completed but no remote server connection is available for file copy.";
+        return false;
+    }
+    if (localCopyPath.empty()) {
+        errorMessage = "localCopyPath is required for remote captures.";
+        return false;
+    }
+
+    emitStatusNote("Copying capture back to the local machine...");
+    remote->CopyCaptureFromRemote(captureMessage.newCapture.path, rdcstr(localCopyPath.c_str()), nullptr);
+    finalCapturePath = localCopyPath;
+    return true;
+}
+
+static json buildCaptureResponse(int id,
+                                 const std::string &fallbackTarget,
+                                 ITargetControl *target,
+                                 const TargetControlMessage &captureMessage,
+                                 const std::string &finalCapturePath) {
+    std::string targetName = fallbackTarget;
+    if (target) {
+        const std::string liveTarget = rdcToStr(target->GetTarget());
+        if (!liveTarget.empty()) {
+            targetName = liveTarget;
+        }
+    }
+
+    json result = {
+        {"capturePath", finalCapturePath},
+        {"target", targetName},
+        {"local", captureMessage.newCapture.local},
+        {"frameNumber", captureMessage.newCapture.frameNumber},
+    };
+    const std::string apiName = rdcToStr(captureMessage.newCapture.api);
+    if (!apiName.empty()) {
+        result["api"] = apiName;
+    }
+    return makeResult(id, result);
 }
 
 // ResourceId has private id field — use memcpy to extract/inject
@@ -542,11 +801,592 @@ static json handleGetTextures(int id) {
         return makeError(id, -1, "No replay active");
 
     const rdcarray<TextureDescription> &textures = g_replay->GetTextures();
+    const uint32_t totalTextureCount = (uint32_t)textures.size();
     json arr = json::array();
     for (size_t i = 0; i < textures.size(); i++)
         arr.push_back(textureToJson(textures[i]));
 
     return makeResult(id, {{"textures", arr}, {"count", textures.size()}});
+}
+
+static void countContributingEvents(const ActionDescription &action,
+                                    uint32_t &drawCount,
+                                    uint32_t &dispatchCount,
+                                    uint32_t &diagnosticCount) {
+    const ActionFlags diagnosticMask =
+        ActionFlags::SetMarker | ActionFlags::PushMarker | ActionFlags::PopMarker;
+    ActionFlags diagnosticMasked = action.flags & diagnosticMask;
+    if (diagnosticMasked != ActionFlags::NoFlags)
+        diagnosticCount += 1;
+
+    if (action.flags & (ActionFlags::MeshDispatch | ActionFlags::Drawcall))
+        drawCount += 1;
+
+    if (action.flags & ActionFlags::Dispatch)
+        dispatchCount += 1;
+
+    for (size_t i = 0; i < action.children.size(); i++)
+        countContributingEvents(action.children[i], drawCount, dispatchCount, diagnosticCount);
+}
+
+static ActionFlags workloadActionMask() {
+    return ActionFlags::Clear | ActionFlags::Drawcall | ActionFlags::Dispatch |
+           ActionFlags::MeshDispatch | ActionFlags::Present | ActionFlags::Copy |
+           ActionFlags::Resolve | ActionFlags::GenMips | ActionFlags::DispatchRay |
+           ActionFlags::BuildAccStruct;
+}
+
+static void collectWorkloadEventIds(const ActionDescription &action, std::set<uint32_t> &eventIds) {
+    if ((action.flags & workloadActionMask()) != ActionFlags::NoFlags && action.eventId > 0)
+        eventIds.insert(action.eventId);
+
+    for (size_t i = 0; i < action.children.size(); i++)
+        collectWorkloadEventIds(action.children[i], eventIds);
+}
+
+static std::string buildFramebufferSignature(const ActionDescription &action) {
+    std::ostringstream sig;
+    bool hasOutputs = false;
+
+    for (size_t i = 0; i < action.outputs.size(); i++) {
+        const ResourceId output = action.outputs[i];
+        if (output != ResourceId())
+            hasOutputs = true;
+        sig << resIdToU64(output) << ',';
+    }
+
+    if (action.depthOut != ResourceId())
+        hasOutputs = true;
+    sig << 'd' << resIdToU64(action.depthOut);
+
+    if (!hasOutputs && action.copyDestination != ResourceId()) {
+        hasOutputs = true;
+        sig << "|copy:" << resIdToU64(action.copyDestination);
+    }
+
+    return hasOutputs ? sig.str() : std::string();
+}
+
+static void countRenderTargetSwitches(const ActionDescription &action,
+                                      std::string &lastSignature,
+                                      uint32_t &switchCount) {
+    if ((action.flags & workloadActionMask()) != ActionFlags::NoFlags && action.eventId > 0) {
+        const std::string currentSignature = buildFramebufferSignature(action);
+        if (!currentSignature.empty()) {
+            if (!lastSignature.empty() && currentSignature != lastSignature)
+                switchCount += 1;
+            lastSignature = currentSignature;
+        }
+    }
+
+    for (size_t i = 0; i < action.children.size(); i++)
+        countRenderTargetSwitches(action.children[i], lastSignature, switchCount);
+}
+
+static bool estimateGpuFrameTimeUs(const rdcarray<ActionDescription> &actions, double &estimatedGpuTimeUs) {
+    if (!g_replay)
+        return false;
+
+    rdcarray<GPUCounter> available = g_replay->EnumerateCounters();
+    bool found = false;
+    for (size_t i = 0; i < available.size(); i++) {
+        if (available[i] == GPUCounter::EventGPUDuration) {
+            found = true;
+            break;
+        }
+    }
+    if (!found)
+        return false;
+
+    std::set<uint32_t> workloadEventIds;
+    for (size_t i = 0; i < actions.size(); i++)
+        collectWorkloadEventIds(actions[i], workloadEventIds);
+    if (workloadEventIds.empty())
+        return false;
+
+    rdcarray<GPUCounter> counters;
+    counters.push_back(GPUCounter::EventGPUDuration);
+    rdcarray<CounterResult> results = g_replay->FetchCounters(counters);
+
+    estimatedGpuTimeUs = 0.0;
+    for (size_t i = 0; i < results.size(); i++) {
+        const CounterResult &r = results[i];
+        if (r.counter != GPUCounter::EventGPUDuration)
+            continue;
+        if (workloadEventIds.find(r.eventId) == workloadEventIds.end())
+            continue;
+
+        const double durationUs = r.value.d * 1000000.0;
+        if (durationUs >= 0.0)
+            estimatedGpuTimeUs += durationUs;
+    }
+
+    return estimatedGpuTimeUs > 0.0;
+}
+
+static json handleGetCaptureStatistics(int id) {
+    if (!g_replay)
+        return makeError(id, -1, "No replay active");
+
+    const rdcarray<ActionDescription> &actions = g_replay->GetRootActions();
+    uint32_t drawCount = 0;
+    uint32_t dispatchCount = 0;
+    uint32_t diagnosticCount = 0;
+    uint32_t renderTargetSwitches = 0;
+    std::string lastFramebufferSignature;
+    for (size_t i = 0; i < actions.size(); i++) {
+        countContributingEvents(actions[i], drawCount, dispatchCount, diagnosticCount);
+        countRenderTargetSwitches(actions[i], lastFramebufferSignature, renderTargetSwitches);
+    }
+    uint32_t maxEventId = findMaxEventId(actions);
+
+    uint32_t apiCallCount = 0;
+    if (maxEventId > (drawCount + dispatchCount + diagnosticCount))
+        apiCallCount = maxEventId - (drawCount + dispatchCount + diagnosticCount);
+
+    const rdcarray<TextureDescription> &textures = g_replay->GetTextures();
+    const uint32_t totalTextureCount = (uint32_t)textures.size();
+    uint64_t renderTargetBytes = 0;
+    uint64_t textureBytes = 0;
+    uint64_t largeTextureBytes = 0;
+    int renderTargetCount = 0;
+    float avgTextureWidth = 0.0f, avgTextureHeight = 0.0f;
+    float avgLargeTextureWidth = 0.0f, avgLargeTextureHeight = 0.0f;
+    int textureCount = 0, largeTextureCount = 0;
+    for (size_t i = 0; i < textures.size(); i++) {
+        const TextureDescription &t = textures[i];
+        if (t.creationFlags & (TextureCategory::ColorTarget | TextureCategory::DepthTarget)) {
+            renderTargetCount++;
+            renderTargetBytes += t.byteSize;
+        } else {
+            avgTextureWidth += (float)t.width;
+            avgTextureHeight += (float)t.height;
+            textureCount++;
+            textureBytes += t.byteSize;
+            if (t.width > 32 && t.height > 32) {
+                avgLargeTextureWidth += (float)t.width;
+                avgLargeTextureHeight += (float)t.height;
+                largeTextureCount++;
+                largeTextureBytes += t.byteSize;
+            }
+        }
+    }
+    if (textureCount > 0) {
+        avgTextureWidth /= textureCount;
+        avgTextureHeight /= textureCount;
+    }
+    if (largeTextureCount > 0) {
+        avgLargeTextureWidth /= largeTextureCount;
+        avgLargeTextureHeight /= largeTextureCount;
+    }
+
+    const rdcarray<BufferDescription> &buffers = g_replay->GetBuffers();
+    uint64_t indexBufferBytes = 0;
+    uint64_t vertexBufferBytes = 0;
+    uint64_t bufferBytes = 0;
+    for (size_t i = 0; i < buffers.size(); i++) {
+        const BufferDescription &b = buffers[i];
+        bufferBytes += b.length;
+        if (b.creationFlags & BufferCategory::Index)
+            indexBufferBytes += b.length;
+        if (b.creationFlags & BufferCategory::Vertex)
+            vertexBufferBytes += b.length;
+    }
+
+    const FrameDescription frameInfo = g_replay->GetFrameInfo();
+    float drawRatio = 0.0f;
+    if (drawCount + dispatchCount > 0)
+        drawRatio = (float)apiCallCount / (float)(drawCount + dispatchCount);
+
+    double estimatedGpuTimeUs = 0.0;
+    const bool estimatedGpuTimeAvailable = estimateGpuFrameTimeUs(actions, estimatedGpuTimeUs);
+
+    json result = {
+        {"compressedFileSize", (double)frameInfo.compressedFileSize},
+        {"uncompressedFileSize", (double)frameInfo.uncompressedFileSize},
+        {"persistentSize", (double)frameInfo.persistentSize},
+        {"initDataSize", (double)frameInfo.initDataSize},
+        {"drawCount", drawCount},
+        {"dispatchCount", dispatchCount},
+        {"apiCallCount", apiCallCount},
+        {"apiDrawDispatchRatio", drawRatio},
+        {"textureCount", totalTextureCount},
+        {"textureBytes", (double)textureBytes},
+        {"largeTextureBytes", (double)largeTextureBytes},
+        {"renderTargetCount", renderTargetCount},
+        {"renderTargetBytes", (double)renderTargetBytes},
+        {"avgTextureWidth", avgTextureWidth},
+        {"avgTextureHeight", avgTextureHeight},
+        {"avgLargeTextureWidth", avgLargeTextureWidth},
+        {"avgLargeTextureHeight", avgLargeTextureHeight},
+        {"bufferCount", (uint32_t)buffers.size()},
+        {"bufferBytes", (double)bufferBytes},
+        {"indexBufferBytes", (double)indexBufferBytes},
+        {"vertexBufferBytes", (double)vertexBufferBytes},
+        {"totalGpuBytes", (double)(textureBytes + renderTargetBytes + bufferBytes)},
+        {"renderTargetSwitches", renderTargetSwitches},
+        {"estimatedGpuTimeAvailable", estimatedGpuTimeAvailable},
+    };
+
+    if (estimatedGpuTimeAvailable)
+        result["estimatedGpuTimeUs"] = estimatedGpuTimeUs;
+
+    if (frameInfo.stats.recorded) {
+        uint32_t numConstantSets = 0;
+        uint32_t numSamplerSets = 0;
+        uint32_t numResourceSets = 0;
+        uint32_t numShaderSets = 0;
+        for (int s = 0; s < (int)frameInfo.stats.constants.size(); s++) {
+            numConstantSets += frameInfo.stats.constants[s].calls;
+            numSamplerSets += frameInfo.stats.samplers[s].calls;
+            numResourceSets += frameInfo.stats.resources[s].calls;
+            numShaderSets += frameInfo.stats.shaders[s].calls;
+        }
+        result["apiSummary"] = {
+            {"indexVertexSets", frameInfo.stats.indices.calls + frameInfo.stats.vertices.calls + frameInfo.stats.layouts.calls},
+            {"constantSets", numConstantSets},
+            {"samplerSets", numSamplerSets},
+            {"resourceSets", numResourceSets},
+            {"shaderSets", numShaderSets},
+            {"blendSets", frameInfo.stats.blends.calls},
+            {"depthStencilSets", frameInfo.stats.depths.calls},
+            {"rasterizationSets", frameInfo.stats.rasters.calls},
+            {"resourceUpdates", frameInfo.stats.updates.calls},
+            {"outputSets", frameInfo.stats.outputs.calls},
+        };
+    }
+
+    return makeResult(id, result);
+}
+
+static json handleListCaptureTargets(int id) {
+    json targets = json::array();
+    if (!g_dll.GetSupportedDeviceProtocols || !g_dll.GetDeviceProtocolController) {
+        return makeResult(id, {{"targets", targets}});
+    }
+
+    rdcarray<rdcstr> protocols;
+    g_dll.GetSupportedDeviceProtocols(&protocols);
+
+    for (size_t protocolIndex = 0; protocolIndex < protocols.size(); protocolIndex++) {
+        const std::string requestedProtocol = rdcToStr(protocols[protocolIndex]);
+        IDeviceProtocolController *controller =
+            g_dll.GetDeviceProtocolController(rdcstr(requestedProtocol.c_str()));
+        if (!controller) continue;
+
+        const std::string protocolName = rdcToStr(controller->GetProtocolName());
+        const rdcarray<rdcstr> devices = controller->GetDevices();
+
+        for (size_t deviceIndex = 0; deviceIndex < devices.size(); deviceIndex++) {
+            const std::string deviceId = rdcToStr(devices[deviceIndex]);
+            const std::string url = protocolName + "://" + deviceId;
+            std::string friendlyName = rdcToStr(controller->GetFriendlyName(rdcstr(url.c_str())));
+            if (friendlyName.empty()) {
+                friendlyName = rdcToStr(controller->GetFriendlyName(rdcstr(deviceId.c_str())));
+            }
+
+            targets.push_back({
+                {"protocol", protocolName},
+                {"url", url},
+                {"id", deviceId},
+                {"name", friendlyName.empty() ? deviceId : friendlyName},
+                {"supported", controller->IsSupported(rdcstr(url.c_str()))},
+                {"supportsMultiplePrograms", controller->SupportsMultiplePrograms(rdcstr(url.c_str()))},
+            });
+        }
+    }
+
+    return makeResult(id, {{"targets", targets}});
+}
+
+static json handleListAttachTargets(int id, const json &params) {
+    json targets = json::array();
+    if (!g_dll.EnumerateRemoteTargets || !g_dll.CreateTargetControl) {
+        return makeResult(id, {{"targets", targets}});
+    }
+
+    const std::string url = params.value("url", "");
+    uint32_t nextIdent = 0;
+    for (;;) {
+        const uint32_t prevIdent = nextIdent;
+        nextIdent = g_dll.EnumerateRemoteTargets(rdcstr(url.c_str()), nextIdent);
+        if (nextIdent == 0 || nextIdent <= prevIdent) {
+            break;
+        }
+
+        ITargetControl *conn = g_dll.CreateTargetControl(
+            rdcstr(url.c_str()), nextIdent, rdcstr("renderdoc-for-vscode"), false);
+        if (!conn) {
+            continue;
+        }
+
+        json entry = {
+            {"url", url},
+            {"ident", nextIdent},
+            {"pid", conn->GetPID()},
+            {"target", rdcToStr(conn->GetTarget())},
+            {"api", rdcToStr(conn->GetAPI())},
+        };
+        const std::string busy = rdcToStr(conn->GetBusyClient());
+        if (!busy.empty()) {
+            entry["busyClient"] = busy;
+        }
+        targets.push_back(entry);
+        conn->Shutdown();
+    }
+
+    return makeResult(id, {{"targets", targets}});
+}
+
+static json handleLaunchCapture(int id, const json &params) {
+    if (!g_dll.isLoaded())
+        return makeError(id, -1, "DLL not loaded. Call init first.");
+    if (!g_dll.ExecuteAndInject || !g_dll.CreateTargetControl)
+        return makeError(id, -2, "Required RenderDoc launch APIs are unavailable.");
+
+    const std::string url = params.value("url", "");
+    const std::string executable = params.value("executable", "");
+    const std::string workingDir = params.value("workingDir", "");
+    const std::string cmdLine = params.value("cmdLine", "");
+    const std::string captureFileTemplate = params.value("captureFileTemplate", "");
+
+    if (executable.empty())
+        return makeError(id, -3, "executable is required");
+
+    std::string directoryError;
+    if (!ensureParentDirectory(captureFileTemplate, directoryError)) {
+        return makeError(id, -4, "Failed to create capture output directory: " + directoryError);
+    }
+
+    clearLiveTargetSession();
+
+    IRemoteServer *remote = nullptr;
+    ITargetControl *target = nullptr;
+
+    auto cleanup = [&]() {
+        if (target) {
+            target->Shutdown();
+            target = nullptr;
+        }
+        if (remote) {
+            remote->ShutdownConnection();
+            remote = nullptr;
+        }
+    };
+
+    try {
+        emitStatusNote(url.empty() ? "Launching local program..." : "Connecting to remote device...");
+
+        ExecuteResult executeResult = {};
+        rdcarray<EnvironmentModification> env;
+        CaptureOptions options = getDefaultCaptureOptions();
+
+        if (!url.empty()) {
+            std::string remoteError;
+            if (!connectRemoteServer(url, &remote, remoteError)) {
+                cleanup();
+                return makeError(id, -6, "Failed to connect to remote device: " + remoteError);
+            }
+
+            emitStatusNote("Launching remote target for capture...");
+            executeResult = remote->ExecuteAndInject(
+                rdcstr(executable.c_str()),
+                rdcstr(workingDir.c_str()),
+                rdcstr(cmdLine.c_str()),
+                env,
+                options);
+        } else {
+            emitStatusNote("Launching local target for capture...");
+            executeResult = g_dll.ExecuteAndInject(
+                rdcstr(executable.c_str()),
+                rdcstr(workingDir.c_str()),
+                rdcstr(cmdLine.c_str()),
+                env,
+                rdcstr(captureFileTemplate.c_str()),
+                options,
+                false);
+        }
+
+        if (executeResult.result.code != ResultCode::Succeeded) {
+            cleanup();
+            return makeError(id, -7, "Launch failed: " + resultMessage(executeResult.result));
+        }
+
+        emitStatusNote("Waiting for target control connection...");
+        target = waitForTargetControl(url, executeResult.ident, 15000);
+        if (!target) {
+            cleanup();
+            return makeError(id, -8, "Failed to connect to target control for launched process.");
+        }
+
+        g_liveRemote = remote;
+        g_liveTarget = target;
+        g_liveTargetUrl = url;
+        g_liveTargetIdent = executeResult.ident;
+        g_liveTargetLocal = url.empty();
+        g_liveTargetName = rdcToStr(target->GetTarget());
+        g_liveTargetAPI = rdcToStr(target->GetAPI());
+        g_liveTargetPID = target->GetPID();
+        startRemoteKeepAlive(g_liveRemote, g_liveRemoteKeepAlive, g_liveRemotePingThread);
+
+        remote = nullptr;
+        target = nullptr;
+        return makeResult(id, currentLiveTargetJson());
+    } catch (const std::exception &e) {
+        cleanup();
+        clearLiveTargetSession();
+        return makeError(id, -12, e.what());
+    }
+}
+
+static json handleAttachCapture(int id, const json &params) {
+    if (!g_dll.isLoaded())
+        return makeError(id, -1, "DLL not loaded. Call init first.");
+    if (!g_dll.CreateTargetControl)
+        return makeError(id, -2, "RenderDoc target control APIs are unavailable.");
+
+    const std::string url = params.value("url", "");
+    const uint32_t ident = params.value("ident", (uint32_t)0);
+    const uint32_t pid = params.value("pid", (uint32_t)0);
+    const std::string processName = params.value("processName", "");
+    const std::string captureFileTemplate = params.value("captureFileTemplate", "");
+
+    if (url.empty() && (!g_dll.InjectIntoProcess || pid == 0))
+        return makeError(id, -3, "pid is required for local attach capture.");
+    if (!url.empty() && ident == 0)
+        return makeError(id, -4, "ident is required for remote attach capture.");
+
+    std::string directoryError;
+    if (!ensureParentDirectory(captureFileTemplate, directoryError)) {
+        return makeError(id, -5, "Failed to create capture output directory: " + directoryError);
+    }
+
+    clearLiveTargetSession();
+
+    IRemoteServer *remote = nullptr;
+    ITargetControl *target = nullptr;
+
+    auto cleanup = [&]() {
+        if (target) {
+            target->Shutdown();
+            target = nullptr;
+        }
+        if (remote) {
+            remote->ShutdownConnection();
+            remote = nullptr;
+        }
+    };
+
+    try {
+        if (!url.empty()) {
+            emitStatusNote("Connecting to remote device...");
+            std::string remoteError;
+            if (!connectRemoteServer(url, &remote, remoteError)) {
+                cleanup();
+                return makeError(id, -7, "Failed to connect to remote device: " + remoteError);
+            }
+            emitStatusNote("Connecting to remote target...");
+            target = waitForTargetControl(url, ident, 15000);
+            if (!target) {
+                cleanup();
+                return makeError(id, -8, "Failed to connect to the selected remote target.");
+            }
+        } else {
+            emitStatusNote("Injecting into local process...");
+            rdcarray<EnvironmentModification> env;
+            CaptureOptions options = getDefaultCaptureOptions();
+            ExecuteResult injectResult = g_dll.InjectIntoProcess(
+                pid,
+                env,
+                rdcstr(captureFileTemplate.c_str()),
+                options,
+                false);
+            if (injectResult.result.code != ResultCode::Succeeded) {
+                cleanup();
+                return makeError(id, -9, "Attach failed: " + resultMessage(injectResult.result));
+            }
+
+            emitStatusNote("Waiting for target control connection...");
+            target = waitForTargetControl("", injectResult.ident, 15000);
+            if (!target) {
+                cleanup();
+                return makeError(id, -10, "Failed to connect to target control for attached process.");
+            }
+        }
+
+        g_liveRemote = remote;
+        g_liveTarget = target;
+        g_liveTargetUrl = url;
+        g_liveTargetIdent = url.empty() ? 0 : ident;
+        g_liveTargetLocal = url.empty();
+        g_liveTargetName = rdcToStr(target->GetTarget());
+        if (g_liveTargetName.empty()) {
+            g_liveTargetName = processName.empty() ? std::to_string(pid) : processName;
+        }
+        g_liveTargetAPI = rdcToStr(target->GetAPI());
+        g_liveTargetPID = target->GetPID() ? target->GetPID() : pid;
+        startRemoteKeepAlive(g_liveRemote, g_liveRemoteKeepAlive, g_liveRemotePingThread);
+
+        remote = nullptr;
+        target = nullptr;
+        return makeResult(id, currentLiveTargetJson());
+    } catch (const std::exception &e) {
+        cleanup();
+        clearLiveTargetSession();
+        return makeError(id, -13, e.what());
+    }
+}
+
+static json handleGetLiveTarget(int id) {
+    return makeResult(id, currentLiveTargetJson());
+}
+
+static json handleDisconnectLiveTarget(int id) {
+    clearLiveTargetSession();
+    return makeResult(id, {{"disconnected", true}});
+}
+
+static json handleTriggerCapture(int id, const json &params) {
+    if (!g_liveTarget) {
+        return makeError(id, -1, "No live target is connected. Launch or attach first.");
+    }
+
+    const std::string localCopyPath = params.value("localCopyPath", "");
+    const std::string trigger = params.value("trigger", "immediate");
+    const uint32_t frameNumber = params.value("frameNumber", (uint32_t)1);
+    const double delaySeconds = params.value("delaySeconds", 3.0);
+
+    std::string directoryError;
+    if (!ensureParentDirectory(localCopyPath, directoryError)) {
+        return makeError(id, -2, "Failed to create local copy directory: " + directoryError);
+    }
+
+    if (trigger == "delay") {
+        emitStatusNote("Waiting before triggering capture...");
+        std::this_thread::sleep_for(std::chrono::milliseconds((int)std::round(delaySeconds * 1000.0)));
+        emitStatusNote("Triggering capture...");
+        g_liveTarget->TriggerCapture(1);
+    } else if (trigger == "frame") {
+        emitStatusNote("Queueing capture on frame " + std::to_string(frameNumber) + "...");
+        g_liveTarget->QueueCapture(frameNumber, 1);
+    } else {
+        emitStatusNote("Triggering capture...");
+        g_liveTarget->TriggerCapture(1);
+    }
+
+    emitStatusNote("Waiting for capture to complete...");
+    TargetControlMessage captureMessage = {};
+    std::string captureError;
+    if (!waitForCaptureMessage(g_liveTarget, 90, captureMessage, captureError)) {
+        return makeError(id, -3, captureError);
+    }
+
+    std::string finalCapturePath;
+    if (!copyCaptureToLocal(g_liveRemote, captureMessage, localCopyPath, finalCapturePath, captureError)) {
+        return makeError(id, -4, captureError);
+    }
+
+    return makeResult(id, buildTriggerCaptureResponse(captureMessage, finalCapturePath));
 }
 
 // Returns per-event GPU duration in microseconds.
@@ -999,6 +1839,21 @@ static bool encodePNGToMemory(const std::vector<uint8_t> &rgba, uint32_t w, uint
                                    (int)w, (int)h, 4, rgba.data(), stride) != 0;
 }
 
+// Convert a single RGBA channel into a visible grayscale preview.
+// channelExtract: -1=preserve RGBA, 0=R, 1=G, 2=B, 3=A
+static void applyChannelExtractToRGBA(std::vector<uint8_t> &rgba, int channelExtract) {
+    if (channelExtract < 0 || channelExtract > 3) return;
+    const size_t pixelCount = rgba.size() / 4;
+    for (size_t i = 0; i < pixelCount; i++) {
+        uint8_t *px = &rgba[i * 4];
+        const uint8_t value = px[channelExtract];
+        px[0] = value;
+        px[1] = value;
+        px[2] = value;
+        px[3] = 255;
+    }
+}
+
 // GPU-render a texture to PNG via IReplayOutput at its native dimensions.
 // Used as a fallback when SaveTexture fails (e.g. backbuffer / GPU-only resources).
 // Uses IReplayOutput::DrawThumbnail which manages its own internal headless output windows
@@ -1011,10 +1866,17 @@ static bool renderTextureGPU(ResourceId resId, uint32_t mip,
                               std::vector<uint8_t> &pngOut) {
     if (!g_replay || width == 0 || height == 0) return false;
 
-    // We need any valid IReplayOutput to call DrawThumbnail on.
-    // DrawThumbnail manages its own internal headless output windows (cached by size),
-    // so it does not depend on g_overlayOut's main output dimensions.
+    // Keep a persistent headless output at the requested dimensions.
     if (!g_overlayOut) {
+        WindowingData win = CreateHeadlessWindowingData((int32_t)width, (int32_t)height);
+        g_overlayOut = g_replay->CreateOutput(win, ReplayOutputType::Texture);
+        if (!g_overlayOut) return false;
+        g_overlayW = (int32_t)width;
+        g_overlayH = (int32_t)height;
+    }
+
+    if (g_overlayW != (int32_t)width || g_overlayH != (int32_t)height) {
+        g_overlayOut->Shutdown();
         WindowingData win = CreateHeadlessWindowingData((int32_t)width, (int32_t)height);
         g_overlayOut = g_replay->CreateOutput(win, ReplayOutputType::Texture);
         if (!g_overlayOut) return false;
@@ -1027,39 +1889,58 @@ static bool renderTextureGPU(ResourceId resId, uint32_t mip,
     sub.slice  = 0;
     sub.sample = (samples > 1) ? TextureDisplay::ResolveSamples : 0u;
 
-    // DrawThumbnail: creates/reuses a headless output of the requested size, renders the texture
-    // using RenderTexture (same GL shader path as the GUI viewer), then reads back RGB pixels.
-    // For depth textures it automatically detects depthMode and renders depth into the R channel.
-    // Returns tightly-packed RGB (3 bytes/pixel), or empty on failure.
-    bytebuf pixels = g_overlayOut->DrawThumbnail((int32_t)width, (int32_t)height,
-                                                  resId, sub, CompType::Typeless);
-    fprintf(stderr, "[bridge] DrawThumbnail: %ux%u -> %zu bytes\n", width, height, pixels.size());
+    TextureDisplay disp = {};
+    disp.resourceId           = resId;
+    disp.typeCast             = CompType::Typeless;
+    disp.scale                = 1.0f;
+    disp.red                  = (channelExtract < 0 || channelExtract == 0);
+    disp.green                = (channelExtract < 0 || channelExtract == 1);
+    disp.blue                 = (channelExtract < 0 || channelExtract == 2);
+    disp.alpha                = (channelExtract == 3);
+    disp.flipY                = false;
+    disp.hdrMultiplier        = -1.0f;
+    disp.linearDisplayAsGamma = true;
+    disp.rangeMin             = 0.0f;
+    disp.rangeMax             = 1.0f;
+    disp.subresource          = sub;
+    disp.overlay              = DebugOverlay::NoOverlay;
+
+    g_overlayOut->SetTextureDisplay(disp);
+    g_overlayOut->Display();
+    bytebuf pixels = g_overlayOut->ReadbackOutputTexture();
+    fprintf(stderr, "[bridge] ReadbackOutputTexture: %ux%u -> %zu bytes (channel=%d)\n",
+            width, height, pixels.size(), channelExtract);
     if (pixels.empty()) return false;
-    if (pixels.size() < (size_t)width * height * 3) return false;
 
+    const size_t pixelCount = (size_t)width * height;
+    const bool rgbaReadback = pixels.size() >= pixelCount * 4;
+    const bool rgbReadback = pixels.size() >= pixelCount * 3;
+    if (!rgbaReadback && !rgbReadback) return false;
+
+    std::vector<uint8_t> rgba(pixelCount * 4, 255);
     const uint8_t* src = pixels.data();
-    std::vector<uint8_t> rgb(width * height * 3);
 
-    if (channelExtract >= 0 && channelExtract < 3) {
-        // Extract a single RGB channel to grayscale.
-        for (uint32_t i = 0; i < width * height; i++) {
-            uint8_t v = src[i * 3 + channelExtract];
-            rgb[i * 3 + 0] = rgb[i * 3 + 1] = rgb[i * 3 + 2] = v;
-        }
-    } else if (isDepthFmt) {
-        // DrawThumbnail renders depth into R only (G=B=0). Copy R to G and B for grayscale.
-        for (uint32_t i = 0; i < width * height; i++) {
-            uint8_t v = src[i * 3 + 0];
-            rgb[i * 3 + 0] = rgb[i * 3 + 1] = rgb[i * 3 + 2] = v;
+    if (rgbaReadback) {
+        memcpy(rgba.data(), src, pixelCount * 4);
+        if (channelExtract >= 0) {
+            applyChannelExtractToRGBA(rgba, channelExtract);
         }
     } else {
-        memcpy(rgb.data(), src, width * height * 3);
+        for (size_t i = 0; i < pixelCount; i++) {
+            rgba[i * 4 + 0] = src[i * 3 + 0];
+            rgba[i * 4 + 1] = src[i * 3 + 1];
+            rgba[i * 4 + 2] = src[i * 3 + 2];
+            rgba[i * 4 + 3] = 255;
+        }
+        if (channelExtract >= 0) {
+            const int sourceChannel = channelExtract == 3 ? 0 : channelExtract;
+            applyChannelExtractToRGBA(rgba, sourceChannel);
+        } else if (isDepthFmt) {
+            applyChannelExtractToRGBA(rgba, 0);
+        }
     }
 
-    pngOut.clear();
-    return stbi_write_png_to_func(stbiWriteToVector, &pngOut,
-                                   (int)width, (int)height, 3,
-                                   rgb.data(), (int)width * 3) != 0;
+    return encodePNGToMemory(rgba, width, height, pngOut);
 }
 
 static json handleGetTexturePreview(int id, const json &params) {
@@ -1134,6 +2015,9 @@ static json handleGetTexturePreview(int id, const json &params) {
                 if (decompressASTCNative(rawData.data(), rawData.size(),
                                           width, height, blockW, blockH,
                                           isSRGB, rgba)) {
+                    if (channelExtract >= 0) {
+                        applyChannelExtractToRGBA(rgba, channelExtract);
+                    }
                     if (encodePNGToMemory(rgba, width, height, pngData)) {
                         usedASTCFallback = true;
                         fprintf(stderr, "[bridge] ASTC decoded: %ux%u block=%dx%d srgb=%d\n",
@@ -1299,7 +2183,29 @@ static json handleGetPipelineState(int id, const json &params) {
     // Vertex input (index buffer + vertex buffers)
     json vertexInput = json::object();
     json vertexBuffers = json::array();
+    json vertexAttributes = json::array();
     uint64_t indexBuffer = 0;
+    uint32_t indexByteStride = 0;
+    std::string topologyName;
+    bool primitiveRestartEnabled = false;
+    uint32_t primitiveRestartIndex = 0;
+
+    auto topologyStr = [](Topology t) -> const char * {
+        switch(t) {
+            case Topology::Unknown: return "Unknown";
+            case Topology::PointList: return "PointList";
+            case Topology::LineList: return "LineList";
+            case Topology::LineStrip: return "LineStrip";
+            case Topology::TriangleList: return "TriangleList";
+            case Topology::TriangleStrip: return "TriangleStrip";
+            case Topology::LineList_Adj: return "LineListAdj";
+            case Topology::LineStrip_Adj: return "LineStripAdj";
+            case Topology::TriangleList_Adj: return "TriangleListAdj";
+            case Topology::TriangleStrip_Adj: return "TriangleStripAdj";
+            case Topology::PatchList: return "PatchList";
+            default: return "Other";
+        }
+    };
 
     // Try each API
     const auto *gl = g_replay->GetGLPipelineState();
@@ -1328,6 +2234,10 @@ static json handleGetPipelineState(int id, const json &params) {
 
         if (gl->vertexInput.indexBuffer != ResourceId())
             indexBuffer = resIdToU64(gl->vertexInput.indexBuffer);
+        indexByteStride = gl->vertexInput.indexByteStride;
+        topologyName = topologyStr(gl->vertexInput.topology);
+        primitiveRestartEnabled = gl->vertexInput.primitiveRestart;
+        primitiveRestartIndex = gl->vertexInput.restartIndex;
         for (const auto &vb : gl->vertexInput.vertexBuffers) {
             if (vb.resourceId != ResourceId()) {
                 vertexBuffers.push_back({
@@ -1336,6 +2246,25 @@ static json handleGetPipelineState(int id, const json &params) {
                     {"offset", (uint64_t)vb.byteOffset},
                 });
             }
+        }
+        const ShaderReflection *refl = gl->vertexShader.reflection;
+        for (size_t i = 0; i < gl->vertexInput.attributes.size(); i++) {
+            const auto &attr = gl->vertexInput.attributes[i];
+            std::string attrName = "attr" + std::to_string(i);
+            if (refl && attr.boundShaderInput >= 0 && (size_t)attr.boundShaderInput < refl->inputSignature.size()) {
+                attrName = rdcToStr(refl->inputSignature[attr.boundShaderInput].varName);
+            }
+            vertexAttributes.push_back({
+                {"name", attrName},
+                {"location", attr.boundShaderInput},
+                {"slot", attr.vertexBufferSlot},
+                {"format", formatToStr(attr.format)},
+                {"offset", attr.byteOffset},
+                {"enabled", attr.enabled},
+                {"perInstance", (size_t)attr.vertexBufferSlot < gl->vertexInput.vertexBuffers.size() ? gl->vertexInput.vertexBuffers[attr.vertexBufferSlot].instanceDivisor > 0 : false},
+                {"instanceRate", (size_t)attr.vertexBufferSlot < gl->vertexInput.vertexBuffers.size() ? gl->vertexInput.vertexBuffers[attr.vertexBufferSlot].instanceDivisor : 0},
+                {"used", true},
+            });
         }
     }
     const auto *vk = g_replay->GetVulkanPipelineState();
@@ -1354,6 +2283,10 @@ static json handleGetPipelineState(int id, const json &params) {
         }
         if (vk->inputAssembly.indexBuffer.resourceId != ResourceId())
             indexBuffer = resIdToU64(vk->inputAssembly.indexBuffer.resourceId);
+        indexByteStride = vk->inputAssembly.indexBuffer.byteStride;
+        topologyName = topologyStr(vk->inputAssembly.topology);
+        primitiveRestartEnabled = vk->inputAssembly.primitiveRestartEnable;
+        primitiveRestartIndex = primitiveRestartEnabled ? (indexByteStride == 2 ? 0xFFFFu : 0xFFFFFFFFu) : 0;
         for (const auto &vb : vk->vertexInput.vertexBuffers) {
             if (vb.resourceId != ResourceId()) {
                 vertexBuffers.push_back({
@@ -1362,6 +2295,40 @@ static json handleGetPipelineState(int id, const json &params) {
                     {"offset", (uint64_t)vb.byteOffset},
                 });
             }
+        }
+        const ShaderReflection *refl = vk->vertexShader.reflection;
+        for (size_t i = 0; i < vk->vertexInput.attributes.size(); i++) {
+            const auto &attr = vk->vertexInput.attributes[i];
+            std::string attrName = "attr" + std::to_string(i);
+            bool used = true;
+            if (refl) {
+                used = false;
+                for (const auto &sig : refl->inputSignature) {
+                    if (sig.regIndex == attr.location && sig.systemValue == ShaderBuiltin::Undefined) {
+                        attrName = rdcToStr(sig.varName);
+                        used = true;
+                        break;
+                    }
+                }
+            }
+            bool perInstance = false;
+            uint32_t instanceRate = 1;
+            if ((size_t)attr.binding < vk->vertexInput.bindings.size()) {
+                const auto &binding = vk->vertexInput.bindings[attr.binding];
+                perInstance = binding.perInstance;
+                instanceRate = binding.instanceDivisor;
+            }
+            vertexAttributes.push_back({
+                {"name", attrName},
+                {"location", attr.location},
+                {"slot", attr.binding},
+                {"format", formatToStr(attr.format)},
+                {"offset", attr.byteOffset},
+                {"enabled", true},
+                {"perInstance", perInstance},
+                {"instanceRate", instanceRate},
+                {"used", used},
+            });
         }
     }
     const auto *d11 = g_replay->GetD3D11PipelineState();
@@ -1383,6 +2350,8 @@ static json handleGetPipelineState(int id, const json &params) {
 
         if (d11->inputAssembly.indexBuffer.resourceId != ResourceId())
             indexBuffer = resIdToU64(d11->inputAssembly.indexBuffer.resourceId);
+        indexByteStride = d11->inputAssembly.indexBuffer.byteStride;
+        topologyName = topologyStr(d11->inputAssembly.topology);
         for (const auto &vb : d11->inputAssembly.vertexBuffers) {
             if (vb.resourceId != ResourceId()) {
                 vertexBuffers.push_back({
@@ -1391,6 +2360,39 @@ static json handleGetPipelineState(int id, const json &params) {
                     {"offset", (uint64_t)vb.byteOffset},
                 });
             }
+        }
+        const ShaderReflection *refl = d11->inputAssembly.bytecode ? (const ShaderReflection *)d11->inputAssembly.bytecode : nullptr;
+        uint32_t byteOffs[128] = {};
+        for (size_t i = 0; i < d11->inputAssembly.layouts.size(); i++) {
+            const auto &layout = d11->inputAssembly.layouts[i];
+            uint32_t offset = layout.byteOffset;
+            if (offset == UINT32_MAX) {
+                offset = byteOffs[layout.inputSlot];
+            } else {
+                byteOffs[layout.inputSlot] = offset;
+            }
+            byteOffs[layout.inputSlot] += (uint32_t)layout.format.compByteWidth * (uint32_t)layout.format.compCount;
+            bool used = false;
+            if (refl) {
+                for (const auto &sig : refl->inputSignature) {
+                    if (sig.semanticName == layout.semanticName && sig.semanticIndex == layout.semanticIndex) {
+                        used = true;
+                        break;
+                    }
+                }
+            }
+            std::string attrName = rdcToStr(layout.semanticName) + (layout.semanticIndex > 0 ? std::to_string(layout.semanticIndex) : "");
+            vertexAttributes.push_back({
+                {"name", attrName},
+                {"location", layout.semanticIndex},
+                {"slot", layout.inputSlot},
+                {"format", formatToStr(layout.format)},
+                {"offset", offset},
+                {"enabled", true},
+                {"perInstance", layout.perInstance},
+                {"instanceRate", layout.instanceDataStepRate},
+                {"used", used},
+            });
         }
     }
     const auto *d12 = g_replay->GetD3D12PipelineState();
@@ -1412,6 +2414,10 @@ static json handleGetPipelineState(int id, const json &params) {
 
         if (d12->inputAssembly.indexBuffer.resourceId != ResourceId())
             indexBuffer = resIdToU64(d12->inputAssembly.indexBuffer.resourceId);
+        indexByteStride = d12->inputAssembly.indexBuffer.byteStride;
+        topologyName = topologyStr(d12->inputAssembly.topology);
+        primitiveRestartEnabled = d12->inputAssembly.indexStripCutValue != 0;
+        primitiveRestartIndex = d12->inputAssembly.indexStripCutValue;
         for (const auto &vb : d12->inputAssembly.vertexBuffers) {
             if (vb.resourceId != ResourceId()) {
                 vertexBuffers.push_back({
@@ -1420,6 +2426,39 @@ static json handleGetPipelineState(int id, const json &params) {
                     {"offset", (uint64_t)vb.byteOffset},
                 });
             }
+        }
+        const ShaderReflection *refl = d12->vertexShader.reflection;
+        uint32_t byteOffs[128] = {};
+        for (size_t i = 0; i < d12->inputAssembly.layouts.size(); i++) {
+            const auto &layout = d12->inputAssembly.layouts[i];
+            uint32_t offset = layout.byteOffset;
+            if (offset == UINT32_MAX) {
+                offset = byteOffs[layout.inputSlot];
+            } else {
+                byteOffs[layout.inputSlot] = offset;
+            }
+            byteOffs[layout.inputSlot] += (uint32_t)layout.format.compByteWidth * (uint32_t)layout.format.compCount;
+            bool used = false;
+            if (refl) {
+                for (const auto &sig : refl->inputSignature) {
+                    if (sig.semanticName == layout.semanticName && sig.semanticIndex == layout.semanticIndex) {
+                        used = true;
+                        break;
+                    }
+                }
+            }
+            std::string attrName = rdcToStr(layout.semanticName) + (layout.semanticIndex > 0 ? std::to_string(layout.semanticIndex) : "");
+            vertexAttributes.push_back({
+                {"name", attrName},
+                {"location", layout.semanticIndex},
+                {"slot", layout.inputSlot},
+                {"format", formatToStr(layout.format)},
+                {"offset", offset},
+                {"enabled", true},
+                {"perInstance", layout.perInstance},
+                {"instanceRate", layout.instanceDataStepRate},
+                {"used", used},
+            });
         }
     }
 
@@ -1445,6 +2484,12 @@ static json handleGetPipelineState(int id, const json &params) {
 
     vertexInput["vertexBuffers"] = vertexBuffers;
     if (indexBuffer != 0) vertexInput["indexBuffer"] = indexBuffer;
+    if (indexByteStride != 0) vertexInput["indexStride"] = indexByteStride;
+    if (!topologyName.empty()) vertexInput["topology"] = topologyName;
+    vertexInput["primitiveRestart"] = primitiveRestartEnabled;
+    if (primitiveRestartEnabled)
+        vertexInput["restartIndex"] = primitiveRestartIndex;
+    vertexInput["attributes"] = vertexAttributes;
     result["vertexInput"] = vertexInput;
 
     // Bound read-only textures (sampler bindings) at the current event.
@@ -2560,6 +3605,7 @@ static json handleGetMeshData(int id, const json &params) {
 }
 
 static json handleShutdown(int id) {
+    clearLiveTargetSession();
     if (g_thumbOut) { g_thumbOut->Shutdown(); g_thumbOut = nullptr; }
     g_overlayOut = nullptr; g_overlayW = 0; g_overlayH = 0;
     if (g_replay) { g_replay->Shutdown(); g_replay = nullptr; }
@@ -2694,6 +3740,14 @@ static json dispatch(const json &req) {
         if (method == "getRootActions")     return handleGetRootActions(id);
         if (method == "getResources")       return handleGetResources(id);
         if (method == "getTextures")        return handleGetTextures(id);
+        if (method == "getCaptureStatistics") return handleGetCaptureStatistics(id);
+        if (method == "listCaptureTargets") return handleListCaptureTargets(id);
+        if (method == "listAttachTargets")  return handleListAttachTargets(id, params);
+        if (method == "launchCapture")      return handleLaunchCapture(id, params);
+        if (method == "attachCapture")      return handleAttachCapture(id, params);
+        if (method == "getLiveTarget")      return handleGetLiveTarget(id);
+        if (method == "triggerCapture")     return handleTriggerCapture(id, params);
+        if (method == "disconnectLiveTarget") return handleDisconnectLiveTarget(id);
         if (method == "getTimings")          return handleGetTimings(id);
         if (method == "getDisassemblyTargets") return handleGetDisassemblyTargets(id);
         if (method == "getShaderEntryPoints") return handleGetShaderEntryPoints(id, params);

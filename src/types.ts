@@ -1,5 +1,105 @@
 /** Shared type definitions for the extension */
 
+export interface CaptureStatisticsApiSummary {
+    indexVertexSets: number;
+    constantSets: number;
+    samplerSets: number;
+    resourceSets: number;
+    shaderSets: number;
+    blendSets: number;
+    depthStencilSets: number;
+    rasterizationSets: number;
+    resourceUpdates: number;
+    outputSets: number;
+}
+
+export interface CaptureStatistics {
+    compressedFileSize: number;
+    uncompressedFileSize: number;
+    persistentSize: number;
+    initDataSize: number;
+    drawCount: number;
+    dispatchCount: number;
+    apiCallCount: number;
+    apiDrawDispatchRatio: number;
+    textureCount: number;
+    textureBytes: number;
+    largeTextureBytes: number;
+    renderTargetCount: number;
+    renderTargetBytes: number;
+    avgTextureWidth: number;
+    avgTextureHeight: number;
+    avgLargeTextureWidth: number;
+    avgLargeTextureHeight: number;
+    bufferCount: number;
+    bufferBytes: number;
+    indexBufferBytes: number;
+    vertexBufferBytes: number;
+    totalGpuBytes: number;
+    renderTargetSwitches: number;
+    estimatedGpuTimeAvailable?: boolean;
+    estimatedGpuTimeUs?: number;
+    apiSummary?: CaptureStatisticsApiSummary;
+}
+
+export interface CaptureLaunchTarget {
+    protocol: string;
+    url: string;
+    id: string;
+    name: string;
+    supported: boolean;
+    supportsMultiplePrograms: boolean;
+}
+
+export interface CaptureAttachTarget {
+    url: string;
+    ident: number;
+    pid: number;
+    target: string;
+    api: string;
+    busyClient?: string;
+}
+
+export interface LaunchCaptureOptions {
+    url?: string;
+    executable: string;
+    workingDir?: string;
+    cmdLine?: string;
+    captureFileTemplate?: string;
+}
+
+export interface AttachCaptureOptions {
+    url?: string;
+    ident?: number;
+    pid?: number;
+    processName?: string;
+    captureFileTemplate?: string;
+}
+
+export interface TriggerCaptureOptions {
+    localCopyPath: string;
+    trigger: 'immediate' | 'frame' | 'delay';
+    frameNumber?: number;
+    delaySeconds?: number;
+}
+
+export interface LiveTargetInfo {
+    target: string;
+    api?: string;
+    pid?: number;
+    ident?: number;
+    url?: string;
+    local: boolean;
+}
+
+export interface LaunchCaptureResult extends LiveTargetInfo {
+}
+
+export interface TriggerCaptureResult extends LiveTargetInfo {
+    capturePath: string;
+    frameNumber?: number;
+}
+
 export interface CaptureInfo {
     filePath: string;
     api: string;
@@ -10,6 +110,7 @@ export interface CaptureInfo {
     frameCount: number;
     sectionCount: number;
     sections: SectionInfo[];
+    statistics?: CaptureStatistics;
 }
 
 export interface SectionInfo {

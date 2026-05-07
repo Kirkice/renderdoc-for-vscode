@@ -149,6 +149,13 @@ export interface MsgMaliAnalysisResult {
     error?: string;
 }
 
+export interface MsgTimingsLoaded {
+    type: 'timingsLoaded';
+    timings: Record<string, number>;
+    available: boolean;
+    error?: string;
+}
+
 export type ExtensionToWebviewMessage =
     | MsgCaptureLoaded
     | MsgEventChanged
@@ -156,4 +163,5 @@ export type ExtensionToWebviewMessage =
     | MsgPipelineLoaded
     | MsgTexturePreview
     | MsgMeshLoaded
-    | MsgMaliAnalysisResult;
+    | MsgMaliAnalysisResult
+    | MsgTimingsLoaded;

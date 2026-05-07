@@ -49,6 +49,22 @@ Click any draw to see **only the textures that draw actually samples** — rende
 </td>
 <td width="50%" valign="top">
 
+### Launch And Capture
+Start a **local Windows executable** or a **supported remote device target** directly from VS Code, trigger a frame capture, and auto-open the resulting `.rdc`.
+
+The extension now exposes a dedicated **Capture Target** sidebar view for switching between **Local** and connected devices, plus a **Launch Application** panel for configuring the program/package, arguments, output path, and trigger settings.
+
+</td>
+</tr>
+<tr>
+<td width="50%" valign="top">
+
+### Attach And Capture
+Inject into a **running Windows process** or connect to an already running **remote RenderDoc target**, trigger a capture, and open the resulting frame in the inspector.
+
+</td>
+<td width="50%" valign="top">
+
 ### Native Replay Bridge
 A C++ bridge (`renderdoc_bridge.exe`) links directly to RenderDoc's replay DLL — delivering real pipeline state, shader disassembly, descriptor enumeration, and mesh data at native speed.
 
@@ -174,7 +190,7 @@ Analyze any shader directly from the Inspector's Shaders tab using the **Mali Of
 
 ```
 1. Install the extension in VS Code 1.95+
-2. File → Open File… → select your .rdc capture
+2. Run `RenderDoc: Launch Program And Capture`, `RenderDoc: Attach To Process And Capture`, or open an existing `.rdc`
 3. The RenderDoc sidebar appears automatically
 4. Click any draw call → Inspector opens beside your editor
 5. Run "Fetch GPU Timings" to populate durationUs per draw
@@ -218,6 +234,8 @@ For non-default paths, run **`RenderDoc: Configure RenderDoc Path`** or set `ren
 ### 3 · Opening a Capture
 
 - **File explorer:** right-click a `.rdc` → **Open RDC Capture**
+- **Command palette:** run **RenderDoc: Launch Program And Capture** to launch a Windows executable or a supported remote device target, then auto-open the captured frame
+- **Command palette:** run **RenderDoc: Attach To Process And Capture** to inject into a running Windows process or capture an already running remote RenderDoc target
 - **Command palette:** `RenderDoc: Open RDC Capture`
 - **Drag & drop** a `.rdc` onto the VS Code window
 

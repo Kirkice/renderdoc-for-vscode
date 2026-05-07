@@ -141,7 +141,94 @@ export const GetTimingsResponse = z.object({
     count: z.number(),
 });
 
+export const CaptureStatisticsApiSummary = z.object({
+    indexVertexSets: z.number(),
+    constantSets: z.number(),
+    samplerSets: z.number(),
+    resourceSets: z.number(),
+    shaderSets: z.number(),
+    blendSets: z.number(),
+    depthStencilSets: z.number(),
+    rasterizationSets: z.number(),
+    resourceUpdates: z.number(),
+    outputSets: z.number(),
+});
+
+export const GetCaptureStatisticsResponse = z.object({
+    compressedFileSize: z.number(),
+    uncompressedFileSize: z.number(),
+    persistentSize: z.number(),
+    initDataSize: z.number(),
+    drawCount: z.number(),
+    dispatchCount: z.number(),
+    apiCallCount: z.number(),
+    apiDrawDispatchRatio: z.number(),
+    textureCount: z.number(),
+    textureBytes: z.number(),
+    largeTextureBytes: z.number(),
+    renderTargetCount: z.number(),
+    renderTargetBytes: z.number(),
+    avgTextureWidth: z.number(),
+    avgTextureHeight: z.number(),
+    avgLargeTextureWidth: z.number(),
+    avgLargeTextureHeight: z.number(),
+    bufferCount: z.number(),
+    bufferBytes: z.number(),
+    indexBufferBytes: z.number(),
+    vertexBufferBytes: z.number(),
+    totalGpuBytes: z.number(),
+    renderTargetSwitches: z.number(),
+    estimatedGpuTimeAvailable: z.boolean().optional(),
+    estimatedGpuTimeUs: z.number().optional(),
+    apiSummary: CaptureStatisticsApiSummary.optional(),
+});
+
+export const CaptureLaunchTarget = z.object({
+    protocol: z.string(),
+    url: z.string(),
+    id: z.string(),
+    name: z.string(),
+    supported: z.boolean(),
+    supportsMultiplePrograms: z.boolean(),
+});
+
+export const CaptureAttachTarget = z.object({
+    url: z.string(),
+    ident: z.number(),
+    pid: z.number(),
+    target: z.string(),
+    api: z.string(),
+    busyClient: z.string().optional(),
+});
+
+export const ListCaptureTargetsResponse = z.object({
+    targets: z.array(CaptureLaunchTarget),
+});
+
+export const ListAttachTargetsResponse = z.object({
+    targets: z.array(CaptureAttachTarget),
+});
+
+export const LiveTargetInfoResponse = z.object({
+    target: z.string(),
+    api: z.string().optional(),
+    pid: z.number().optional(),
+    ident: z.number().optional(),
+    url: z.string().optional(),
+    local: z.boolean(),
+});
+
+export const TriggerCaptureResponse = LiveTargetInfoResponse.extend({
+    capturePath: z.string(),
+    frameNumber: z.number().optional(),
+});
+
 export type TGetTimingsResponse = z.infer<typeof GetTimingsResponse>;
+export type TGetCaptureStatisticsResponse = z.infer<typeof GetCaptureStatisticsResponse>;
+export type TListCaptureTargetsResponse = z.infer<typeof ListCaptureTargetsResponse>;
+export type TListAttachTargetsResponse = z.infer<typeof ListAttachTargetsResponse>;
+export type TLiveTargetInfoResponse = z.infer<typeof LiveTargetInfoResponse>;
+export type TTriggerCaptureResponse = z.infer<typeof TriggerCaptureResponse>;
 
 export const GetDisassemblyTargetsResponse = z.object({
     targets: z.array(z.string()),
@@ -208,6 +295,9 @@ export type TGetShaderSourceForEventResponse = z.infer<typeof GetShaderSourceFor
 export type TGetTexturePreviewResponse   = z.infer<typeof GetTexturePreviewResponse>;
 export type TSaveTextureResponse         = z.infer<typeof SaveTextureResponse>;
 export type TGetPipelineStateResponse    = z.infer<typeof GetPipelineStateResponse>;
+export type TCaptureStatisticsApiSummary = z.infer<typeof CaptureStatisticsApiSummary>;
+export type TCaptureLaunchTarget         = z.infer<typeof CaptureLaunchTarget>;
+export type TCaptureAttachTarget         = z.infer<typeof CaptureAttachTarget>;
 
 /**
  * Runtime-validate a native bridge response. On failure, throws an Error

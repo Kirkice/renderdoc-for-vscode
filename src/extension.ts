@@ -1,11 +1,27 @@
 import * as vscode from 'vscode';
+import * as cp from 'child_process';
 import * as fs from 'fs';
 import * as path from 'path';
 import { RenderDocBridge } from './renderdocBridge';
-import { CaptureInfo, DrawCall, ResourceInfo } from './types';
+import {
+    AttachCaptureOptions,
+    CaptureAttachTarget,
+    CaptureInfo,
+    CaptureLaunchTarget,
+    DrawCall,
+    LiveTargetInfo,
+    LaunchCaptureOptions,
+    LaunchCaptureResult,
+    ResourceInfo,
+    TriggerCaptureOptions,
+} from './types';
+import { LaunchTargetState } from './launchTargetState';
 import { CaptureInfoProvider } from './views/captureInfoProvider';
 import { DrawCallProvider } from './views/drawCallProvider';
 import { ApiInspectorProvider } from './views/apiInspectorProvider';
+import { LaunchTargetViewProvider } from './views/launchTargetView';
+import { LaunchApplicationPanel, type LaunchFormState } from './views/launchApplicationPanel';
+import { CaptureResultPanel } from './views/captureResultPanel';
 import { ResourceProvider } from './views/resourceProvider';
 import { ThumbnailPanel } from './views/thumbnailPanel';
 import { InspectorPanel } from './views/inspectorPanel';
@@ -27,6 +43,7 @@ let captureInfoProvider: CaptureInfoProvider;
 let drawCallProvider: DrawCallProvider;
 let apiInspectorProvider: ApiInspectorProvider;
 let resourceProvider: ResourceProvider;
+let launchTargetState: LaunchTargetState;
 let currentCapturePath: string | undefined;
 
 // ── Selection tracking (for Copilot context) ──
@@ -36,15 +53,575 @@ let currentDrawCalls: DrawCall[] = [];
 let currentResources: ResourceInfo[] = [];
 let shaderAliasScanGeneration = 0;
 
+type ExclusiveRenderDocPanel = 'thumbnail' | 'inspector' | 'captureResult';
+
+function closeExclusiveRenderDocPanels(active: ExclusiveRenderDocPanel) {
+    if (active !== 'thumbnail' && ThumbnailPanel.currentPanel) {
+        ThumbnailPanel.currentPanel.dispose();
+    }
+    if (active !== 'inspector' && InspectorPanel.currentPanel) {
+        InspectorPanel.currentPanel.disposePanel();
+    }
+    if (active !== 'captureResult') {
+        CaptureResultPanel.closeCurrent();
+    }
+}
+
 // Path of the capture currently known to the native bridge process.
 // Used to force-restart the bridge before loading a different capture,
 // because some backends (GL/ANGLE) crash when a second capture is opened
 // in the same process after a prior replay was torn down.
 let bridgeLoadedCapturePath: string | undefined;
 
+const LAST_LAUNCH_CAPTURE_STATE_KEY = 'renderdoc.lastLaunchCaptureState';
+const LAST_ATTACH_CAPTURE_STATE_KEY = 'renderdoc.lastAttachCaptureState';
+const SAVED_CAPTURE_PATHS_KEY = 'renderdoc.savedCapturePaths';
+
+type StoredLaunchCaptureState = {
+    targetKind?: 'local' | 'device';
+    targetUrl?: string;
+    executable?: string;
+    workingDir?: string;
+    cmdLine?: string;
+};
+
+type StoredAttachCaptureState = {
+    mode?: 'local' | 'remote';
+    targetUrl?: string;
+    processName?: string;
+    pid?: number;
+};
+
+const LAST_TRIGGER_CAPTURE_STATE_KEY = 'renderdoc.lastTriggerCaptureState';
+
+function delay(ms: number): Promise<void> {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function loadReplayDataWithRetry(
+    filePath: string,
+    token?: vscode.CancellationToken,
+    progress?: vscode.Progress<{ message?: string; increment?: number }>,
+): Promise<{ drawCalls: DrawCall[]; resources: ResourceInfo[] }> {
+    const maxAttempts = 4;
+    let lastError: any;
+
+    for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+        if (token?.isCancellationRequested) {
+            throw new Error('Capture loading cancelled.');
+        }
+
+        try {
+            const drawCalls = await bridge.getDrawCalls(filePath);
+            const resources = await bridge.getResources(filePath);
+
+            // A newly opened replay can transiently report an empty action tree.
+            // Give it a couple of short retries before surfacing an empty EventBrowser.
+            if (drawCalls.length > 0 || attempt === maxAttempts) {
+                return { drawCalls, resources };
+            }
+
+            lastError = new Error('Replay returned no draw calls yet.');
+        } catch (err: any) {
+            lastError = err;
+        }
+
+        if (attempt < maxAttempts) {
+            progress?.report({ message: `Waiting for replay data... (${attempt + 1}/${maxAttempts})` });
+            await delay(250 * attempt);
+        }
+    }
+
+    throw lastError || new Error('Failed to load replay data.');
+}
+
+type CaptureTriggerOptions = {
+    trigger: 'immediate' | 'frame' | 'delay';
+    frameNumber?: number;
+    delaySeconds?: number;
+};
+
+type LocalProcessInfo = {
+    pid: number;
+    processName: string;
+    path?: string;
+};
+
+function execFileText(file: string, args: readonly string[]): Promise<string> {
+    return new Promise((resolve, reject) => {
+        cp.execFile(file, args, { maxBuffer: 16 * 1024 * 1024 }, (error, stdout, stderr) => {
+            if (error) {
+                reject(new Error(stderr?.trim() || error.message));
+                return;
+            }
+            resolve(stdout);
+        });
+    });
+}
+
+function isAndroidLikeTarget(target: CaptureLaunchTarget): boolean {
+    const probe = `${target.protocol} ${target.url} ${target.id} ${target.name}`.toLowerCase();
+    return probe.includes('adb') || probe.includes('android');
+}
+
+async function findAdbExecutable(): Promise<string | undefined> {
+    try {
+        await execFileText('adb', ['version']);
+        return 'adb';
+    } catch {
+        // fall through
+    }
+
+    try {
+        if (process.platform === 'win32') {
+            const out = await execFileText('where.exe', ['adb']);
+            const first = out.split(/\r?\n/).map((line) => line.trim()).find(Boolean);
+            return first || undefined;
+        }
+        const out = await execFileText('which', ['adb']);
+        const first = out.split(/\r?\n/).map((line) => line.trim()).find(Boolean);
+        return first || undefined;
+    } catch {
+        return undefined;
+    }
+}
+
+async function listAndroidPackages(adbPath: string, serial: string): Promise<string[]> {
+    const args = serial ? ['-s', serial, 'shell', 'pm', 'list', 'packages', '-3'] : ['shell', 'pm', 'list', 'packages', '-3'];
+    const out = await execFileText(adbPath, args);
+    return out
+        .split(/\r?\n/)
+        .map((line) => line.trim())
+        .filter(Boolean)
+        .map((line) => line.replace(/^package:/, '').trim())
+        .filter(Boolean)
+        .sort((a, b) => a.localeCompare(b));
+}
+
+async function resolveAndroidLaunchActivity(adbPath: string, serial: string, packageName: string): Promise<string | undefined> {
+    const args = serial
+        ? ['-s', serial, 'shell', 'cmd', 'package', 'resolve-activity', '--brief', packageName]
+        : ['shell', 'cmd', 'package', 'resolve-activity', '--brief', packageName];
+    const out = await execFileText(adbPath, args);
+    const lines = out
+        .split(/\r?\n/)
+        .map((line) => line.trim())
+        .filter(Boolean);
+    const activityLine = [...lines].reverse().find((line) => line.includes('/'));
+    return activityLine || undefined;
+}
+
+async function chooseAndroidPackageActivity(target: CaptureLaunchTarget, initialValue = ''): Promise<string | undefined> {
+    const mode = await vscode.window.showQuickPick([
+        {
+            label: 'Browse Installed Packages',
+            description: 'Use adb to choose an installed package and resolve its launcher activity',
+            value: 'browse' as const,
+        },
+        {
+            label: 'Manual Entry',
+            description: 'Type package/activity yourself',
+            value: 'manual' as const,
+        },
+    ], {
+        title: 'Android Target',
+        placeHolder: 'Choose how to specify the Android launch target',
+    });
+
+    if (!mode) {
+        return undefined;
+    }
+
+    if (mode.value === 'manual') {
+        return await vscode.window.showInputBox({
+            title: 'Android Package / Activity',
+            prompt: 'Package and activity to launch on the device',
+            placeHolder: 'com.example.game/.MainActivity',
+            value: initialValue,
+            validateInput: (input) => input.trim() ? undefined : 'Enter a package/activity.',
+        });
+    }
+
+    const adbPath = await findAdbExecutable();
+    if (!adbPath) {
+        vscode.window.showWarningMessage('adb was not found on PATH. Falling back to manual Android target entry.');
+        return await vscode.window.showInputBox({
+            title: 'Android Package / Activity',
+            prompt: 'Package and activity to launch on the device',
+            placeHolder: 'com.example.game/.MainActivity',
+            value: initialValue,
+            validateInput: (input) => input.trim() ? undefined : 'Enter a package/activity.',
+        });
+    }
+
+    try {
+        const packages = await vscode.window.withProgress(
+            {
+                location: vscode.ProgressLocation.Notification,
+                title: 'RenderDoc — Enumerating Android Packages',
+                cancellable: false,
+            },
+            async () => listAndroidPackages(adbPath, target.id),
+        );
+
+        if (packages.length === 0) {
+            vscode.window.showWarningMessage('No launchable third-party Android packages were found.');
+            return await vscode.window.showInputBox({
+                title: 'Android Package / Activity',
+                prompt: 'Package and activity to launch on the device',
+                placeHolder: 'com.example.game/.MainActivity',
+                value: initialValue,
+                validateInput: (input) => input.trim() ? undefined : 'Enter a package/activity.',
+            });
+        }
+
+        const pickedPackage = await vscode.window.showQuickPick(
+            packages.map((pkg) => ({ label: pkg, description: target.name || target.id })),
+            {
+                title: 'Android Package',
+                placeHolder: 'Choose the package to launch',
+            },
+        );
+        if (!pickedPackage) {
+            return undefined;
+        }
+
+        let resolved = '';
+        try {
+            resolved = (await resolveAndroidLaunchActivity(adbPath, target.id, pickedPackage.label)) || '';
+        } catch (err: any) {
+            console.warn('[RenderDoc] resolveAndroidLaunchActivity failed:', err?.message);
+        }
+
+        if (resolved) {
+            return resolved;
+        }
+
+        const manualActivity = await vscode.window.showInputBox({
+            title: 'Android Activity',
+            prompt: 'Launcher activity could not be resolved automatically. Enter the activity name to launch.',
+            placeHolder: '.MainActivity',
+            value: `${pickedPackage.label}/`,
+            validateInput: (input) => input.trim().includes('/') ? undefined : 'Enter package/activity.',
+        });
+        return manualActivity;
+    } catch (err: any) {
+        vscode.window.showWarningMessage(`adb package enumeration failed: ${err?.message || err}`);
+        return await vscode.window.showInputBox({
+            title: 'Android Package / Activity',
+            prompt: 'Package and activity to launch on the device',
+            placeHolder: 'com.example.game/.MainActivity',
+            value: initialValue,
+            validateInput: (input) => input.trim() ? undefined : 'Enter a package/activity.',
+        });
+    }
+}
+
+async function listLocalProcesses(): Promise<LocalProcessInfo[]> {
+    if (process.platform !== 'win32') {
+        return [];
+    }
+
+    const script = [
+        'Get-Process',
+        '| Sort-Object ProcessName, Id',
+        '| Select-Object Id, ProcessName, Path',
+        '| ConvertTo-Json -Depth 2',
+    ].join(' ');
+    const out = await execFileText('powershell.exe', ['-NoProfile', '-Command', script]);
+    const parsed = JSON.parse(out || '[]');
+    const list = Array.isArray(parsed) ? parsed : [parsed];
+    return list
+        .map((item: any) => ({
+            pid: Number(item?.Id || 0),
+            processName: String(item?.ProcessName || '').trim(),
+            path: typeof item?.Path === 'string' ? item.Path.trim() : undefined,
+        }))
+        .filter((item) => item.pid > 0 && item.processName);
+}
+
+async function promptForCaptureTrigger(initial?: {
+    trigger?: 'immediate' | 'frame' | 'delay';
+    frameNumber?: number;
+    delaySeconds?: number;
+}): Promise<CaptureTriggerOptions | undefined> {
+    const triggerPick = await vscode.window.showQuickPick([
+        {
+            label: 'Capture Immediately',
+            description: 'Trigger a capture right after the target control connection is established',
+            value: 'immediate' as const,
+        },
+        {
+            label: 'Capture On Frame Number',
+            description: 'Queue a capture for a specific frame',
+            value: 'frame' as const,
+        },
+        {
+            label: 'Capture After Delay',
+            description: 'Wait a few seconds after launch or attach, then trigger a capture',
+            value: 'delay' as const,
+        },
+    ], {
+        title: 'Capture Trigger',
+        placeHolder: 'Choose when the frame capture should happen',
+    });
+    if (!triggerPick) {
+        return undefined;
+    }
+
+    let frameNumber = initial?.frameNumber || 1;
+    let delaySeconds = initial?.delaySeconds || 3;
+    if (triggerPick.value === 'frame') {
+        const value = await promptForPositiveNumber('Capture on which frame number?', '1', frameNumber, true);
+        if (value === undefined) {
+            return undefined;
+        }
+        frameNumber = value;
+    } else if (triggerPick.value === 'delay') {
+        const value = await promptForPositiveNumber('How many seconds after launch should capture trigger?', '3', delaySeconds, false);
+        if (value === undefined) {
+            return undefined;
+        }
+        delaySeconds = value;
+    }
+
+    return {
+        trigger: triggerPick.value,
+        frameNumber,
+        delaySeconds,
+    };
+}
+
+async function promptForCaptureOutputDir(executable: string, storedDir?: string): Promise<string | undefined> {
+    const outputDir = await vscode.window.showInputBox({
+        title: 'Capture Output Directory',
+        prompt: 'Directory where the captured .rdc file should be stored locally',
+        value: getDefaultCaptureOutputDir(executable, storedDir),
+        validateInput: (input) => input.trim() ? undefined : 'Enter a directory path.',
+    });
+    if (outputDir === undefined) {
+        return undefined;
+    }
+    await fs.promises.mkdir(outputDir, { recursive: true });
+    return outputDir;
+}
+
+function getLiveCaptureTempDir(context: vscode.ExtensionContext): string {
+    return path.join(context.globalStorageUri.fsPath, 'live-captures');
+}
+
+function buildLiveCaptureTemplate(baseDir: string, stemSource: string): string {
+    return path.join(baseDir, `${buildCaptureStem(stemSource)}_${Date.now()}`);
+}
+
+async function getSavedCapturePaths(context: vscode.ExtensionContext): Promise<string[]> {
+    const saved = context.globalState.get<string[]>(SAVED_CAPTURE_PATHS_KEY) || [];
+    const existing: string[] = [];
+    for (const filePath of saved) {
+        try {
+            await fs.promises.access(filePath, fs.constants.F_OK);
+            existing.push(filePath);
+        } catch {
+            // Skip missing files.
+        }
+    }
+    if (existing.length !== saved.length) {
+        await context.globalState.update(SAVED_CAPTURE_PATHS_KEY, existing);
+    }
+    return existing;
+}
+
+async function rememberSavedCapturePath(context: vscode.ExtensionContext, filePath: string): Promise<void> {
+    const saved = await getSavedCapturePaths(context);
+    if (!saved.includes(filePath)) {
+        saved.push(filePath);
+        await context.globalState.update(SAVED_CAPTURE_PATHS_KEY, saved);
+    }
+}
+
+async function forgetSavedCapturePaths(context: vscode.ExtensionContext, filePaths: string[]): Promise<void> {
+    if (filePaths.length === 0) {
+        return;
+    }
+    const removeSet = new Set(filePaths.map((filePath) => path.normalize(filePath)));
+    const saved = context.globalState.get<string[]>(SAVED_CAPTURE_PATHS_KEY) || [];
+    const next = saved.filter((filePath) => !removeSet.has(path.normalize(filePath)));
+    await context.globalState.update(SAVED_CAPTURE_PATHS_KEY, next);
+}
+
+async function refreshLiveTargetState(): Promise<void> {
+    await launchTargetState.refreshLiveTarget(bridge);
+    await vscode.commands.executeCommand('setContext', 'renderdoc.liveTargetActive', !!launchTargetState.getLiveTarget());
+}
+
+async function promptForCaptureDisposition(context: vscode.ExtensionContext, capturePath: string): Promise<string | undefined> {
+    closeExclusiveRenderDocPanels('captureResult');
+    const choice = await CaptureResultPanel.show(capturePath);
+
+    if (choice === 'delete') {
+        await fs.promises.rm(capturePath, { force: true });
+        return undefined;
+    }
+
+    if (choice === 'save') {
+        const uri = await vscode.window.showSaveDialog({
+            title: 'Save Captured Frame',
+            defaultUri: vscode.Uri.file(capturePath),
+            filters: { 'RenderDoc Capture': ['rdc'] },
+        });
+        if (!uri) {
+            return capturePath;
+        }
+        await fs.promises.mkdir(path.dirname(uri.fsPath), { recursive: true });
+        try {
+            await fs.promises.rename(capturePath, uri.fsPath);
+        } catch {
+            await fs.promises.copyFile(capturePath, uri.fsPath);
+            await fs.promises.rm(capturePath, { force: true });
+        }
+        await rememberSavedCapturePath(context, uri.fsPath);
+        return uri.fsPath;
+    }
+
+    if (choice === 'dismiss') {
+        return undefined;
+    }
+
+    return capturePath;
+}
+
+async function captureFromLiveTarget(context: vscode.ExtensionContext) {
+    try {
+        const liveTarget = launchTargetState.getLiveTarget();
+        if (!liveTarget) {
+            vscode.window.showWarningMessage('No live target is connected. Launch or attach first.');
+            return;
+        }
+
+        const stored = context.workspaceState.get<CaptureTriggerOptions>(LAST_TRIGGER_CAPTURE_STATE_KEY);
+        const triggerOptions = await promptForCaptureTrigger(stored);
+        if (!triggerOptions) {
+            return;
+        }
+
+        await context.workspaceState.update(LAST_TRIGGER_CAPTURE_STATE_KEY, triggerOptions);
+
+        const tempDir = getLiveCaptureTempDir(context);
+        await fs.promises.mkdir(tempDir, { recursive: true });
+        const options: TriggerCaptureOptions = {
+            localCopyPath: `${buildLiveCaptureTemplate(tempDir, liveTarget.target || 'capture')}.rdc`,
+            ...triggerOptions,
+        };
+
+        const result = await runCaptureWithProgress('RenderDoc — Capture Frame', () => bridge.nativeTriggerCapture(options));
+        const finalPath = await promptForCaptureDisposition(context, result.capturePath);
+        if (finalPath) {
+            await loadCapture(context, finalPath);
+        }
+        await refreshLiveTargetState();
+    } catch (err: any) {
+        vscode.window.showErrorMessage(`RenderDoc: capture failed - ${err?.message || err}`);
+    }
+}
+
+async function disconnectLiveTarget() {
+    try {
+        await bridge.nativeDisconnectLiveTarget();
+    } catch (err: any) {
+        console.warn('[RenderDoc] disconnectLiveTarget failed:', err?.message);
+    }
+    await refreshLiveTargetState();
+}
+
+async function clearSavedCaptures(context: vscode.ExtensionContext) {
+    const savedPaths = await getSavedCapturePaths(context);
+    if (savedPaths.length === 0) {
+        vscode.window.showInformationMessage('RenderDoc: no saved RDC files are tracked for cleanup.');
+        return;
+    }
+
+    const picks = await vscode.window.showQuickPick(
+        savedPaths.map((filePath) => ({
+            label: path.basename(filePath),
+            description: path.dirname(filePath),
+            detail: filePath,
+            filePath,
+            picked: true,
+        })),
+        {
+            title: 'Clear Saved RDC Files',
+            placeHolder: 'Select the saved RDC files to delete',
+            canPickMany: true,
+        },
+    );
+
+    if (!picks || picks.length === 0) {
+        return;
+    }
+
+    const filePaths = picks.map((pick) => pick.filePath);
+    const confirm = await vscode.window.showWarningMessage(
+        `Delete ${filePaths.length} saved RDC file(s)?`,
+        { modal: true },
+        'Delete',
+    );
+    if (confirm !== 'Delete') {
+        return;
+    }
+
+    for (const filePath of filePaths) {
+        await fs.promises.rm(filePath, { force: true });
+    }
+    await forgetSavedCapturePaths(context, filePaths);
+
+    if (currentCapturePath && filePaths.some((filePath) => path.normalize(filePath) === path.normalize(currentCapturePath))) {
+        closeCapture();
+    }
+
+    vscode.window.showInformationMessage(`RenderDoc: deleted ${filePaths.length} saved RDC file(s).`);
+}
+
+async function runCaptureWithProgress<T extends LaunchCaptureResult>(
+    title: string,
+    action: () => Promise<T>,
+): Promise<T> {
+    let lastStatusMessage = 'Preparing capture...';
+    const unsubscribe = bridge.onNativeNotification('launchCaptureStatus', (params) => {
+        if (typeof params?.message === 'string' && params.message.trim()) {
+            lastStatusMessage = params.message;
+        }
+    });
+
+    try {
+        return await vscode.window.withProgress(
+            {
+                location: vscode.ProgressLocation.Notification,
+                title,
+                cancellable: false,
+            },
+            async (progress) => {
+                const updateStatus = bridge.onNativeNotification('launchCaptureStatus', (params) => {
+                    if (typeof params?.message === 'string' && params.message.trim()) {
+                        progress.report({ message: params.message });
+                    }
+                });
+                try {
+                    progress.report({ message: lastStatusMessage });
+                    return await action();
+                } finally {
+                    updateStatus();
+                }
+            },
+        );
+    } finally {
+        unsubscribe();
+    }
+}
+
 export async function activate(context: vscode.ExtensionContext) {
     bridge = new RenderDocBridge();
     captureCache = new CaptureCache(context);
+    launchTargetState = new LaunchTargetState(context);
 
     // Check RenderDoc availability on startup
     const available = await bridge.checkAvailability();
@@ -76,6 +653,11 @@ export async function activate(context: vscode.ExtensionContext) {
     drawCallProvider = new DrawCallProvider();
     apiInspectorProvider = new ApiInspectorProvider(bridge);
     resourceProvider = new ResourceProvider();
+    const launchTargetViewProvider = new LaunchTargetViewProvider(
+        context,
+        launchTargetState,
+        async () => { await launchTargetState.refresh(bridge); },
+    );
 
     // Use createTreeView to get selection change events for Copilot context
     const drawCallTreeView = vscode.window.createTreeView('renderdoc-drawCalls', {
@@ -126,6 +708,18 @@ export async function activate(context: vscode.ExtensionContext) {
     context.subscriptions.push(
         vscode.window.registerTreeDataProvider('renderdoc-captureInfo', captureInfoProvider),
         vscode.window.registerTreeDataProvider('renderdoc-apiInspector', apiInspectorProvider),
+        vscode.window.registerWebviewViewProvider('renderdoc-launchTarget', launchTargetViewProvider),
+        launchTargetState.onDidChange(() => {
+            void vscode.commands.executeCommand('setContext', 'renderdoc.liveTargetActive', !!launchTargetState.getLiveTarget());
+            if (!LaunchApplicationPanel.currentPanel) {
+                return;
+            }
+            const current = launchTargetState.getSelected();
+            LaunchApplicationPanel.currentPanel.setTarget(current.kind === 'local'
+                ? { kind: 'local' }
+                : { kind: 'device', target: launchTargetState.getSelectedTarget() });
+            LaunchApplicationPanel.currentPanel.setLiveTarget(launchTargetState.getLiveTarget());
+        }),
         drawCallTreeView,
         resourceTreeView
     );
@@ -150,6 +744,15 @@ export async function activate(context: vscode.ExtensionContext) {
     // Register commands
     context.subscriptions.push(
         vscode.commands.registerCommand('renderdoc.openCapture', () => openCapture(context)),
+        vscode.commands.registerCommand('renderdoc.launchCapture', () => openLaunchApplication(context)),
+        vscode.commands.registerCommand('renderdoc.attachCapture', () => attachProcessAndCapture(context)),
+        vscode.commands.registerCommand('renderdoc.triggerCapture', () => captureFromLiveTarget(context)),
+        vscode.commands.registerCommand('renderdoc.disconnectLiveTarget', () => disconnectLiveTarget()),
+        vscode.commands.registerCommand('renderdoc.clearSavedCaptures', () => clearSavedCaptures(context)),
+        vscode.commands.registerCommand('renderdoc.refreshCaptureTargets', async () => {
+            await launchTargetState.refresh(bridge);
+            await refreshLiveTargetState();
+        }),
         vscode.commands.registerCommand('renderdoc.closeCapture', () => closeCapture()),
         vscode.commands.registerCommand('renderdoc.showThumbnail', () => showThumbnail(context)),
         vscode.commands.registerCommand('renderdoc.refreshCapture', () => refreshCapture()),
@@ -208,6 +811,9 @@ export async function activate(context: vscode.ExtensionContext) {
             }
         })
     );
+
+    void launchTargetState.refresh(bridge);
+    void refreshLiveTargetState();
 }
 
 async function openCapture(context: vscode.ExtensionContext) {
@@ -225,6 +831,466 @@ async function openCapture(context: vscode.ExtensionContext) {
 
     const filePath = uris[0].fsPath;
     await loadCapture(context, filePath);
+}
+
+function getDefaultCaptureOutputDir(executable: string, storedDir?: string): string {
+    if (storedDir?.trim()) {
+        return storedDir.trim();
+    }
+
+    const workspaceDir = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+    if (workspaceDir) {
+        return path.join(workspaceDir, '.renderdoc-captures');
+    }
+
+    const exeDir = executable ? path.dirname(executable) : '';
+    if (exeDir && exeDir !== '.') {
+        return path.join(exeDir, 'captures');
+    }
+
+    return path.join(process.env.TEMP || process.cwd(), 'renderdoc-captures');
+}
+
+function buildCaptureStem(value: string): string {
+    const base = (value || 'capture')
+        .split(/[\\/]/)
+        .pop()
+        ?.replace(/\.[^.]+$/, '')
+        .replace(/[^a-zA-Z0-9._-]+/g, '_')
+        .replace(/^_+|_+$/g, '');
+    return base || 'capture';
+}
+
+async function promptForPositiveNumber(
+    prompt: string,
+    placeHolder: string,
+    initialValue: number,
+    integerOnly = false,
+): Promise<number | undefined> {
+    const value = await vscode.window.showInputBox({
+        prompt,
+        placeHolder,
+        value: String(initialValue),
+        validateInput: (input) => {
+            const parsed = Number(input);
+            if (!Number.isFinite(parsed) || parsed <= 0) {
+                return 'Enter a value greater than 0.';
+            }
+            if (integerOnly && !Number.isInteger(parsed)) {
+                return 'Enter a whole number.';
+            }
+            return undefined;
+        },
+    });
+
+    if (value === undefined) {
+        return undefined;
+    }
+
+    return Number(value);
+}
+
+async function chooseLaunchTarget(deviceTargets: CaptureLaunchTarget[]): Promise<
+    | { kind: 'local' }
+    | { kind: 'device'; target: CaptureLaunchTarget }
+    | undefined
+> {
+    const items: Array<vscode.QuickPickItem & {
+        kindValue: 'local' | 'device';
+        target?: CaptureLaunchTarget;
+    }> = [];
+
+    if (process.platform === 'win32') {
+        items.push({
+            label: 'Windows Local',
+            description: 'Launch an executable on this machine and capture a frame',
+            kindValue: 'local',
+        });
+    }
+
+    for (const target of deviceTargets) {
+        const suffix = target.supported ? '' : 'unsupported by RenderDoc on this device';
+        items.push({
+            label: target.name || target.id,
+            description: target.url,
+            detail: suffix || `Protocol: ${target.protocol}`,
+            kindValue: 'device',
+            target,
+        });
+    }
+
+    if (items.length === 0) {
+        vscode.window.showWarningMessage('No launch targets are available.');
+        return undefined;
+    }
+
+    const choice = await vscode.window.showQuickPick(items, {
+        title: 'Launch And Capture',
+        placeHolder: 'Choose where to launch the target program',
+    });
+
+    if (!choice) {
+        return undefined;
+    }
+
+    if (choice.kindValue === 'local') {
+        return { kind: 'local' };
+    }
+
+    return choice.target ? { kind: 'device', target: choice.target } : undefined;
+}
+
+async function collectLaunchCaptureOptions(
+    context: vscode.ExtensionContext,
+): Promise<LaunchCaptureOptions | undefined> {
+    const stored = (context.workspaceState.get<StoredLaunchCaptureState>(LAST_LAUNCH_CAPTURE_STATE_KEY) || {});
+
+    await bridge.ensureNativeBridgeReady();
+
+    let deviceTargets: CaptureLaunchTarget[] = [];
+    try {
+        deviceTargets = await bridge.nativeListCaptureTargets();
+    } catch (err: any) {
+        console.warn('[RenderDoc] listCaptureTargets failed:', err?.message);
+    }
+
+    const selected = await chooseLaunchTarget(deviceTargets);
+    if (!selected) {
+        return undefined;
+    }
+
+    if (selected.kind === 'device' && !selected.target.supported) {
+        const action = await vscode.window.showWarningMessage(
+            `RenderDoc reports that ${selected.target.name} may not support capture/replay. Continue anyway?`,
+            'Continue',
+            'Cancel',
+        );
+        if (action !== 'Continue') {
+            return undefined;
+        }
+    }
+
+    let executable = '';
+    let workingDir = stored.workingDir || '';
+
+    if (selected.kind === 'local') {
+        const uris = await vscode.window.showOpenDialog({
+            canSelectFiles: true,
+            canSelectFolders: false,
+            canSelectMany: false,
+            title: 'Choose Windows Executable To Launch',
+            defaultUri: stored.executable ? vscode.Uri.file(stored.executable) : undefined,
+            filters: { Executable: ['exe'] },
+        });
+        if (!uris || uris.length === 0) {
+            return undefined;
+        }
+        executable = uris[0].fsPath;
+        const workingDirInput = await vscode.window.showInputBox({
+            title: 'Working Directory',
+            prompt: 'Working directory for the launched process',
+            value: stored.workingDir || path.dirname(executable),
+        });
+        if (workingDirInput === undefined) {
+            return undefined;
+        }
+        workingDir = workingDirInput;
+    } else {
+        const remoteTarget = isAndroidLikeTarget(selected.target)
+            ? await chooseAndroidPackageActivity(selected.target, stored.executable || '')
+            : await vscode.window.showInputBox({
+                title: 'Remote Target Identifier',
+                prompt: 'Package/activity or other launch identifier understood by the selected device protocol',
+                placeHolder: 'com.example.game/.MainActivity',
+                value: stored.executable || '',
+                validateInput: (input) => input.trim() ? undefined : 'Enter a remote target identifier.',
+            });
+        if (remoteTarget === undefined) {
+            return undefined;
+        }
+        executable = remoteTarget;
+        workingDir = '';
+    }
+
+    const cmdLine = await vscode.window.showInputBox({
+        title: 'Launch Arguments',
+        prompt: 'Command-line arguments passed to the target program',
+        placeHolder: '--scene test --width 1920 --height 1080',
+        value: stored.cmdLine || '',
+    });
+
+    if (cmdLine === undefined) {
+        return undefined;
+    }
+
+    const outputDir = await promptForCaptureOutputDir(executable, stored.outputDir);
+    if (!outputDir) {
+        return undefined;
+    }
+
+    const triggerOptions = await promptForCaptureTrigger(stored);
+    if (!triggerOptions) {
+        return undefined;
+    }
+
+    const captureStem = buildCaptureStem(executable);
+    const captureOptions: LaunchCaptureOptions = {
+        url: selected.kind === 'device' ? selected.target.url : '',
+        executable,
+        workingDir,
+        cmdLine,
+        captureFileTemplate: path.join(outputDir, captureStem),
+        localCopyPath: path.join(outputDir, `${captureStem}_${Date.now()}.rdc`),
+        ...triggerOptions,
+    };
+
+    await context.workspaceState.update(LAST_LAUNCH_CAPTURE_STATE_KEY, {
+        targetKind: selected.kind,
+        targetUrl: selected.kind === 'device' ? selected.target.url : '',
+        executable,
+        workingDir,
+        cmdLine,
+        outputDir,
+        trigger: triggerOptions.trigger,
+        frameNumber: triggerOptions.frameNumber,
+        delaySeconds: triggerOptions.delaySeconds,
+    } satisfies StoredLaunchCaptureState);
+
+    return captureOptions;
+}
+
+async function launchProgramAndCapture(context: vscode.ExtensionContext) {
+    try {
+        const options = await collectLaunchCaptureOptions(context);
+        if (!options) {
+            return;
+        }
+        const result = await runCaptureWithProgress('RenderDoc — Launch And Capture', () => bridge.nativeLaunchCapture(options));
+        await loadCapture(context, result.capturePath);
+        const targetLabel = options.url ? options.url : 'local machine';
+        vscode.window.showInformationMessage(
+            `RenderDoc: captured frame ${result.frameNumber ?? '?'} from ${result.target || targetLabel}.`
+        );
+    } catch (err: any) {
+        vscode.window.showErrorMessage(`RenderDoc: launch and capture failed - ${err?.message || err}`);
+    }
+}
+
+function getLaunchFormState(context: vscode.ExtensionContext): LaunchFormState {
+    const stored = (context.workspaceState.get<StoredLaunchCaptureState>(LAST_LAUNCH_CAPTURE_STATE_KEY) || {});
+    return {
+        executable: stored.executable || '',
+        workingDir: stored.workingDir || '',
+        cmdLine: stored.cmdLine || '',
+    };
+}
+
+async function openLaunchApplication(context: vscode.ExtensionContext) {
+    await bridge.ensureNativeBridgeReady();
+    const panel = LaunchApplicationPanel.createOrShow(context, getLaunchFormState(context), {
+        onLaunch: async (form) => {
+            await launchProgramAndCaptureFromForm(context, form);
+        },
+        onCapture: async () => {
+            await captureFromLiveTarget(context);
+        },
+        onBrowseExecutable: async () => {
+            const uris = await vscode.window.showOpenDialog({
+                canSelectFiles: true,
+                canSelectFolders: false,
+                canSelectMany: false,
+                title: 'Choose Windows Executable To Launch',
+                filters: { Executable: ['exe'] },
+            });
+            return uris?.[0]?.fsPath;
+        },
+        onBrowseAndroidPackage: async (value) => {
+            const selected = launchTargetState.getSelectedTarget();
+            if (!selected) {
+                vscode.window.showWarningMessage('Select a mobile device in the left Capture Target view first.');
+                return undefined;
+            }
+            return chooseAndroidPackageActivity(selected, value);
+        },
+    });
+
+    const selected = launchTargetState.getSelected();
+    panel.setTarget(selected.kind === 'local'
+        ? { kind: 'local' }
+        : { kind: 'device', target: launchTargetState.getSelectedTarget() });
+    panel.setLiveTarget(launchTargetState.getLiveTarget());
+
+    const current = launchTargetState.getSelected();
+    panel.setTarget(current.kind === 'local'
+        ? { kind: 'local' }
+        : { kind: 'device', target: launchTargetState.getSelectedTarget() });
+    panel.setLiveTarget(launchTargetState.getLiveTarget());
+}
+
+async function launchProgramAndCaptureFromForm(context: vscode.ExtensionContext, form: LaunchFormState) {
+    const selected = launchTargetState.getSelected();
+    const selectedTarget = launchTargetState.getSelectedTarget();
+
+    if (!form.executable.trim()) {
+        throw new Error(selected.kind === 'local' ? 'Executable path is required.' : 'Package/activity is required.');
+    }
+
+    const tempDir = getLiveCaptureTempDir(context);
+    await fs.promises.mkdir(tempDir, { recursive: true });
+
+    const options: LaunchCaptureOptions = {
+        url: selected.kind === 'device' ? selectedTarget?.url || '' : '',
+        executable: form.executable.trim(),
+        workingDir: selected.kind === 'local' ? form.workingDir.trim() : '',
+        cmdLine: form.cmdLine,
+        captureFileTemplate: buildLiveCaptureTemplate(tempDir, form.executable),
+    };
+
+    await context.workspaceState.update(LAST_LAUNCH_CAPTURE_STATE_KEY, {
+        targetKind: selected.kind === 'local' ? 'local' : 'device',
+        targetUrl: selected.kind === 'device' ? selectedTarget?.url || '' : '',
+        executable: form.executable.trim(),
+        workingDir: selected.kind === 'local' ? form.workingDir.trim() : '',
+        cmdLine: form.cmdLine,
+    } satisfies StoredLaunchCaptureState);
+
+    const result = await runCaptureWithProgress('RenderDoc — Launch Application', () => bridge.nativeLaunchCapture(options));
+    launchTargetState.setLiveTarget(result);
+    await refreshLiveTargetState();
+    const targetLabel = selected.kind === 'device' ? (result.target || selectedTarget?.name || selectedTarget?.url || 'device') : 'local machine';
+    vscode.window.showInformationMessage(`RenderDoc: launched ${targetLabel}. Use Capture when you are ready to grab a frame.`);
+}
+
+async function collectAttachCaptureOptions(
+    context: vscode.ExtensionContext,
+): Promise<AttachCaptureOptions | undefined> {
+    const stored = (context.workspaceState.get<StoredAttachCaptureState>(LAST_ATTACH_CAPTURE_STATE_KEY) || {});
+    await bridge.ensureNativeBridgeReady();
+
+    const remoteDevices = await bridge.nativeListCaptureTargets().catch((): CaptureLaunchTarget[] => []);
+    const source = await vscode.window.showQuickPick([
+        process.platform === 'win32'
+            ? {
+                label: 'Local Windows Process',
+                description: 'Inject into an already running process on this machine',
+                value: 'local' as const,
+            }
+            : undefined,
+        ...remoteDevices.map((target) => ({
+            label: target.name || target.id,
+            description: target.url,
+            detail: 'Attach to an already running RenderDoc target on this device',
+            value: 'remote' as const,
+            target,
+        })),
+    ].filter(Boolean) as Array<(vscode.QuickPickItem & { value: 'local' | 'remote'; target?: CaptureLaunchTarget })>, {
+        title: 'Attach And Capture',
+        placeHolder: 'Choose a local process or a remote device target',
+    });
+
+    if (!source) {
+        return undefined;
+    }
+
+    let processName = stored.processName || '';
+    let pid = stored.pid;
+    let url = '';
+    let ident: number | undefined;
+
+    if (source.value === 'local') {
+        const processes = await vscode.window.withProgress(
+            {
+                location: vscode.ProgressLocation.Notification,
+                title: 'RenderDoc — Enumerating Local Processes',
+                cancellable: false,
+            },
+            async () => listLocalProcesses(),
+        );
+        const pick = await vscode.window.showQuickPick(
+            processes.map((proc) => ({
+                label: `${proc.processName} (${proc.pid})`,
+                description: proc.path || '',
+                proc,
+            })),
+            {
+                title: 'Local Process',
+                placeHolder: 'Choose the running process to inject into',
+            },
+        );
+        if (!pick) {
+            return undefined;
+        }
+        processName = pick.proc.processName;
+        pid = pick.proc.pid;
+    } else {
+        url = source.target?.url || '';
+        const attachTargets = await runCaptureWithProgress('RenderDoc — Enumerating Remote Targets', async () => {
+            const targets = await bridge.nativeListAttachTargets(url);
+            return {
+                capturePath: '',
+                target: '',
+                local: true,
+                frameNumber: 0,
+                api: '',
+                targets,
+            } as LaunchCaptureResult & { targets: CaptureAttachTarget[] };
+        });
+        const pick = await vscode.window.showQuickPick(
+            attachTargets.targets.map((target) => ({
+                label: target.target || `ident ${target.ident}`,
+                description: target.api ? `${target.api} · PID ${target.pid}` : `PID ${target.pid}`,
+                detail: target.busyClient ? `Busy: ${target.busyClient}` : source.target?.url,
+                target,
+            })),
+            {
+                title: 'Remote Running Target',
+                placeHolder: 'Choose the already running RenderDoc target to capture',
+            },
+        );
+        if (!pick) {
+            return undefined;
+        }
+        ident = pick.target.ident;
+        processName = pick.target.target;
+    }
+
+    const tempDir = getLiveCaptureTempDir(context);
+    await fs.promises.mkdir(tempDir, { recursive: true });
+
+    const options: AttachCaptureOptions = {
+        url,
+        ident,
+        pid,
+        processName,
+        captureFileTemplate: buildLiveCaptureTemplate(tempDir, processName || `pid_${pid || ident || 'target'}`),
+    };
+
+    await context.workspaceState.update(LAST_ATTACH_CAPTURE_STATE_KEY, {
+        mode: source.value,
+        targetUrl: url,
+        processName,
+        pid,
+    } satisfies StoredAttachCaptureState);
+
+    return options;
+}
+
+async function attachProcessAndCapture(context: vscode.ExtensionContext) {
+    try {
+        const options = await collectAttachCaptureOptions(context);
+        if (!options) {
+            return;
+        }
+
+        const result = await runCaptureWithProgress('RenderDoc — Attach To Process', () => bridge.nativeAttachCapture(options));
+        launchTargetState.setLiveTarget(result);
+        await refreshLiveTargetState();
+        vscode.window.showInformationMessage(
+            `RenderDoc: attached to ${result.target || options.processName || options.pid || 'target'}. Use Capture when you are ready to grab a frame.`
+        );
+    } catch (err: any) {
+        vscode.window.showErrorMessage(`RenderDoc: attach failed - ${err?.message || err}`);
+    }
 }
 
 function closeCapture() {
@@ -307,7 +1373,6 @@ async function startShaderAliasScan(captureInfo: CaptureInfo, drawCalls: DrawCal
     if (drawCalls.length === 0 || resources.every((resource) => !needsShaderMetadata(resource))) {
         return;
     }
-
     const generation = ++shaderAliasScanGeneration;
     try {
         const metadata = await bridge.buildShaderMetadataMap(drawCalls);
@@ -331,6 +1396,18 @@ async function startShaderAliasScan(captureInfo: CaptureInfo, drawCalls: DrawCal
     } catch (err: any) {
         console.warn('[RenderDoc] shader alias scan failed:', err?.message);
     }
+}
+
+async function enrichCaptureInfoWithStatistics(captureInfo: CaptureInfo | undefined): Promise<CaptureInfo | undefined> {
+    if (!captureInfo || !bridge.hasNativeBridge()) {
+        return captureInfo;
+    }
+    try {
+        captureInfo.statistics = await bridge.nativeGetCaptureStatistics();
+    } catch (err: any) {
+        console.warn('[RenderDoc] capture statistics unavailable:', err?.message);
+    }
+    return captureInfo;
 }
 
 async function loadCapture(context: vscode.ExtensionContext, filePath: string, silent = false) {
@@ -360,6 +1437,7 @@ async function loadCapture(context: vscode.ExtensionContext, filePath: string, s
         // background so the panel still shows the preview.
         bridge.getThumbnail(filePath).then(thumbnail => {
             if (thumbnail && !silent) {
+                closeExclusiveRenderDocPanels('thumbnail');
                 ThumbnailPanel.createOrShow(context, thumbnail, cached.captureInfo);
             }
         }).catch(() => { /* best-effort */ });
@@ -544,13 +1622,14 @@ async function loadCapture(context: vscode.ExtensionContext, filePath: string, s
                 try {
                     if (token.isCancellationRequested) { return; }
                     progress.report({ message: 'Loading draw calls...', increment: 10 });
-                    drawCalls = await bridge.getDrawCalls(filePath);
+                    const replayData = await loadReplayDataWithRetry(filePath, token, progress);
+                    drawCalls = replayData.drawCalls;
                     currentDrawCalls = drawCalls;
                     drawCallProvider.update(drawCalls);
 
                     if (token.isCancellationRequested) { return; }
                     progress.report({ message: 'Loading resources...', increment: 10 });
-                    resources = await bridge.getResources(filePath);
+                    resources = replayData.resources;
                     currentResources = resources;
                     resourceProvider.update(resources);
                 } catch (err: any) {
@@ -560,6 +1639,11 @@ async function loadCapture(context: vscode.ExtensionContext, filePath: string, s
                 }
             }
             apiInspectorProvider.clear();
+
+            if (!replayErr && captureInfo) {
+                await enrichCaptureInfoWithStatistics(captureInfo);
+                captureInfoProvider.update(captureInfo);
+            }
 
             // Persist successful results so the next open of this capture
             // can populate the UI instantly (avoiding expensive JSON fetch again).
@@ -586,6 +1670,7 @@ async function loadCapture(context: vscode.ExtensionContext, filePath: string, s
                 progress.report({ message: 'Loading thumbnail...', increment: 10 });
                 const thumbnail = await bridge.getThumbnail(filePath);
                 if (thumbnail && !silent) {
+                    closeExclusiveRenderDocPanels('thumbnail');
                     ThumbnailPanel.createOrShow(context, thumbnail, captureInfo);
                 }
             } catch (err: any) {
@@ -614,6 +1699,7 @@ async function showThumbnail(context: vscode.ExtensionContext) {
     }
     const thumbnail = await bridge.getThumbnail(info.filePath);
     if (thumbnail) {
+        closeExclusiveRenderDocPanels('thumbnail');
         ThumbnailPanel.createOrShow(context, thumbnail, info);
     }
 }
@@ -626,12 +1712,15 @@ async function refreshCapture() {
     }
     const captureInfo = await bridge.getCaptureInfo(info.filePath);
     captureInfoProvider.update(captureInfo);
-    const drawCalls = await bridge.getDrawCalls(info.filePath);
+    const replayData = await loadReplayDataWithRetry(info.filePath);
+    const drawCalls = replayData.drawCalls;
     currentDrawCalls = drawCalls;
     drawCallProvider.update(drawCalls);
-    const resources = await bridge.getResources(info.filePath);
+    const resources = replayData.resources;
     currentResources = resources;
     resourceProvider.update(resources);
+    await enrichCaptureInfoWithStatistics(captureInfo);
+    captureInfoProvider.update(captureInfo);
     if (InspectorPanel.currentPanel) {
         InspectorPanel.currentPanel.setCapture(captureInfo, drawCalls, resources);
     }
@@ -719,9 +1808,7 @@ async function showDrawCallDetails(context: vscode.ExtensionContext, item: any) 
     if (!item) { return; }
     if (item.eventId === undefined) { return; }
 
-    // User asked for simplest possible behaviour: always dispose the previous
-    // Inspector panel and create a fresh one on every draw-call click, so we
-    // never hit any stale-state / re-render corner cases.
+    closeExclusiveRenderDocPanels('inspector');
     if (InspectorPanel.currentPanel) {
         InspectorPanel.currentPanel.disposePanel();
     }
@@ -863,6 +1950,7 @@ async function viewAllShaders(context: vscode.ExtensionContext) {
 
 async function openInspector(context: vscode.ExtensionContext) {
     const info = captureInfoProvider.getCaptureInfo();
+    closeExclusiveRenderDocPanels('inspector');
     const panel = InspectorPanel.createOrShow(context, bridge);
     if (info) {
         try {

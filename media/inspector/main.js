@@ -28,8 +28,12 @@
         meshShowPreview: true,
         meshCam: { yaw: 0.6, pitch: 0.4, zoom: 1.0, panX: 0, panY: 0, auto: true },
         graphZoom: 1,
-        graphMinZoom: 0.35,
+        graphMinZoom: 0.05,
         graphMaxZoom: 2.5,
+        timings: {},
+        timingsAvailable: false,
+        timingsError: null,
+        graphFocus: null,
     };
 
     // Build resourceId -> resource info lookup (strings for consistent key match)
@@ -159,6 +163,9 @@
                 state.drawCalls = m.drawCalls || [];
                 state.resources = m.resources || [];
                 state.resourceAliases = {};
+                state.timings = {};
+                state.timingsAvailable = false;
+                state.timingsError = null;
                 render();
                 break;
             case 'eventChanged':
@@ -211,6 +218,13 @@
                 if (containerDom) containerDom.style.display = 'flex';
                 if (splitterDom) splitterDom.style.display = 'block';
                 break;
+            case 'timingsLoaded':
+                state.timings = m.timings || {};
+                state.timingsAvailable = !!m.available;
+                state.timingsError = m.error || null;
+                if (state.activeTab === 'overview') renderOverview();
+                if (state.activeTab === 'pipelinegraph') renderPipelineGraph();
+                break;
         }
     });
 
@@ -236,55 +250,619 @@
     }
 
     // ── Overview ───────────────────────────────────────────────────
+    function buildDerivedOverviewStatistics() {
+        const events = flattenEvents(state.drawCalls);
+        const drawCount = events.filter(dc => String(dc.flags || '').toLowerCase().includes('drawcall')).length;
+        const dispatchCount = events.filter(dc => String(dc.flags || '').toLowerCase().includes('dispatch')).length;
+        const diagnosticCount = events.filter(dc => String(dc.flags || '').toLowerCase().includes('marker')).length;
+        const maxEventId = events.reduce((max, dc) => Math.max(max, dc.eventId || 0), 0);
+        const apiCallCount = Math.max(0, maxEventId - drawCount - dispatchCount - diagnosticCount);
+        const textureResources = state.resources.filter(r => r.type === 'Texture');
+        const bufferResources = state.resources.filter(r => r.type === 'Buffer');
+        const textureBytes = textureResources.reduce((sum, resource) => sum + (resource.byteSize || 0), 0);
+        const bufferBytes = bufferResources.reduce((sum, resource) => sum + (resource.byteSize || 0), 0);
+        const avgTextureWidth = textureResources.length
+            ? textureResources.reduce((sum, resource) => sum + (resource.width || 0), 0) / textureResources.length
+            : 0;
+        const avgTextureHeight = textureResources.length
+            ? textureResources.reduce((sum, resource) => sum + (resource.height || 0), 0) / textureResources.length
+            : 0;
+        return {
+            compressedFileSize: 0,
+            uncompressedFileSize: 0,
+            persistentSize: 0,
+            initDataSize: 0,
+            drawCount,
+            dispatchCount,
+            apiCallCount,
+            apiDrawDispatchRatio: (drawCount + dispatchCount) > 0 ? (apiCallCount / (drawCount + dispatchCount)) : 0,
+            textureCount: textureResources.length,
+            textureBytes,
+            largeTextureBytes: 0,
+            renderTargetCount: 0,
+            renderTargetBytes: 0,
+            bufferCount: bufferResources.length,
+            bufferBytes,
+            indexBufferBytes: 0,
+            vertexBufferBytes: 0,
+            avgTextureWidth,
+            avgTextureHeight,
+            avgLargeTextureWidth: 0,
+            avgLargeTextureHeight: 0,
+            totalGpuBytes: textureBytes + bufferBytes,
+            renderTargetSwitches: 0,
+            estimatedGpuTimeAvailable: false,
+        };
+    }
+
+    function formatCompactNumber(value) {
+        const number = Number(value || 0);
+        if (!Number.isFinite(number)) return '0';
+        if (Math.abs(number) >= 1000000) return (number / 1000000).toFixed(number >= 10000000 ? 0 : 1) + 'M';
+        if (Math.abs(number) >= 1000) return (number / 1000).toFixed(number >= 10000 ? 0 : 1) + 'K';
+        return String(Math.round(number));
+    }
+
+    function formatOverviewRatio(value) {
+        const number = Number(value || 0);
+        if (!Number.isFinite(number)) return '0.00';
+        return number.toFixed(2);
+    }
+
+    function formatOverviewPercent(value) {
+        const number = Number(value || 0);
+        if (!Number.isFinite(number)) return '0%';
+        return (number * 100).toFixed(number >= 0.1 ? 0 : 1) + '%';
+    }
+
+    function makeGraphFocusKey(kind, stats, title) {
+        return [kind || 'pass', stats?.minEid ?? 'na', stats?.maxEid ?? 'na', title || 'untitled'].join('|');
+    }
+
+    function formatDurationUs(durationUs) {
+        const value = Number(durationUs || 0);
+        if (!Number.isFinite(value) || value <= 0) return '0 us';
+        if (value >= 1000) return (value / 1000).toFixed(value >= 10000 ? 1 : 2) + ' ms';
+        return value.toFixed(0) + ' us';
+    }
+
+    function collectNodeGpuTimeUs(node) {
+        if (!node) return 0;
+        let total = Number(state.timings[String(node.eventId)] || 0);
+        (node.children || []).forEach((child) => {
+            total += collectNodeGpuTimeUs(child);
+        });
+        return total;
+    }
+
+    function buildGraphPassCandidates() {
+        const rootNodes = Array.isArray(state.drawCalls) ? state.drawCalls : [];
+        const totalEventCount = flattenEvents(rootNodes).length;
+        const candidates = [];
+        const hasTimingData = state.timingsAvailable && Object.keys(state.timings || {}).length > 0;
+
+        function visit(nodes, depth) {
+            (nodes || []).forEach((node) => {
+                if (!node) return;
+                const hasChildren = !!(node.children && node.children.length);
+                const stats = collectNodeStats(node);
+                const workload = stats.draws + stats.dispatches + stats.clears + stats.copies + stats.presents;
+                const gpuTimeUs = collectNodeGpuTimeUs(node);
+                const kind = inferFlowKind(node.name, node.flags, stats, hasChildren);
+                const title = node.name || (hasChildren ? 'Unnamed pass' : 'Inline commands');
+                const isWrapper = depth === 0 && rootNodes.length === 1 && stats.events >= Math.max(12, totalEventCount * 0.9);
+
+                if (workload > 0 && !isWrapper) {
+                    const score = stats.draws + stats.dispatches * 1.4 + stats.copies * 0.55 + stats.clears * 0.3 + stats.presents * 0.2;
+                    const previewLeaf = gatherLeafPreview(node, 1)[0];
+                    const hints = [];
+                    if (kind === 'transparent' || kind === 'ui' || kind === 'postfx') hints.push('Overdraw-prone');
+                    if (kind === 'shadow' || kind === 'postfx') hints.push('Bandwidth-heavy');
+                    if (stats.dispatches > stats.draws) hints.push('Compute-heavy');
+                    if (stats.copies > 0) hints.push('Transfer activity');
+                    if (stats.clears > 1) hints.push('Frequent clears');
+
+                    candidates.push({
+                        key: makeGraphFocusKey(kind, stats, title),
+                        title,
+                        kind,
+                        stats,
+                        score,
+                        gpuTimeUs,
+                        depth,
+                        summary: summarizeStats(stats),
+                        hints,
+                        representativeEid: previewLeaf?.eventId || node.eventId || stats.minEid,
+                    });
+                }
+
+                if (hasChildren) visit(node.children, depth + 1);
+            });
+        }
+
+        visit(rootNodes, 0);
+
+        const deduped = [];
+        const seen = new Set();
+        candidates
+            .sort((a, b) => {
+                if (hasTimingData && (a.gpuTimeUs !== b.gpuTimeUs)) return b.gpuTimeUs - a.gpuTimeUs;
+                return b.score - a.score || a.depth - b.depth || a.stats.minEid - b.stats.minEid;
+            })
+            .forEach((candidate) => {
+                if (seen.has(candidate.key)) return;
+                seen.add(candidate.key);
+                deduped.push(candidate);
+            });
+
+        return { all: deduped, hasTimingData };
+    }
+
+    function clamp01(value) {
+        if (!Number.isFinite(value)) return 0;
+        return Math.max(0, Math.min(1, value));
+    }
+
+    function buildOverviewInsights(stats, hasNativeStats) {
+        const insights = [];
+        const totalGpuBytes = Math.max(1, Number(stats.totalGpuBytes || 0));
+        const drawCount = Math.max(1, Number(stats.drawCount || 0));
+        const workCount = Math.max(1, Number(stats.drawCount || 0) + Number(stats.dispatchCount || 0));
+        const textureShare = Number(stats.textureBytes || 0) / totalGpuBytes;
+        const renderTargetShare = Number(stats.renderTargetBytes || 0) / totalGpuBytes;
+        const bufferShare = Number(stats.bufferBytes || 0) / totalGpuBytes;
+        const largeTextureShare = Number(stats.textureBytes || 0) > 0 ? Number(stats.largeTextureBytes || 0) / Number(stats.textureBytes || 0) : 0;
+        const apiSummary = stats.apiSummary || {};
+        const outputSetsPerDraw = Number(apiSummary.outputSets || 0) / drawCount;
+        const shaderSetsPerDraw = Number(apiSummary.shaderSets || 0) / drawCount;
+        const resourceUpdatesPerWork = Number(apiSummary.resourceUpdates || 0) / workCount;
+        const resourceSetsPerDraw = Number(apiSummary.resourceSets || 0) / drawCount;
+
+        if (textureShare >= 0.58) {
+            insights.push({
+                tone: 'accent',
+                title: 'Texture memory dominates the frame footprint',
+                text: formatOverviewPercent(textureShare) + ' of tracked GPU residency is textures. Prioritise large atlases, streaming policy, and compression wins first.',
+            });
+        }
+        if (renderTargetShare >= 0.3) {
+            insights.push({
+                tone: 'warn',
+                title: 'Render target pressure is elevated',
+                text: 'Render targets account for ' + formatOverviewPercent(renderTargetShare) + ' of tracked GPU bytes. This often correlates with bandwidth-heavy post FX or multi-pass accumulation.',
+            });
+        }
+        if (bufferShare >= 0.45) {
+            insights.push({
+                tone: 'info',
+                title: 'Buffer residency is unusually high',
+                text: 'Buffers make up ' + formatOverviewPercent(bufferShare) + ' of tracked memory. Large geometry streams or upload-heavy workloads may be dominating this frame.',
+            });
+        }
+        if (largeTextureShare >= 0.45) {
+            insights.push({
+                tone: 'warn',
+                title: 'Large textures are carrying most texture cost',
+                text: formatOverviewPercent(largeTextureShare) + ' of texture memory comes from textures above 32×32. Mip policy and render-target reuse are good places to check next.',
+            });
+        }
+        if (outputSetsPerDraw >= 0.22) {
+            insights.push({
+                tone: 'warn',
+                title: 'Output-state churn is high',
+                text: 'Output bindings change about ' + formatOverviewRatio(outputSetsPerDraw) + ' times per draw. Frequent RT switches or pass fragmentation are likely hurting locality.',
+            });
+        }
+        if (shaderSetsPerDraw >= 0.18) {
+            insights.push({
+                tone: 'info',
+                title: 'Shader switching density is noticeable',
+                text: 'Shader programs change about ' + formatOverviewRatio(shaderSetsPerDraw) + ' times per draw. Sorting by material/pipeline may reduce driver overhead.',
+            });
+        }
+        if (resourceUpdatesPerWork >= 0.16) {
+            insights.push({
+                tone: 'warn',
+                title: 'Resource updates are heavy for this frame',
+                text: 'Updates occur at roughly ' + formatOverviewRatio(resourceUpdatesPerWork) + ' per draw/dispatch. Dynamic uploads or transient resource rebuilds may be inflating cost.',
+            });
+        }
+        if (resourceSetsPerDraw >= 1.5) {
+            insights.push({
+                tone: 'info',
+                title: 'Descriptor / binding churn is high',
+                text: 'Resource bindings change ' + formatOverviewRatio(resourceSetsPerDraw) + ' times per draw on average. Binding tables may need consolidation.',
+            });
+        }
+        if (Number(stats.dispatchCount || 0) > Number(stats.drawCount || 0)) {
+            insights.push({
+                tone: 'accent',
+                title: 'This frame is compute-leaning',
+                text: 'Dispatch calls exceed draw calls, so compute queues or post-processing kernels may be driving the dominant GPU cost.',
+            });
+        }
+        if (!insights.length) {
+            insights.push({
+                tone: hasNativeStats ? 'info' : 'accent',
+                title: hasNativeStats ? 'Frame balance looks relatively even' : 'Showing derived metrics until native stats are available',
+                text: hasNativeStats
+                    ? 'No single pressure source stands out from the current capture statistics. Use Pipeline and resource tabs for per-event investigation.'
+                    : 'Counts and memory totals are inferred from the loaded replay data, so this view is directionally useful but not yet authoritative.',
+            });
+        }
+
+        return insights.slice(0, 4);
+    }
+
+    function buildOverviewOverdrawRisk(stats) {
+        const drawCount = Math.max(1, Number(stats.drawCount || 0));
+        const apiSummary = stats.apiSummary || {};
+        const flatEvents = flattenEvents(state.drawCalls);
+        const drawEvents = flatEvents.filter((dc) => /drawcall/i.test(String(dc.flags || '')));
+        const transparentLikeDraws = drawEvents.filter((dc) => {
+            const text = ((dc.name || '') + ' ' + (dc.flags || '')).toLowerCase();
+            return /transparent|translucent|alpha|particle|glass|ui|overlay|postfx|post fx|post-process|bloom|tonemap/.test(text);
+        }).length;
+        const transparentRatio = drawEvents.length ? transparentLikeDraws / drawEvents.length : 0;
+        const blendDensity = clamp01(Number(apiSummary.blendSets || 0) / drawCount / 0.35);
+        const rtPressure = clamp01(Number(stats.renderTargetBytes || 0) / Math.max(1, Number(stats.totalGpuBytes || 0)) / 0.35);
+        const outputChurn = clamp01(Number(stats.renderTargetSwitches || 0) / drawCount / 0.2);
+        const score = clamp01(transparentRatio * 0.4 + blendDensity * 0.25 + rtPressure * 0.2 + outputChurn * 0.15);
+
+        let label = 'Low';
+        let tone = 'info';
+        let rationale = 'Opaque and stable render passes dominate the frame.';
+        if (score >= 0.67) {
+            label = 'High';
+            tone = 'warn';
+            rationale = 'Transparent/post FX style draws, blend churn, and RT pressure suggest elevated overdraw risk.';
+        } else if (score >= 0.34) {
+            label = 'Medium';
+            tone = 'accent';
+            rationale = 'Some blend-heavy or screen-space work is present, but it does not dominate the frame yet.';
+        }
+
+        return { score, label, tone, rationale, transparentRatio };
+    }
+
+    function buildOverviewPassBreakdown() {
+        const graphPasses = buildGraphPassCandidates();
+        const top = graphPasses.all.slice(0, 4);
+        const totalMetric = graphPasses.hasTimingData
+            ? top.reduce((sum, candidate) => sum + candidate.gpuTimeUs, 0)
+            : top.reduce((sum, candidate) => sum + candidate.score, 0);
+        return { top, totalMetric, hasTimingData: graphPasses.hasTimingData, allCandidates: graphPasses.all };
+    }
+
+    function findBestPassCandidateForResource(resource, passCandidates) {
+        if (!resource || !Array.isArray(passCandidates) || !passCandidates.length) return null;
+        const text = [resourceDisplayName(resource), resource.name, resource.format, resource.type]
+            .filter(Boolean)
+            .join(' ')
+            .toLowerCase();
+        const keywords = text.match(/[a-z0-9_]{4,}/g) || [];
+        const preferredKinds = [];
+        if (/shadow|depth/.test(text)) preferredKinds.push('shadow', 'opaque');
+        if (/bloom|tonemap|taa|fxaa|blur|post|ssao|ssr|dof|upscale/.test(text)) preferredKinds.push('postfx');
+        if (/ui|hud|overlay|canvas|font/.test(text)) preferredKinds.push('ui');
+        if (/alpha|transparent|particle|glass/.test(text)) preferredKinds.push('transparent');
+        if (/swap|present|backbuffer/.test(text)) preferredKinds.push('present', 'postfx');
+        if (resource.type === 'Buffer') preferredKinds.push('compute', 'opaque');
+        if (!preferredKinds.length) preferredKinds.push('opaque', 'camera', 'transparent', 'postfx');
+
+        let best = null;
+        let bestScore = -Infinity;
+        passCandidates.forEach((candidate, index) => {
+            let score = candidate.gpuTimeUs > 0 ? candidate.gpuTimeUs / 1000 : candidate.score;
+            const candidateText = (candidate.title || '').toLowerCase();
+            const kindIdx = preferredKinds.indexOf(candidate.kind);
+            if (kindIdx >= 0) score += (preferredKinds.length - kindIdx) * 250;
+            keywords.forEach((keyword) => {
+                if (candidateText.includes(keyword)) score += 45;
+            });
+            if (resource.type === 'Texture' && /render target|gbuffer|color|scene color|main color/.test(text) && (candidate.kind === 'postfx' || candidate.kind === 'opaque')) score += 120;
+            if (resource.type === 'Texture' && /depth|shadow/.test(text) && candidate.kind === 'shadow') score += 160;
+            if (resource.type === 'Buffer' && candidate.kind === 'compute') score += 80;
+            score -= index * 2;
+            if (score > bestScore) {
+                bestScore = score;
+                best = candidate;
+            }
+        });
+        return best;
+    }
+
+    function buildOverviewResourceHotspots(passCandidates) {
+        const topTextures = state.resources
+            .filter((resource) => resource.type === 'Texture')
+            .sort((left, right) => Number(right.byteSize || 0) - Number(left.byteSize || 0))
+            .slice(0, 4)
+            .map((resource) => ({
+                resource,
+                hint: resource.isColorTarget || resource.isDepthTarget ? 'Render target candidate' : 'Texture residency',
+                passCandidate: findBestPassCandidateForResource(resource, passCandidates),
+            }));
+        const topBuffers = state.resources
+            .filter((resource) => resource.type === 'Buffer')
+            .sort((left, right) => Number(right.byteSize || 0) - Number(left.byteSize || 0))
+            .slice(0, 3)
+            .map((resource) => ({ resource, hint: 'Buffer residency', passCandidate: findBestPassCandidateForResource(resource, passCandidates) }));
+        return { topTextures, topBuffers };
+    }
+
+    function renderOverviewPassCard(candidate, totalMetric, hasTimingData) {
+        const primaryValue = hasTimingData && candidate.gpuTimeUs > 0
+            ? (candidate.gpuTimeUs >= 1000 ? (candidate.gpuTimeUs / 1000).toFixed(2) + ' ms' : candidate.gpuTimeUs.toFixed(0) + ' us')
+            : candidate.summary;
+        const share = totalMetric > 0 ? (hasTimingData ? candidate.gpuTimeUs / totalMetric : candidate.score / totalMetric) : 0;
+        const tone = candidate.kind === 'transparent' || candidate.kind === 'postfx' || candidate.kind === 'ui'
+            ? 'warn'
+            : candidate.kind === 'compute' || candidate.kind === 'camera'
+                ? 'accent'
+                : 'info';
+        const badges = [
+            renderGraphBadge(kindLabel(candidate.kind), candidate.kind),
+            renderGraphBadge('EID ' + formatEidRange(candidate.stats.minEid, candidate.stats.maxEid), 'mono'),
+        ];
+        if (candidate.stats.draws) badges.push(renderGraphBadge(candidate.stats.draws + ' draws', 'mono'));
+        if (candidate.stats.dispatches) badges.push(renderGraphBadge(candidate.stats.dispatches + ' dispatches', 'mono'));
+
+        let html = '<article class="ov-pass-card ' + tone + '" data-eid="' + esc(String(candidate.representativeEid || candidate.stats.minEid)) + '" data-focus-key="' + esc(candidate.key) + '">';
+        html += '<div class="ov-pass-head">';
+        html += '<div class="ov-pass-title">' + esc(candidate.title) + '</div>';
+        html += '<div class="ov-pass-meta">' + esc(primaryValue) + '</div>';
+        html += '</div>';
+        html += '<div class="ov-pass-badges">' + badges.join('') + '</div>';
+        html += '<div class="ov-bars ov-pass-bars">';
+        html += renderOverviewBar(hasTimingData ? 'GPU Time Share' : 'Workload Share', hasTimingData ? candidate.gpuTimeUs : candidate.score, Math.max(totalMetric, hasTimingData ? candidate.gpuTimeUs : candidate.score, 1), formatOverviewPercent(share), tone);
+        html += '</div>';
+        html += '<div class="ov-pass-hints">';
+        if (candidate.hints.length) {
+            html += candidate.hints.map((hint) => renderGraphTextChip(hint, tone)).join('');
+        } else {
+            html += renderGraphTextChip('Stable pass signature', 'mono');
+        }
+        html += '</div>';
+        html += '</article>';
+        return html;
+    }
+
+    function renderOverviewResourceCard(entry, tone) {
+        const resource = entry.resource;
+        let html = '<article class="ov-resource-card ' + tone + '" data-resid="' + esc(String(resource.resourceId)) + '"';
+        if (entry.passCandidate?.key) html += ' data-focus-key="' + esc(entry.passCandidate.key) + '"';
+        if (entry.passCandidate?.representativeEid) html += ' data-eid="' + esc(String(entry.passCandidate.representativeEid)) + '"';
+        html += '>';
+        html += '<div class="ov-resource-type">' + esc(resource.type || 'Resource') + '</div>';
+        html += '<div class="ov-resource-title">' + esc(resourceDisplayName(resource) || resource.name || ('Resource ' + resource.resourceId)) + '</div>';
+        html += '<div class="ov-resource-meta">' + esc(formatByteSize(resource.byteSize)) + ' · ' + esc(resource.format || 'Unknown format') + '</div>';
+        if (resource.width || resource.height) {
+            html += '<div class="ov-resource-submeta">' + esc(formatResourceExtent(resource)) + ' · ' + esc(entry.hint || '') + '</div>';
+        } else {
+            html += '<div class="ov-resource-submeta">' + esc(entry.hint || '') + '</div>';
+        }
+        if (entry.passCandidate) {
+            html += '<div class="ov-resource-pass">Likely pass · ' + esc(entry.passCandidate.title) + '</div>';
+        }
+        html += '</article>';
+        return html;
+    }
+
+    function renderOverviewMetricCard(label, value, meta, tone) {
+        return '<article class="ov-metric-card' + (tone ? ' ' + tone : '') + '">' +
+            '<div class="ov-metric-label">' + esc(label) + '</div>' +
+            '<div class="ov-metric-value">' + esc(value) + '</div>' +
+            '<div class="ov-metric-meta">' + esc(meta || '') + '</div>' +
+            '</article>';
+    }
+
+    function renderOverviewMiniMetric(label, value, meta) {
+        return '<article class="ov-mini-card">' +
+            '<div class="ov-mini-label">' + esc(label) + '</div>' +
+            '<div class="ov-mini-value">' + esc(value) + '</div>' +
+            '<div class="ov-mini-meta">' + esc(meta || '') + '</div>' +
+            '</article>';
+    }
+
+    function renderOverviewSection(title, subtitle, body, extraClass) {
+        let html = '<section class="ov-section' + (extraClass ? ' ' + extraClass : '') + '">';
+        html += '<div class="ov-section-head">';
+        html += '<div class="ov-section-title">' + esc(title) + '</div>';
+        if (subtitle) html += '<div class="ov-section-subtitle">' + esc(subtitle) + '</div>';
+        html += '</div>';
+        html += '<div class="ov-section-body">' + body + '</div>';
+        html += '</section>';
+        return html;
+    }
+
+    function renderOverviewBar(label, value, total, meta, tone) {
+        const safeValue = Number(value || 0);
+        const safeTotal = Math.max(Number(total || 0), safeValue, 1);
+        const ratio = clamp01(safeValue / safeTotal);
+        return '<div class="ov-bar-row">' +
+            '<div class="ov-bar-labels"><span>' + esc(label) + '</span><span>' + esc(meta || '') + '</span></div>' +
+            '<div class="ov-bar-track"><div class="ov-bar-fill' + (tone ? ' ' + tone : '') + '" style="width:' + (ratio * 100).toFixed(1) + '%"></div></div>' +
+            '</div>';
+    }
+
     function renderOverview() {
         const body = document.getElementById('overview-body');
         if (!state.captureInfo) { body.textContent = 'Load a capture to begin.'; body.className = 'empty-state'; return; }
         body.className = '';
         const info = state.captureInfo;
-        const drawCount = flattenEvents(state.drawCalls).length;
+        const stats = info.statistics || buildDerivedOverviewStatistics();
+        const hasNativeStats = !!info.statistics;
+        const fileName = info.filePath.split(/[/\\]/).pop() || info.filePath;
+        const eventCount = flattenEvents(state.drawCalls).length;
         const texCount = state.resources.filter(r => r.type === 'Texture').length;
         const bufCount = state.resources.filter(r => r.type === 'Buffer').length;
         const shdCount = state.resources.filter(r => r.type === 'Shader').length;
+        const bandwidthWorkingSet = Number(stats.textureBytes || 0) + Number(stats.renderTargetBytes || 0);
+        const totalGpuBytes = Math.max(0, Number(stats.totalGpuBytes || 0));
+        const textureShare = totalGpuBytes > 0 ? Number(stats.textureBytes || 0) / totalGpuBytes : 0;
+        const rtShare = totalGpuBytes > 0 ? Number(stats.renderTargetBytes || 0) / totalGpuBytes : 0;
+        const bufferShare = totalGpuBytes > 0 ? Number(stats.bufferBytes || 0) / totalGpuBytes : 0;
+        const apiSummary = stats.apiSummary || {};
+        const stateChangeTotal = Number(apiSummary.shaderSets || 0) + Number(apiSummary.blendSets || 0) + Number(apiSummary.depthStencilSets || 0) + Number(apiSummary.rasterizationSets || 0) + Number(apiSummary.outputSets || 0);
+        const findings = buildOverviewInsights(stats, hasNativeStats);
+        const overdrawRisk = buildOverviewOverdrawRisk(stats);
+        const passBreakdown = buildOverviewPassBreakdown();
+        const resourceHotspots = buildOverviewResourceHotspots(passBreakdown.allCandidates);
+        const estimatedGpuTimeText = stats.estimatedGpuTimeAvailable && stats.estimatedGpuTimeUs != null
+            ? (stats.estimatedGpuTimeUs >= 1000 ? (stats.estimatedGpuTimeUs / 1000).toFixed(2) + ' ms' : stats.estimatedGpuTimeUs.toFixed(0) + ' us')
+            : 'Unavailable';
 
-        let html = '<div class="stat-row">';
-        html += stat(drawCount, 'Events');
-        html += stat(texCount, 'Textures');
-        html += stat(bufCount, 'Buffers');
-        html += stat(shdCount, 'Shaders');
-        html += '</div>';
+        let frameSummary = 'Balanced frame composition with no dominant pressure source.';
+        if (textureShare >= 0.58) frameSummary = 'Texture residency is the dominant pressure source in this frame.';
+        else if (rtShare >= 0.3) frameSummary = 'Render-target footprint suggests a bandwidth-heavy multi-pass frame.';
+        else if (Number(stats.dispatchCount || 0) > Number(stats.drawCount || 0)) frameSummary = 'Compute dispatch work is heavier than graphics draw submission in this frame.';
+        else if (stateChangeTotal > Math.max(1, Number(stats.drawCount || 0)) * 0.75) frameSummary = 'Driver-facing state churn is elevated relative to the draw count.';
 
-        html += '<div class="info-grid">';
-        for (const [k, v] of [
-            ['API', info.api],
-            ['Driver', info.driver],
-            ['RenderDoc Version', info.rdocVersion],
-            ['Machine ID', info.machineIdent],
-            ['Timestamp', info.timestamp],
-            ['Frame Count', info.frameCount],
-            ['Sections', info.sectionCount],
-            ['File', info.filePath],
+        let html = '<div class="overview-shell">';
+        html += '<section class="ov-hero">';
+        html += '<div class="ov-hero-main">';
+        html += '<div class="ov-eyebrow">Frame Performance Overview</div>';
+        html += '<h2 class="ov-title">' + esc(fileName) + '</h2>';
+        html += '<p class="ov-summary">' + esc(frameSummary) + '</p>';
+        html += '<div class="ov-badges">';
+        for (const badge of [
+            info.api ? ('API · ' + info.api) : '',
+            info.driver ? ('Driver · ' + info.driver) : '',
+            'Stats · ' + (hasNativeStats ? 'Native' : 'Derived'),
+            info.frameCount != null ? ('Frames · ' + info.frameCount) : '',
+            info.sectionCount != null ? ('Sections · ' + info.sectionCount) : '',
         ]) {
-            if (v == null || v === '') continue;
-            html += '<div class="k">' + esc(k) + '</div><div class="v">' + esc(String(v)) + '</div>';
+            if (!badge) continue;
+            html += '<span class="ov-badge">' + esc(badge) + '</span>';
         }
         html += '</div>';
+        html += '</div>';
+        html += '<div class="ov-hero-side">';
+        html += renderOverviewMiniMetric('Events', formatCompactNumber(eventCount), 'Replay event graph size');
+        html += renderOverviewMiniMetric('Textures', formatCompactNumber(texCount), 'Tracked texture resources');
+        html += renderOverviewMiniMetric('Buffers', formatCompactNumber(bufCount), 'Tracked buffer resources');
+        html += renderOverviewMiniMetric('Shaders', formatCompactNumber(shdCount), 'Shader resource count');
+        html += '</div>';
+        html += '</section>';
 
-        if (state.drawCall) {
-            html += '<h3>Current Event</h3>';
-            html += '<div class="info-grid">';
-            for (const [k, v] of [
-                ['EID', state.drawCall.eventId],
-                ['Name', state.drawCall.name],
-                ['Indices', state.drawCall.numIndices],
-                ['Instances', state.drawCall.numInstances],
-                ['Flags', state.drawCall.flags],
-            ]) {
-                if (v == null || v === '' || v === 0) continue;
-                html += '<div class="k">' + esc(k) + '</div><div class="v">' + esc(String(v)) + '</div>';
-            }
-            html += '</div>';
-        }
+        html += '<div class="ov-metric-grid">';
+        html += renderOverviewMetricCard('Draw Calls', formatCompactNumber(stats.drawCount), 'Graphics submissions in frame', 'accent');
+        html += renderOverviewMetricCard('API Calls', formatCompactNumber(stats.apiCallCount), 'Driver-facing call volume', 'accent');
+        html += renderOverviewMetricCard('Dispatch Calls', formatCompactNumber(stats.dispatchCount), 'Compute submissions in frame', 'info');
+        html += renderOverviewMetricCard('Estimated GPU Time', estimatedGpuTimeText, stats.estimatedGpuTimeAvailable ? 'Summed workload event durations' : 'EventGPUDuration counter unavailable', stats.estimatedGpuTimeAvailable ? 'accent' : 'info');
+        html += renderOverviewMetricCard('GPU Footprint', formatByteSize(stats.totalGpuBytes), 'Tracked texture + buffer residency', 'accent');
+        html += renderOverviewMetricCard('Bandwidth Working Set', formatByteSize(bandwidthWorkingSet), 'Texture + RT residency proxy', 'warn');
+        html += renderOverviewMetricCard('Render Target Memory', formatByteSize(stats.renderTargetBytes), formatCompactNumber(stats.renderTargetCount) + ' tracked RTs', 'warn');
+        html += renderOverviewMetricCard('RT Switches', formatCompactNumber(stats.renderTargetSwitches), 'Coarse pass changes from action outputs', 'warn');
+        html += renderOverviewMetricCard('Overdraw Risk', overdrawRisk.label, overdrawRisk.rationale, overdrawRisk.tone);
+        html += '</div>';
+
+        html += '<div class="ov-grid ov-grid-2">';
+        html += renderOverviewSection(
+            'Memory & Bandwidth',
+            'Frame footprint split by major residency buckets. This is the fastest way to see what is likely stressing memory and bandwidth.',
+            '<div class="ov-mini-grid">' +
+                renderOverviewMiniMetric('Textures', formatByteSize(stats.textureBytes), formatCompactNumber(stats.textureCount) + ' resources') +
+                renderOverviewMiniMetric('Large Textures', formatByteSize(stats.largeTextureBytes), formatOverviewPercent((stats.textureBytes || 0) > 0 ? (stats.largeTextureBytes || 0) / stats.textureBytes : 0) + ' of texture memory') +
+                renderOverviewMiniMetric('Buffers', formatByteSize(stats.bufferBytes), formatCompactNumber(stats.bufferCount) + ' resources') +
+                renderOverviewMiniMetric('Vertex Buffers', formatByteSize(stats.vertexBufferBytes), 'Geometry streaming footprint') +
+                renderOverviewMiniMetric('Index Buffers', formatByteSize(stats.indexBufferBytes), 'Index topology footprint') +
+                renderOverviewMiniMetric('Avg Texture Size', Math.round(stats.avgTextureWidth || 0) + ' × ' + Math.round(stats.avgTextureHeight || 0), hasNativeStats ? 'Tracked native average' : 'Derived from resource list') +
+            '</div>' +
+            '<div class="ov-bars">' +
+                renderOverviewBar('Texture Share', stats.textureBytes, totalGpuBytes, formatOverviewPercent(textureShare), 'accent') +
+                renderOverviewBar('Render Target Share', stats.renderTargetBytes, totalGpuBytes, formatOverviewPercent(rtShare), 'warn') +
+                renderOverviewBar('Buffer Share', stats.bufferBytes, totalGpuBytes, formatOverviewPercent(bufferShare), 'info') +
+            '</div>'
+        );
+
+        html += renderOverviewSection(
+            'Execution Density',
+            'Submission volume and driver churn indicators pulled from the capture statistics summary.',
+            '<div class="ov-mini-grid">' +
+                renderOverviewMiniMetric('API / Work Ratio', formatOverviewRatio(stats.apiDrawDispatchRatio), 'API calls per draw + dispatch') +
+                renderOverviewMiniMetric('Shader Sets', formatCompactNumber(apiSummary.shaderSets || 0), 'Pipeline program changes') +
+                renderOverviewMiniMetric('Output Sets', formatCompactNumber(apiSummary.outputSets || 0), 'Render target / OM changes') +
+                renderOverviewMiniMetric('RT Switches', formatCompactNumber(stats.renderTargetSwitches), 'Transitions between output sets') +
+                renderOverviewMiniMetric('Resource Updates', formatCompactNumber(apiSummary.resourceUpdates || 0), 'Upload / update activity') +
+                renderOverviewMiniMetric('Sampler Sets', formatCompactNumber(apiSummary.samplerSets || 0), 'Sampler state changes') +
+                renderOverviewMiniMetric('Resource Sets', formatCompactNumber(apiSummary.resourceSets || 0), 'Descriptor / resource bindings') +
+                renderOverviewMiniMetric('Overdraw Signal', formatOverviewPercent(overdrawRisk.score), formatOverviewPercent(overdrawRisk.transparentRatio) + ' transparent-like draw ratio') +
+            '</div>' +
+            '<div class="ov-bars">' +
+                renderOverviewBar('Shader Churn', apiSummary.shaderSets || 0, Math.max(1, stats.drawCount), formatOverviewRatio((apiSummary.shaderSets || 0) / Math.max(1, stats.drawCount)) + ' / draw', 'accent') +
+                renderOverviewBar('Output Churn', apiSummary.outputSets || 0, Math.max(1, stats.drawCount), formatOverviewRatio((apiSummary.outputSets || 0) / Math.max(1, stats.drawCount)) + ' / draw', 'warn') +
+                renderOverviewBar('RT Switch Density', stats.renderTargetSwitches || 0, Math.max(1, stats.drawCount), formatOverviewRatio((stats.renderTargetSwitches || 0) / Math.max(1, stats.drawCount)) + ' / draw', 'warn') +
+                renderOverviewBar('Update Density', apiSummary.resourceUpdates || 0, Math.max(1, stats.drawCount + stats.dispatchCount), formatOverviewRatio((apiSummary.resourceUpdates || 0) / Math.max(1, stats.drawCount + stats.dispatchCount)) + ' / work item', 'info') +
+            '</div>'
+        );
+        html += '</div>';
+
+        html += renderOverviewSection(
+            'Pass Hotspots',
+            'Most workload-heavy marker groups inferred from the EventBrowser hierarchy. Use this to see which passes are most likely driving frame cost before drilling into Pipeline or Events.',
+            passBreakdown.top.length
+                ? '<div class="ov-pass-grid">' + passBreakdown.top.map((candidate) => renderOverviewPassCard(candidate, passBreakdown.totalMetric, passBreakdown.hasTimingData)).join('') + '</div>'
+                : '<div class="pipe-empty">No pass groups with meaningful workload were detected in the current event tree.</div>'
+        );
+
+        html += '<div class="ov-grid ov-grid-2">';
+        html += renderOverviewSection(
+            'Resource Hotspots',
+            'Largest tracked textures and buffers in the current capture. These are good first candidates when memory or bandwidth pressure is high.',
+            '<div class="ov-resource-grid">' +
+                resourceHotspots.topTextures.map((entry) => renderOverviewResourceCard(entry, 'warn')).join('') +
+                resourceHotspots.topBuffers.map((entry) => renderOverviewResourceCard(entry, 'info')).join('') +
+            '</div>'
+        );
+        html += renderOverviewSection(
+            'Capture Context',
+            'Replay, capture, and storage metadata for this frame. Useful for correlating footprint changes with the actual capture artifact size.',
+            '<div class="ov-kv-grid">' +
+                '<div class="k">File</div><div class="v">' + esc(info.filePath) + '</div>' +
+                (info.timestamp ? '<div class="k">Timestamp</div><div class="v">' + esc(String(info.timestamp)) + '</div>' : '') +
+                (info.machineIdent ? '<div class="k">Machine ID</div><div class="v">' + esc(String(info.machineIdent)) + '</div>' : '') +
+                (info.rdocVersion ? '<div class="k">RenderDoc</div><div class="v">' + esc(String(info.rdocVersion)) + '</div>' : '') +
+                '<div class="k">Compressed</div><div class="v">' + esc(formatByteSize(stats.compressedFileSize)) + '</div>' +
+                '<div class="k">Uncompressed</div><div class="v">' + esc(formatByteSize(stats.uncompressedFileSize)) + '</div>' +
+                '<div class="k">Persistent Data</div><div class="v">' + esc(formatByteSize(stats.persistentSize)) + '</div>' +
+                '<div class="k">Init Data</div><div class="v">' + esc(formatByteSize(stats.initDataSize)) + '</div>' +
+            '</div>'
+        );
+
+        html += renderOverviewSection(
+            'Auto Findings',
+            'Short conclusions inferred from the current frame statistics. These are heuristic summaries intended to speed up triage, not replace detailed profiling.',
+            '<div class="ov-findings">' + findings.map((finding) =>
+                '<article class="ov-finding ' + esc(finding.tone) + '">' +
+                    '<div class="ov-finding-title">' + esc(finding.title) + '</div>' +
+                    '<div class="ov-finding-text">' + esc(finding.text) + '</div>' +
+                '</article>'
+            ).join('') + '</div>'
+        );
+        html += '</div>';
+        html += '</div>';
         body.innerHTML = html;
+        body.querySelectorAll('.ov-pass-card[data-eid]').forEach((el) => {
+            el.addEventListener('click', () => {
+                const eventId = parseInt(el.dataset.eid || '', 10);
+                if (!Number.isNaN(eventId) && eventId > 0) {
+                    state.graphFocus = { key: el.dataset.focusKey || null, eventId };
+                    switchTab('pipelinegraph');
+                }
+            });
+        });
+        body.querySelectorAll('.ov-resource-card[data-resid]').forEach((el) => {
+            el.addEventListener('click', () => {
+                const eventId = parseInt(el.dataset.eid || '', 10);
+                if (!Number.isNaN(eventId) && eventId > 0 && el.dataset.focusKey) {
+                    state.graphFocus = { key: el.dataset.focusKey, eventId };
+                    switchTab('pipelinegraph');
+                    return;
+                }
+                activateResourceById(el.dataset.resid);
+            });
+        });
     }
     const stat = (n, l) => '<div class="stat-card"><div class="n">' + n + '</div><div class="l">' + l + '</div></div>';
 
@@ -320,6 +898,13 @@
         const shaders = p.shaders || {};
         const fb = p.framebuffer || {};
         const vi = p.vertexInput || {};
+        const rasterizer = p.rasterizer || {};
+        const depthStencil = p.depthStencil || {};
+        const blendState = p.blendState || {};
+        const blendTargets = Array.isArray(blendState.targets) ? blendState.targets : [];
+        const samplers = Array.isArray(p.samplers) ? p.samplers : [];
+        const boundTextures = Array.isArray(p.boundTextures) ? p.boundTextures : [];
+        const resMap = resById();
 
         let html = '<div class="info-grid">';
         html += '<div class="k">API</div><div class="v">' + esc(p.api || '?') + '</div>';
@@ -327,42 +912,121 @@
         if (state.drawCall) html += '<div class="k">Draw</div><div class="v">' + esc(state.drawCall.name) + '</div>';
         html += '</div>';
 
-        html += '<div class="pipe-subtitle">Graphics Pipeline</div>';
-        html += '<div class="pipe-flow">';
-        GFX_PIPELINE.forEach((stage, idx) => {
-            if (idx > 0) html += '<span class="pipe-arrow">▼</span>';
-            html += renderPipelineStage(stage, shaders, fb, vi);
-        });
+        html += '<div class="stat-row">';
+        html += stat(Object.keys(shaders).length, 'Bound Stages');
+        html += stat((fb.colorTargets || []).length, 'Color Targets');
+        html += stat((vi.vertexBuffers || []).length, 'Vertex Buffers');
+        html += stat(boundTextures.length, 'Bound Textures');
+        html += stat(samplers.length, 'Samplers');
         html += '</div>';
+
+        const diagnostics = buildPipelineDiagnostics(p, vi, fb, shaders, boundTextures, samplers);
+        if (diagnostics.length) {
+            html += renderPipelineCard(
+                'State Diagnostics',
+                'Quick heuristics to highlight suspicious or noteworthy fixed-function state at this event.',
+                '<div class="pipe-diagnostic-list">' + diagnostics.map((diag) =>
+                    '<div class="pipe-diagnostic ' + diag.kind + '"><div class="pipe-diagnostic-title">' + esc(diag.title) + '</div><div class="pipe-diagnostic-text">' + esc(diag.text) + '</div></div>'
+                ).join('') + '</div>',
+                'pipe-card-compact'
+            );
+        }
+
+        html += renderPipelineCard(
+            'Graphics Pipeline',
+            'Bound programmable stages and fixed-function flow at the selected event.',
+            (() => {
+                let flowHtml = '<div class="pipe-flow">';
+                GFX_PIPELINE.forEach((stage, idx) => {
+                    if (idx > 0) flowHtml += '<span class="pipe-arrow">▼</span>';
+                    flowHtml += renderPipelineStage(stage, shaders, fb, vi);
+                });
+                flowHtml += '</div>';
+                return flowHtml;
+            })(),
+            'pipe-card-flow'
+        );
 
         const cs = resolveShader(shaders, 'compute', []);
         if (cs) {
-            html += '<div class="pipe-subtitle">Compute Pipeline</div>';
-            html += '<div class="pipe-flow">';
-            html += renderPipelineStage({ id: 'compute', kind: 'Shader', label: 'Compute Shader' }, shaders, fb, vi);
-            html += '</div>';
+            html += renderPipelineCard(
+                'Compute Pipeline',
+                'Standalone compute state when the selected event uses a compute shader.',
+                '<div class="pipe-flow">' + renderPipelineStage({ id: 'compute', kind: 'Shader', label: 'Compute Shader' }, shaders, fb, vi) + '</div>',
+                'pipe-card-flow'
+            );
         }
 
         const colorRTs = fb.colorTargets || [];
-        if (colorRTs.length || fb.depthTarget) {
-            html += '<div class="pipe-subtitle">Render Targets</div><div>';
-            for (const rt of colorRTs) {
-                html += '<span class="resource-chip" data-resid="' + esc(rt) + '">' + esc(resName(rt)) + '</span>';
-            }
-            if (fb.depthTarget) {
-                html += '<span class="resource-chip depth" data-resid="' + esc(fb.depthTarget) + '">DS: ' + esc(resName(fb.depthTarget)) + '</span>';
-            }
-            html += '</div>';
+        const vbs = vi.vertexBuffers || [];
+
+        const fixedStateCards = [];
+        fixedStateCards.push(renderPipelineCard('Rasterizer State', 'Cull/fill/depth-bias setup for the current draw.', renderPipelineKvGrid([
+            ['Fill Mode', formatPipelineValue(rasterizer.fillMode)],
+            ['Cull Mode', formatPipelineValue(rasterizer.cullMode)],
+            ['Front CCW', formatPipelineBool(rasterizer.frontCCW)],
+            ['Depth Bias', formatPipelineValue(rasterizer.depthBias)],
+            ['Slope Bias', formatPipelineValue(rasterizer.slopeScaledDepthBias)],
+            ['Depth Clamp', formatPipelineValue(rasterizer.depthClampEnable ?? rasterizer.depthClamp)],
+            ['Depth Clip', formatPipelineValue(rasterizer.depthClipEnable ?? rasterizer.depthClip)],
+            ['Scissor', formatPipelineBool(rasterizer.scissorEnable)],
+            ['MSAA', formatPipelineBool(rasterizer.multisampleEnable)],
+            ['Raster Discard', formatPipelineBool(rasterizer.rasterizerDiscard)],
+            ['Line Width', formatPipelineValue(rasterizer.lineWidth)],
+            ['Point Size', formatPipelineValue(rasterizer.pointSize)],
+        ]), 'pipe-card-compact'));
+
+        fixedStateCards.push(renderPipelineCard('Depth / Stencil', 'Depth test, writes, and front/back stencil operations.', renderPipelineKvGrid([
+            ['Depth Test', formatPipelineBool(depthStencil.depthEnable)],
+            ['Depth Write', formatPipelineBool(depthStencil.depthWrites)],
+            ['Depth Func', formatPipelineValue(depthStencil.depthFunc)],
+            ['Stencil Test', formatPipelineBool(depthStencil.stencilEnable)],
+            ['Front Face', formatStencilFace(depthStencil.frontFace)],
+            ['Back Face', formatStencilFace(depthStencil.backFace)],
+        ]), 'pipe-card-compact'));
+
+        fixedStateCards.push(renderPipelineCard('Blend State', 'Blend factor and per-target color/alpha blend setup.', renderPipelineKvGrid([
+            ['Alpha To Coverage', formatPipelineBool(blendState.alphaToCoverage)],
+            ['Independent Blend', formatPipelineBool(blendState.independentBlend)],
+            ['Blend Factor', formatPipelineArray(blendState.blendFactor)],
+            ['Targets', formatPipelineValue(blendTargets.length)],
+        ]) + renderBlendTargets(blendTargets), 'pipe-card-compact'));
+
+        html += '<div class="pipe-grid pipe-grid-3">' + fixedStateCards.join('') + '</div>';
+
+        if (colorRTs.length || fb.depthTarget || fb.stencilTarget) {
+            html += renderPipelineCard(
+                'Render Targets',
+                'Current color, depth, and stencil attachments used by the output-merger/framebuffer stage.',
+                renderRenderTargetSection(colorRTs, fb, resMap)
+            );
         }
 
-        const vbs = vi.vertexBuffers || [];
         if (vbs.length || vi.indexBuffer) {
-            html += '<div class="pipe-subtitle">Vertex Input</div><div>';
-            vbs.forEach((vb, i) => {
-                html += '<span class="resource-chip" data-resid="' + esc(vb.resourceId) + '">VB' + i + ': ' + esc(resName(vb.resourceId)) + '</span>';
-            });
-            if (vi.indexBuffer) {
-                html += '<span class="resource-chip" data-resid="' + esc(vi.indexBuffer) + '">IB: ' + esc(resName(vi.indexBuffer)) + '</span>';
+            html += renderPipelineCard(
+                'Vertex Input',
+                'Index and vertex buffers feeding the input assembler at this event.',
+                renderVertexInputSection(vi, resMap)
+            );
+        }
+
+        if (boundTextures.length || samplers.length) {
+            html += '<div class="pipe-grid pipe-grid-2">';
+            if (boundTextures.length) {
+                html += renderPipelineCard(
+                    'Bound Textures',
+                    'Sampler-visible textures referenced by the currently selected pipeline state.',
+                    '<div class="pipe-chip-wrap">' + boundTextures.map((rid) => renderResourceChip(rid)).join('') + '</div>',
+                    'pipe-card-compact'
+                );
+            }
+            if (samplers.length) {
+                html += renderPipelineCard(
+                    'Samplers',
+                    'Resolved sampler descriptor state including filters, addressing, compare, and LOD range.',
+                    renderSamplerSection(samplers),
+                    'pipe-card-compact'
+                );
             }
             html += '</div>';
         }
@@ -375,7 +1039,7 @@
             });
         });
         body.querySelectorAll('.resource-chip[data-resid]').forEach(el => {
-            el.addEventListener('click', () => openTextureModal(el.dataset.resid));
+            el.addEventListener('click', () => activateResourceById(el.dataset.resid));
         });
     }
     function renderPipelineStage(stage, shaders, fb, vi) {
@@ -408,7 +1072,8 @@
             }
         } else if (stage.id === 'ia') {
             const vbCount = (vi.vertexBuffers || []).length;
-            html += '<span class="ps-meta">' + vbCount + ' VB' + (vbCount === 1 ? '' : 's') + (vi.indexBuffer ? ' + IB' : '') + '</span>';
+            const topo = vi.topology ? (' · ' + vi.topology) : '';
+            html += '<span class="ps-meta">' + vbCount + ' VB' + (vbCount === 1 ? '' : 's') + (vi.indexBuffer ? ' + IB' : '') + topo + '</span>';
         } else if (stage.id === 'raster') {
             html += '<span class="ps-meta">fixed-function</span>';
         } else if (stage.id === 'om') {
@@ -419,6 +1084,253 @@
         return html;
     }
 
+    function activateResourceById(resId) {
+        if (!resId) return;
+        const resource = resById().get(String(resId));
+        if (resource) {
+            handleResourceActivation(resource);
+            return;
+        }
+        openTextureModal(String(resId));
+    }
+    function renderPipelineCard(title, subtitle, body, extraClass) {
+        let html = '<section class="pipe-card' + (extraClass ? ' ' + extraClass : '') + '">';
+        html += '<div class="pipe-card-header">';
+        html += '<div class="pipe-card-title">' + esc(title) + '</div>';
+        if (subtitle) html += '<div class="pipe-card-subtitle">' + esc(subtitle) + '</div>';
+        html += '</div>';
+        html += '<div class="pipe-card-body">' + body + '</div>';
+        html += '</section>';
+        return html;
+    }
+    function renderPipelineKvGrid(entries) {
+        const filtered = entries.filter((entry) => entry[1] !== '' && entry[1] !== undefined && entry[1] !== null);
+        if (!filtered.length) {
+            return '<div class="pipe-empty">No state reported for this section.</div>';
+        }
+        return '<div class="pipe-kv-grid">' + filtered.map(([label, value]) =>
+            '<div class="pipe-k">' + esc(label) + '</div><div class="pipe-v">' + value + '</div>'
+        ).join('') + '</div>';
+    }
+    function renderPipelineTable(headers, rows) {
+        if (!rows.length) return '<div class="pipe-empty">No entries.</div>';
+        let html = '<div class="pipe-table-wrap"><table class="pipe-table"><thead><tr>';
+        html += headers.map((header) => '<th>' + esc(header) + '</th>').join('');
+        html += '</tr></thead><tbody>';
+        html += rows.map((row) => '<tr>' + row.map((cell) => '<td>' + cell + '</td>').join('') + '</tr>').join('');
+        html += '</tbody></table></div>';
+        return html;
+    }
+    function renderRenderTargetSection(colorRTs, framebuffer, resMap) {
+        const rows = [];
+        colorRTs.forEach((rid, idx) => {
+            const resource = resMap.get(String(rid));
+            rows.push([
+                esc('RT' + idx),
+                renderResourceChip(rid),
+                esc(resource?.format || 'Unknown'),
+                esc(formatResourceExtent(resource)),
+                esc(formatByteSize(resource?.byteSize)),
+            ]);
+        });
+        if (framebuffer.depthTarget) {
+            const resource = resMap.get(String(framebuffer.depthTarget));
+            rows.push([
+                esc('Depth'),
+                renderResourceChip(framebuffer.depthTarget, 'DS: ' + resName(framebuffer.depthTarget), 'depth'),
+                esc(resource?.format || 'Unknown'),
+                esc(formatResourceExtent(resource)),
+                esc(formatByteSize(resource?.byteSize)),
+            ]);
+        }
+        if (framebuffer.stencilTarget && String(framebuffer.stencilTarget) !== String(framebuffer.depthTarget)) {
+            const resource = resMap.get(String(framebuffer.stencilTarget));
+            rows.push([
+                esc('Stencil'),
+                renderResourceChip(framebuffer.stencilTarget, 'ST: ' + resName(framebuffer.stencilTarget), 'depth'),
+                esc(resource?.format || 'Unknown'),
+                esc(formatResourceExtent(resource)),
+                esc(formatByteSize(resource?.byteSize)),
+            ]);
+        }
+        return renderPipelineTable(['Slot', 'Resource', 'Format', 'Extent', 'Bytes'], rows);
+    }
+    function renderVertexInputSection(vertexInput, resMap) {
+        const body = [];
+        const indexResource = vertexInput.indexBuffer ? resMap.get(String(vertexInput.indexBuffer)) : null;
+        body.push(renderPipelineKvGrid([
+            ['Topology', formatPipelineValue(vertexInput.topology)],
+            ['Primitive Restart', formatPipelineBool(vertexInput.primitiveRestart)],
+            ['Restart Index', formatPipelineValue(vertexInput.restartIndex)],
+            ['Index Buffer', vertexInput.indexBuffer ? renderResourceChip(vertexInput.indexBuffer, 'IB: ' + resName(vertexInput.indexBuffer)) : '<span class="pipe-muted">—</span>'],
+            ['Index Stride', formatPipelineValue(vertexInput.indexStride != null ? vertexInput.indexStride + ' B' : undefined)],
+            ['Index Bytes', formatPipelineValue(formatByteSize(indexResource?.byteSize))],
+        ]));
+        const rows = (vertexInput.vertexBuffers || []).map((vb, idx) => {
+            const resource = resMap.get(String(vb.resourceId));
+            return [
+                esc('VB' + idx),
+                renderResourceChip(vb.resourceId),
+                esc(vb.stride != null ? vb.stride + ' B' : '—'),
+                esc(vb.offset != null ? vb.offset + ' B' : '0 B'),
+                esc(formatResourceExtent(resource)),
+                esc(formatByteSize(resource?.byteSize)),
+            ];
+        });
+        body.push(renderPipelineTable(['Slot', 'Resource', 'Stride', 'Offset', 'Extent', 'Bytes'], rows));
+        if (Array.isArray(vertexInput.attributes) && vertexInput.attributes.length) {
+            body.push(renderAttributeSection(vertexInput.attributes));
+        }
+        return body.join('');
+    }
+    function renderAttributeSection(attributes) {
+        const rows = attributes.map((attr, idx) => [
+            esc(attr.name || ('Attr ' + idx)),
+            esc(attr.location != null ? String(attr.location) : '—'),
+            esc(attr.slot != null ? String(attr.slot) : '—'),
+            esc(attr.format || 'Unknown'),
+            esc(attr.offset != null ? attr.offset + ' B' : '0 B'),
+            attr.enabled === false ? '<span class="pipe-muted">Disabled</span>' : formatPipelineBool(!!attr.used),
+            attr.perInstance ? esc('Per-instance ×' + (attr.instanceRate != null ? attr.instanceRate : 1)) : '<span class="pipe-muted">Per-vertex</span>',
+        ]);
+        return '<div class="pipe-section-subtitle">Attributes</div>' + renderPipelineTable(['Attribute', 'Location', 'VB Slot', 'Format', 'Offset', 'Used', 'Rate'], rows);
+    }
+    function renderBlendTargets(targets) {
+        if (!targets.length) return '<div class="pipe-empty">No per-target blend descriptors were reported.</div>';
+        const rows = targets.map((target) => [
+            esc('RT' + target.index),
+            formatPipelineBool(target.enabled),
+            esc(formatWriteMask(target.writeMask)),
+            esc(formatBlendOp(target.colorBlend)),
+            esc(formatBlendOp(target.alphaBlend)),
+            formatPipelineBool(target.logicOpEnabled),
+        ]);
+        return renderPipelineTable(['Target', 'Enabled', 'Write Mask', 'Color Blend', 'Alpha Blend', 'Logic Op'], rows);
+    }
+    function renderSamplerSection(samplers) {
+        const rows = samplers.map((sampler, idx) => [
+            esc(sampler.name || ('Sampler ' + idx)),
+            esc([sampler.minFilter, sampler.magFilter, sampler.mipFilter].filter(Boolean).join(' / ') || '—'),
+            esc([sampler.addressU, sampler.addressV, sampler.addressW].filter(Boolean).join(' / ') || '—'),
+            sampler.compareEnable ? esc(sampler.compareFunc || 'Enabled') : '<span class="pipe-muted">Disabled</span>',
+            esc((sampler.minLOD != null ? sampler.minLOD : '0') + ' → ' + (sampler.maxLOD != null ? sampler.maxLOD : '∞')),
+            esc(sampler.maxAnisotropy != null ? String(sampler.maxAnisotropy) : '—'),
+        ]);
+        return renderPipelineTable(['Sampler', 'Filter', 'Address', 'Compare', 'LOD Range', 'Aniso'], rows);
+    }
+    function renderResourceChip(resourceId, label, extraClass) {
+        return '<span class="resource-chip' + (extraClass ? ' ' + extraClass : '') + '" data-resid="' + esc(String(resourceId)) + '">' + esc(label || resName(resourceId)) + '</span>';
+    }
+    function formatPipelineValue(value) {
+        if (value === undefined || value === null || value === '') return '<span class="pipe-muted">—</span>';
+        if (typeof value === 'boolean') return formatPipelineBool(value);
+        if (Array.isArray(value)) return esc(value.join(', '));
+        return esc(String(value));
+    }
+    function formatPipelineBool(value) {
+        if (value === undefined || value === null) return '<span class="pipe-muted">—</span>';
+        return '<span class="pipe-bool ' + (value ? 'on' : 'off') + '">' + (value ? 'Enabled' : 'Disabled') + '</span>';
+    }
+    function formatPipelineArray(value) {
+        if (!Array.isArray(value) || value.length === 0) return '<span class="pipe-muted">—</span>';
+        return esc(value.join(', '));
+    }
+    function formatStencilFace(face) {
+        if (!face || typeof face !== 'object') return '<span class="pipe-muted">—</span>';
+        const parts = [];
+        if (face.compareFunc) parts.push('Cmp ' + face.compareFunc);
+        if (face.passOp) parts.push('Pass ' + face.passOp);
+        if (face.failOp) parts.push('Fail ' + face.failOp);
+        if (face.depthFailOp) parts.push('DepthFail ' + face.depthFailOp);
+        return esc(parts.join(' · ') || 'Configured');
+    }
+    function formatBlendOp(blend) {
+        if (!blend || typeof blend !== 'object') return '—';
+        return [blend.src, blend.dst, blend.op].filter(Boolean).join(' / ');
+    }
+    function formatWriteMask(mask) {
+        if (mask === undefined || mask === null || mask === '') return '—';
+        if (typeof mask === 'string') return mask;
+        if (typeof mask !== 'number') return String(mask);
+        const channels = [];
+        if (mask & 0x1) channels.push('R');
+        if (mask & 0x2) channels.push('G');
+        if (mask & 0x4) channels.push('B');
+        if (mask & 0x8) channels.push('A');
+        return channels.length ? channels.join('') : 'None';
+    }
+    function formatResourceExtent(resource) {
+        if (!resource) return '—';
+        if (resource.width || resource.height || resource.depth) {
+            return [resource.width || 0, resource.height || 0].concat(resource.depth > 1 ? [resource.depth] : []).join(' × ');
+        }
+        return resource.format || '—';
+    }
+    function formatByteSize(bytes) {
+        if (bytes === undefined || bytes === null || Number.isNaN(Number(bytes))) return '—';
+        const value = Number(bytes);
+        if (value < 1024) return value + ' B';
+        if (value < 1024 * 1024) return (value / 1024).toFixed(1) + ' KB';
+        if (value < 1024 * 1024 * 1024) return (value / (1024 * 1024)).toFixed(2) + ' MB';
+        return (value / (1024 * 1024 * 1024)).toFixed(2) + ' GB';
+    }
+    function buildPipelineDiagnostics(pipeline, vertexInput, framebuffer, shaders, boundTextures, samplers) {
+        const diagnostics = [];
+        const colorTargets = framebuffer.colorTargets || [];
+        const blendTargets = Array.isArray(pipeline.blendState?.targets) ? pipeline.blendState.targets : [];
+        if (!colorTargets.length && !framebuffer.depthTarget) {
+            diagnostics.push({
+                kind: 'warn',
+                title: 'No framebuffer attachments reported',
+                text: 'The current event has no color or depth attachments in the pipeline snapshot. This can happen on setup/clear events or indicate incomplete state.',
+            });
+        }
+        if (pipeline.depthStencil?.depthEnable && !framebuffer.depthTarget) {
+            diagnostics.push({
+                kind: 'warn',
+                title: 'Depth test enabled without depth target',
+                text: 'Depth testing is on, but no depth attachment is currently reported. This often explains missing geometry or unexpected overdraw.',
+            });
+        }
+        if (blendTargets.some((target) => target.enabled) && !colorTargets.length) {
+            diagnostics.push({
+                kind: 'warn',
+                title: 'Blend enabled without color RT',
+                text: 'At least one blend target is active, but no color render target is bound in the current pipeline snapshot.',
+            });
+        }
+        if ((vertexInput.vertexBuffers || []).length > 0 && !Object.keys(shaders || {}).some((key) => key === 'vertex')) {
+            diagnostics.push({
+                kind: 'warn',
+                title: 'Vertex input without vertex shader',
+                text: 'Vertex buffers are bound, but there is no vertex shader stage reported. This can happen on compute events or indicate incomplete replay state.',
+            });
+        }
+        if ((boundTextures || []).length > 0 && !(samplers || []).length) {
+            diagnostics.push({
+                kind: 'info',
+                title: 'Textures are bound with no sampler descriptors',
+                text: 'Read-only textures are visible in the descriptor walk, but no distinct sampler objects were reported. The API may be using inline/default sampler state.',
+            });
+        }
+        const unusedAttrs = (vertexInput.attributes || []).filter((attr) => attr.enabled !== false && attr.used === false);
+        if (unusedAttrs.length) {
+            diagnostics.push({
+                kind: 'info',
+                title: 'Unused vertex attributes present',
+                text: unusedAttrs.length + ' vertex attribute(s) are enabled in the input layout but do not appear in shader reflection for the current vertex stage.',
+            });
+        }
+        if (vertexInput.primitiveRestart && !vertexInput.indexBuffer) {
+            diagnostics.push({
+                kind: 'warn',
+                title: 'Primitive restart enabled without index buffer',
+                text: 'Primitive restart is only relevant for indexed draws, but no index buffer is reported in the current input assembler state.',
+            });
+        }
+        return diagnostics;
+    }
+
     function renderGraphStat(label, value) {
         return '<div class="stat-card pg-stat"><div class="n">' + esc(value) + '</div><div class="l">' + esc(label) + '</div></div>';
     }
@@ -427,6 +1339,11 @@
     }
     function renderGraphTextChip(label, kind) {
         return '<span class="pg-chip' + (kind ? ' ' + kind : '') + '">' + esc(label) + '</span>';
+    }
+    function truncateGraphLabel(text, maxLength = 28) {
+        const value = String(text || '');
+        if (value.length <= maxLength) return value;
+        return value.slice(0, Math.max(1, maxLength - 1)) + '...';
     }
     function renderGraphList(items) {
         if (!items || items.length === 0) return '<div class="pg-note">None</div>';
@@ -474,6 +1391,84 @@
         };
         return map[kind] || 'Pass';
     }
+    function computeGraphNodeWorkload(stats) {
+        if (!stats) return 0;
+        return stats.draws + stats.dispatches * 1.4 + stats.copies * 0.55 + stats.clears * 0.3 + stats.presents * 0.2;
+    }
+    function describeFlowNode(node) {
+        const synthetic = !!node?.synthetic;
+        const stats = synthetic ? node.stats : collectNodeStats(node);
+        const gpuTimeUs = collectNodeGpuTimeUs(node);
+        const hasChildren = synthetic ? false : !!(node?.children && node.children.length);
+        const kind = synthetic ? node.kind : inferFlowKind(node?.name, node?.flags, stats, hasChildren);
+        const title = synthetic ? node.title : (node?.name || 'Unnamed pass');
+        return {
+            synthetic,
+            stats,
+            gpuTimeUs,
+            hasChildren,
+            kind,
+            title,
+            focusKey: makeGraphFocusKey(kind, stats, title),
+            metric: gpuTimeUs > 0 ? gpuTimeUs : computeGraphNodeWorkload(stats),
+        };
+    }
+    function buildPipelineGraphHeat(topLevel) {
+        const candidates = [];
+
+        function visit(node, depth) {
+            const descriptor = describeFlowNode(node);
+            candidates.push({ ...descriptor, node, depth });
+            if (!descriptor.synthetic) {
+                getFlowChildren(node).forEach((child) => visit(child, depth + 1));
+            }
+        }
+
+        function buildPath(node, depth) {
+            const descriptor = describeFlowNode(node);
+            const result = { metric: descriptor.metric, nodes: [{ ...descriptor, node, depth }] };
+            if (descriptor.synthetic) return result;
+            const children = getFlowChildren(node);
+            if (!children.length) return result;
+            let bestChildPath = null;
+            children.forEach((child) => {
+                const childPath = buildPath(child, depth + 1);
+                if (!bestChildPath || childPath.metric > bestChildPath.metric) bestChildPath = childPath;
+            });
+            if (bestChildPath?.nodes?.length) result.nodes.push(...bestChildPath.nodes);
+            return result;
+        }
+
+        (topLevel || []).forEach((node) => visit(node, 0));
+        const meaningful = candidates.filter((candidate) => candidate.metric > 0);
+        const preferredPasses = meaningful.filter((candidate) => !candidate.synthetic || candidate.depth === 0);
+        const passPool = preferredPasses.length ? preferredPasses : meaningful;
+        const hottestPass = passPool.sort((left, right) => right.metric - left.metric || left.depth - right.depth)[0] || null;
+
+        let hottestPath = null;
+        (topLevel || []).forEach((node) => {
+            const path = buildPath(node, 0);
+            if (!hottestPath || path.metric > hottestPath.metric) hottestPath = path;
+        });
+
+        const hottestPathKeys = new Set((hottestPath?.nodes || []).map((node) => node.focusKey));
+        return {
+            hottestPass,
+            hottestPath,
+            hottestPathKeys,
+            hottestPathMetric: hottestPath?.metric || 0,
+            hasTimingData: !!meaningful.find((candidate) => candidate.gpuTimeUs > 0),
+        };
+    }
+    function formatPipelineGraphHeatValue(metric, hasTimingData) {
+        return hasTimingData ? formatDurationUs(metric) : ('score ' + Number(metric || 0).toFixed(1));
+    }
+    function formatPipelineGraphHotPathLabel(path) {
+        const labels = (path?.nodes || []).map((node) => truncateGraphLabel(node.title, 24));
+        if (!labels.length) return 'Unavailable';
+        if (labels.length <= 3) return labels.join(' > ');
+        return labels[0] + ' > ' + labels[1] + ' > ...';
+    }
     function collectNodeStats(node) {
         const stats = {
             minEid: node && node.eventId != null ? node.eventId : Infinity,
@@ -512,6 +1507,22 @@
             if (out.length < limit) gatherLeafPreview(child, limit, out);
         });
         return out;
+    }
+    function isDrawCommand(node) {
+        return /drawcall/i.test(node?.flags || '');
+    }
+    function filterDrawCommandTree(nodes) {
+        const filtered = [];
+        (nodes || []).forEach(node => {
+            if (!node) return;
+            if (node.children?.length) {
+                const children = filterDrawCommandTree(node.children);
+                if (children.length) filtered.push({ ...node, children });
+            } else if (isDrawCommand(node)) {
+                filtered.push(node);
+            }
+        });
+        return filtered;
     }
     function compressLeafNodes(nodes) {
         if (!nodes.length) return [];
@@ -587,15 +1598,23 @@
                 + '</div>';
         }).join('') + '</div>';
     }
-    function renderFlowNode(node, depth, selectedSet) {
-        const synthetic = !!node.synthetic;
-        const stats = synthetic ? node.stats : collectNodeStats(node);
-        const hasChildren = synthetic ? false : !!(node.children && node.children.length);
-        const kind = synthetic ? node.kind : inferFlowKind(node.name, node.flags, stats, hasChildren);
+    function renderCommandSection(title, items) {
+        return '<div class="pg-section pg-command-section"><div class="pg-section-title">' + esc(title) + '</div>' + renderLeafPreview(items) + '</div>';
+    }
+    function renderFlowNode(node, depth, selectedSet, focusedGraphKey, heat) {
+        const descriptor = describeFlowNode(node);
+        const synthetic = descriptor.synthetic;
+        const stats = descriptor.stats;
+        const gpuTimeUs = descriptor.gpuTimeUs;
+        const hasChildren = descriptor.hasChildren;
+        const kind = descriptor.kind;
         const current = synthetic
             ? !!node.selected
             : (selectedSet.has(node.eventId) || (state.eventId != null && stats.minEid <= state.eventId && state.eventId <= stats.maxEid && selectedSet.has(node.eventId)));
-        const title = synthetic ? node.title : (node.name || 'Unnamed pass');
+        const title = descriptor.title;
+        const focusKey = descriptor.focusKey;
+        const hotPass = !!(heat?.hottestPass && heat.hottestPass.focusKey === focusKey);
+        const hotPath = !!heat?.hottestPathKeys?.has(focusKey);
         const subtitle = synthetic
             ? node.subtitle
             : (kindLabel(kind) + ' · ' + summarizeStats(stats));
@@ -603,36 +1622,57 @@
             renderGraphBadge(kindLabel(kind), kind),
             renderGraphBadge('EID ' + formatEidRange(stats.minEid, stats.maxEid), 'mono'),
         ];
+        if (gpuTimeUs > 0) badges.push(renderGraphBadge(formatDurationUs(gpuTimeUs), 'mono'));
+        if (hotPass) badges.push(renderGraphBadge('Hot Pass', 'hot'));
+        else if (hotPath) badges.push(renderGraphBadge('Hot Path', 'hot-path'));
         if (stats.draws) badges.push(renderGraphBadge(stats.draws + ' draws', 'mono'));
         if (stats.dispatches) badges.push(renderGraphBadge(stats.dispatches + ' dispatches', 'mono'));
-        const preview = synthetic ? node.preview : gatherLeafPreview(node, hasChildren ? 5 : 3);
+        const childModels = synthetic ? [] : getFlowChildren(node);
+        const nestedGroups = synthetic ? [] : childModels.filter(child => !child.synthetic);
+        const directDrawEvents = synthetic ? [] : childModels.flatMap(child => child.synthetic ? (child.events || []) : []);
+        const preview = synthetic ? (node.events || node.preview) : gatherLeafPreview(node, hasChildren ? 5 : 3);
         const sections = [
             renderGraphSection('Summary', [
                 summarizeStats(stats),
+                gpuTimeUs > 0 ? ('GPU time ' + formatDurationUs(gpuTimeUs)) : 'GPU time unavailable',
                 stats.markers > 1 ? (stats.markers - 1) + ' nested pass groups' : 'No nested pass groups',
                 'Leaf events ' + stats.leaves,
             ]),
-            '<div class="pg-section"><div class="pg-section-title">Representative Commands</div>' + renderLeafPreview(preview) + '</div>',
         ];
-        const childModels = synthetic ? [] : getFlowChildren(node);
+        if (synthetic) {
+            sections.push(renderCommandSection('Draw Commands', preview));
+        } else if (directDrawEvents.length) {
+            sections.push(renderCommandSection('Draw Commands In This Pass', directDrawEvents));
+        } else {
+            sections.push(renderCommandSection('Representative Commands', preview));
+        }
         let html = '<div class="pg-tree-node depth-' + depth + '">';
         html += renderGraphNode({
-            kind: 'flow-' + kind + (current ? ' current' : ''),
+            kind: 'flow-' + kind + (current ? ' current' : '') + (hotPass ? ' hot-pass' : '') + (hotPath ? ' hot-path' : ''),
             active: true,
             title,
             subtitle,
             badges,
-            chips: current && state.eventId != null ? [renderGraphTextChip('Selected EID ' + state.eventId, 'current')] : [],
+            chips: [
+                current && state.eventId != null ? renderGraphTextChip('Selected EID ' + state.eventId, 'current') : '',
+                hotPass ? renderGraphTextChip('Highest cost node', 'hot') : '',
+                (!hotPass && hotPath) ? renderGraphTextChip('On hottest chain', 'hot-path') : '',
+            ].filter(Boolean),
             note: !synthetic && node.flags && !hasChildren ? node.flags : undefined,
             sections,
+            focusKey,
+            focused: focusedGraphKey === focusKey,
+            eventId: synthetic ? (node.eid || stats.minEid) : stats.minEid,
         });
-        if (childModels.length) {
+        if (nestedGroups.length) {
             html += '<div class="pg-children">';
-            childModels.forEach((child, idx) => {
+            nestedGroups.forEach((child, idx) => {
+                const childDescriptor = describeFlowNode(child);
+                const connectorHot = hotPath && !!heat?.hottestPathKeys?.has(childDescriptor.focusKey);
                 html += '<div class="pg-child-link">';
                 if (idx > 0) html += '<div class="pg-child-spacer"></div>';
-                html += '<div class="pg-child-connector"></div>';
-                html += renderFlowNode(child, Math.min(depth + 1, 4), selectedSet);
+                html += '<div class="pg-child-connector' + (connectorHot ? ' hot' : '') + '"></div>';
+                html += renderFlowNode(child, Math.min(depth + 1, 4), selectedSet, focusedGraphKey, heat);
                 html += '</div>';
             });
             html += '</div>';
@@ -645,7 +1685,10 @@
         const breadcrumbs = options.breadcrumbs || [];
         const chips = options.chips || [];
         const sections = options.sections || [];
-        let html = '<div class="pg-node' + (options.kind ? ' ' + options.kind : '') + (!options.active ? ' inactive' : '') + '">';
+        const attrs = [];
+        if (options.focusKey) attrs.push('data-focus-key="' + esc(options.focusKey) + '"');
+        if (options.eventId != null) attrs.push('data-eid="' + esc(String(options.eventId)) + '"');
+        let html = '<div class="pg-node' + (options.kind ? ' ' + options.kind : '') + (!options.active ? ' inactive' : '') + (options.focused ? ' focused' : '') + (options.eventId != null ? ' clickable' : '') + '" ' + attrs.join(' ') + '>';
         html += '<div class="pg-node-header">';
         html += '<div class="pg-node-title-wrap">';
         html += '<div class="pg-node-title">' + esc(options.title || '') + '</div>';
@@ -676,6 +1719,22 @@
             + '<span class="pg-connector-arrow"></span>'
             + (label ? '<span class="pg-connector-label">' + esc(label) + '</span>' : '')
             + '</div>';
+    }
+    function focusPipelineGraphNode() {
+        if (state.activeTab !== 'pipelinegraph' || !state.graphFocus?.key) return;
+        const viewport = document.getElementById('pipeline-graph-viewport');
+        if (!viewport) return;
+        const target = viewport.querySelector('.pg-node[data-focus-key="' + CSS.escape(state.graphFocus.key) + '"]');
+        if (!target) return;
+
+        requestAnimationFrame(() => {
+            const viewportRect = viewport.getBoundingClientRect();
+            const targetRect = target.getBoundingClientRect();
+            const offsetLeft = (targetRect.left - viewportRect.left) + viewport.scrollLeft - Math.max(24, (viewport.clientWidth - targetRect.width) * 0.5);
+            const offsetTop = (targetRect.top - viewportRect.top) + viewport.scrollTop - Math.max(24, (viewport.clientHeight - targetRect.height) * 0.25);
+            viewport.scrollLeft = Math.max(0, offsetLeft);
+            viewport.scrollTop = Math.max(0, offsetTop);
+        });
     }
     function clampGraphZoom(zoom) {
         return Math.max(state.graphMinZoom, Math.min(state.graphMaxZoom, zoom));
@@ -742,22 +1801,28 @@
     function renderPipelineGraph() {
         const body = document.getElementById('pipeline-graph-body');
         if (!state.captureInfo || !state.drawCalls.length) {
-            body.textContent = 'Load a capture to view its render flow graph.';
+            body.textContent = 'Load a capture to view its draw command graph.';
             body.className = 'empty-state';
             return;
         }
-        const selectedPath = state.eventId != null ? (findEventPath(state.drawCalls, state.eventId) || []) : [];
+        const drawOnlyCalls = filterDrawCommandTree(state.drawCalls);
+        if (!drawOnlyCalls.length) {
+            body.textContent = 'No draw commands in this capture.';
+            body.className = 'empty-state';
+            return;
+        }
+        const selectedPath = state.eventId != null ? (findEventPath(drawOnlyCalls, state.eventId) || []) : [];
         const selectedSet = new Set(selectedPath.map(dc => dc.eventId));
-        const topLevel = compressLeafNodes(state.drawCalls);
-        const topStats = state.drawCalls.reduce((acc, node) => {
+        const focusedGraphKey = state.graphFocus?.key || null;
+        const topLevel = compressLeafNodes(drawOnlyCalls);
+        const heat = buildPipelineGraphHeat(topLevel);
+        const graphGpuTimeUs = state.timingsAvailable ? topLevel.reduce((sum, node) => sum + collectNodeGpuTimeUs(node), 0) : 0;
+        const topStats = drawOnlyCalls.reduce((acc, node) => {
             const sub = collectNodeStats(node);
             acc.events += sub.events;
             acc.draws += sub.draws;
-            acc.dispatches += sub.dispatches;
-            acc.clears += sub.clears;
-            acc.presents += sub.presents;
             return acc;
-        }, { events: 0, draws: 0, dispatches: 0, clears: 0, presents: 0 });
+        }, { events: 0, draws: 0 });
         const topKinds = new Set();
         topLevel.forEach(node => {
             if (node.synthetic) topKinds.add(node.kind);
@@ -767,17 +1832,21 @@
         let html = '<div class="pipeline-graph-shell">';
         html += '<div class="stat-row pg-summary">';
         html += renderGraphStat('Top-Level Steps', topLevel.length);
-        html += renderGraphStat('Events', topStats.events);
-        html += renderGraphStat('Draws', topStats.draws);
-        html += renderGraphStat('Dispatches', topStats.dispatches);
+        html += renderGraphStat('Draw Commands', topStats.draws);
+        html += renderGraphStat('Context Nodes', topStats.events - topStats.draws);
         html += renderGraphStat('Pass Kinds', topKinds.size);
+        if (graphGpuTimeUs > 0) html += renderGraphStat('GPU Time', formatDurationUs(graphGpuTimeUs));
+        if (heat.hottestPass) html += renderGraphStat('Hot Pass', formatPipelineGraphHeatValue(heat.hottestPass.metric, heat.hasTimingData));
         html += '</div>';
         html += '<div class="pg-hero">';
-        html += '<div class="pg-hero-title">Capture Render Flow</div>';
-        html += '<div class="pg-hero-text">This graph is built from the full RDC EventBrowser hierarchy. Marker groups become render passes, consecutive leaf events are compressed into inline command blocks, and the currently selected EID is highlighted in context.</div>';
+        html += '<div class="pg-hero-title">Capture Draw Commands</div>';
+        html += '<div class="pg-hero-text">This graph keeps only DrawCall events from the RDC EventBrowser hierarchy. Marker groups are retained only when they contain draw commands, and consecutive draw leaves are compressed into inline command blocks.</div>';
         html += '<div class="pg-chip-row">';
         html += renderGraphTextChip('API: ' + (state.captureInfo.api || 'Unknown'));
         html += renderGraphTextChip('Driver: ' + (state.captureInfo.driver || 'Unknown'));
+        html += renderGraphTextChip(state.timingsAvailable ? ('Timings: ' + formatDurationUs(graphGpuTimeUs)) : ('Timings: ' + (state.timingsError || 'Unavailable')));
+        if (heat.hottestPass) html += renderGraphTextChip('Hot Pass: ' + truncateGraphLabel(heat.hottestPass.title, 26) + ' · ' + formatPipelineGraphHeatValue(heat.hottestPass.metric, heat.hasTimingData), 'hot');
+        if (heat.hottestPath?.nodes?.length) html += renderGraphTextChip('Hot Chain: ' + formatPipelineGraphHotPathLabel(heat.hottestPath), 'hot-path');
         if (state.eventId != null) html += renderGraphTextChip('Focused EID ' + state.eventId, 'current');
         html += '</div>';
         html += '</div>';
@@ -785,7 +1854,7 @@
         html += '<div class="pg-tree">';
         topLevel.forEach((node, idx) => {
             if (idx > 0) html += renderGraphConnector('next stage');
-            html += renderFlowNode(node, 0, selectedSet);
+            html += renderFlowNode(node, 0, selectedSet, focusedGraphKey, heat);
         });
         html += '</div>';
 
@@ -793,27 +1862,42 @@
         body.className = '';
         body.innerHTML = html;
         applyPipelineGraphTransform();
+        focusPipelineGraphNode();
+        body.querySelectorAll('.pg-node.clickable[data-eid]').forEach((el) => {
+            el.addEventListener('click', (event) => {
+                event.stopPropagation();
+                const eventId = parseInt(el.dataset.eid || '', 10);
+                if (!Number.isNaN(eventId) && eventId > 0) {
+                    state.graphFocus = { key: el.dataset.focusKey || null, eventId };
+                    vscode.postMessage({ type: 'selectEvent', eventId });
+                }
+            });
+        });
     }
 
     // ── Shaders ────────────────────────────────────────────────────
     function renderShaders() {
         const body = document.getElementById('shaders-body');
         const toolbar = document.getElementById('shaders-toolbar');
+        const shaderPaneMeta = document.getElementById('shader-pane-meta');
         if (state.eventId == null) {
             body.textContent = 'Select an event.';
             body.className = 'code-view empty-state';
+            if (shaderPaneMeta) shaderPaneMeta.textContent = 'Select an event to inspect bound shader stages.';
             toolbar.hidden = true;
             return;
         }
         if (!state.shaders) {
             body.textContent = 'Loading shaders…';
             body.className = 'code-view empty-state';
+            if (shaderPaneMeta) shaderPaneMeta.textContent = 'Collecting shader source and stage metadata from the current event.';
             toolbar.hidden = true;
             return;
         }
         if (state.shaders.error) {
             body.textContent = 'Shader sources unavailable: ' + state.shaders.error + '\\n\\n(Local replay required.)';
             body.className = 'code-view empty-state';
+            if (shaderPaneMeta) shaderPaneMeta.textContent = 'Shader extraction needs an active local replay for this capture.';
             toolbar.hidden = true;
             return;
         }
@@ -822,6 +1906,7 @@
         if (stages.length === 0) {
             body.textContent = 'No bound shaders at this event.';
             body.className = 'code-view empty-state';
+            if (shaderPaneMeta) shaderPaneMeta.textContent = 'No shader stages are bound at the selected event.';
             toolbar.hidden = true;
             return;
         }
@@ -929,6 +2014,11 @@
         const files = Array.isArray(info.sourceFiles) ? info.sourceFiles : [];
         const hasDisasm = typeof info.disassembly === 'string' && info.disassembly.length > 0;
         const cur = state.activeShaderFile[state.activeShaderStage];
+        if (shaderPaneMeta) {
+            const fileCount = files.length;
+            const resourceText = rid ? (' · Resource ' + rid) : '';
+            shaderPaneMeta.textContent = state.activeShaderStage + ' stage' + resourceText + ' · ' + fileCount + ' source file' + (fileCount === 1 ? '' : 's') + (hasDisasm ? ' · disassembly available' : '');
+        }
         let code;
         if (cur === -1 && hasDisasm) {
             code = info.disassembly;
@@ -1121,12 +2211,300 @@
     }
 
     // ── Texture modal ──────────────────────────────────────────────
+    const TEXTURE_MODAL_STORAGE_KEY = 'renderdoc.textureModalBounds';
+    const TEXTURE_MODAL_MIN_WIDTH = 520;
+    const TEXTURE_MODAL_MIN_HEIGHT = 360;
+    const TEXTURE_MODAL_MIN_ZOOM = 0.1;
+    const TEXTURE_MODAL_MAX_ZOOM = 16;
+    const textureModalEl = document.getElementById('texture-modal');
+    const textureModalPanelEl = textureModalEl.querySelector('.modal-panel');
+    const textureModalHeaderEl = textureModalPanelEl.querySelector('.modal-header');
+    const textureModalResizeEl = textureModalPanelEl.querySelector('.modal-resize-handle');
+    const textureModalPreviewEl = document.getElementById('tex-modal-preview');
+    let textureModalDrag = null;
+    let textureModalResize = null;
+    let textureModalPan = null;
+    let textureModalZoom = 1;
+
+    function loadTextureModalBounds() {
+        try {
+            const raw = localStorage.getItem(TEXTURE_MODAL_STORAGE_KEY);
+            if (!raw) return null;
+            const parsed = JSON.parse(raw);
+            if (!parsed || typeof parsed !== 'object') return null;
+            return parsed;
+        } catch {
+            return null;
+        }
+    }
+
+    function saveTextureModalBounds() {
+        const style = textureModalPanelEl.style;
+        const left = parseFloat(style.left);
+        const top = parseFloat(style.top);
+        const width = parseFloat(style.width);
+        const height = parseFloat(style.height);
+        if (![left, top, width, height].every(Number.isFinite)) return;
+        try {
+            localStorage.setItem(TEXTURE_MODAL_STORAGE_KEY, JSON.stringify({ left, top, width, height }));
+        } catch {
+            // Ignore storage failures in webview sandboxes.
+        }
+    }
+
+    function clampTextureModalSize(width, height, left, top) {
+        const maxWidth = Math.max(TEXTURE_MODAL_MIN_WIDTH, textureModalEl.clientWidth - left);
+        const maxHeight = Math.max(TEXTURE_MODAL_MIN_HEIGHT, textureModalEl.clientHeight - top);
+        return {
+            width: Math.min(Math.max(TEXTURE_MODAL_MIN_WIDTH, width), maxWidth),
+            height: Math.min(Math.max(TEXTURE_MODAL_MIN_HEIGHT, height), maxHeight),
+        };
+    }
+
+    function clampTextureModalPosition(left, top) {
+        const maxLeft = Math.max(0, textureModalEl.clientWidth - textureModalPanelEl.offsetWidth);
+        const maxTop = Math.max(0, textureModalEl.clientHeight - textureModalPanelEl.offsetHeight);
+        return {
+            left: Math.min(Math.max(0, left), maxLeft),
+            top: Math.min(Math.max(0, top), maxTop),
+        };
+    }
+
+    function clampTextureModalZoom(zoom) {
+        return Math.min(Math.max(TEXTURE_MODAL_MIN_ZOOM, zoom), TEXTURE_MODAL_MAX_ZOOM);
+    }
+
+    function getTextureModalImageEl() {
+        return textureModalPreviewEl.querySelector('img');
+    }
+
+    function getTextureModalStageEl() {
+        return textureModalPreviewEl.querySelector('.tex-preview-stage');
+    }
+
+    function stopTextureModalPan() {
+        if (!textureModalPan) return;
+        try { textureModalPreviewEl.releasePointerCapture(textureModalPan.pointerId); } catch {}
+        textureModalPan = null;
+        textureModalPreviewEl.classList.remove('panning');
+        textureModalPreviewEl.removeEventListener('pointermove', onTextureModalPan);
+        textureModalPreviewEl.removeEventListener('pointerup', stopTextureModalPan);
+        textureModalPreviewEl.removeEventListener('pointercancel', stopTextureModalPan);
+    }
+
+    function startTextureModalPan(event) {
+        if (event.button !== 0) return;
+        if (!getTextureModalImageEl()) return;
+        if (event.target.closest('.muted')) return;
+        stopTextureModalDrag();
+        stopTextureModalResize();
+        textureModalPan = {
+            pointerId: event.pointerId,
+            startX: event.clientX,
+            startY: event.clientY,
+            scrollLeft: textureModalPreviewEl.scrollLeft,
+            scrollTop: textureModalPreviewEl.scrollTop,
+        };
+        textureModalPreviewEl.classList.add('panning');
+        textureModalPreviewEl.setPointerCapture(event.pointerId);
+        textureModalPreviewEl.addEventListener('pointermove', onTextureModalPan);
+        textureModalPreviewEl.addEventListener('pointerup', stopTextureModalPan);
+        textureModalPreviewEl.addEventListener('pointercancel', stopTextureModalPan);
+        event.preventDefault();
+        event.stopPropagation();
+    }
+
+    function onTextureModalPan(event) {
+        if (!textureModalPan) return;
+        textureModalPreviewEl.scrollLeft = textureModalPan.scrollLeft - (event.clientX - textureModalPan.startX);
+        textureModalPreviewEl.scrollTop = textureModalPan.scrollTop - (event.clientY - textureModalPan.startY);
+    }
+
+    function getTextureModalPreviewContentSize() {
+        const style = window.getComputedStyle(textureModalPreviewEl);
+        const padX = parseFloat(style.paddingLeft || '0') + parseFloat(style.paddingRight || '0');
+        const padY = parseFloat(style.paddingTop || '0') + parseFloat(style.paddingBottom || '0');
+        return {
+            width: Math.max(1, textureModalPreviewEl.clientWidth - padX),
+            height: Math.max(1, textureModalPreviewEl.clientHeight - padY),
+        };
+    }
+
+    function updateTextureModalImageScale() {
+        const img = getTextureModalImageEl();
+        const stage = getTextureModalStageEl();
+        textureModalPreviewEl.classList.toggle('has-image', !!img);
+        if (!img || !img.naturalWidth || !img.naturalHeight) return;
+        const previewSize = getTextureModalPreviewContentSize();
+        const fitScale = Math.min(
+            previewSize.width / img.naturalWidth,
+            previewSize.height / img.naturalHeight,
+            1,
+        );
+        const width = Math.max(1, Math.round(img.naturalWidth * fitScale * textureModalZoom));
+        const height = Math.max(1, Math.round(img.naturalHeight * fitScale * textureModalZoom));
+        img.style.width = width + 'px';
+        img.style.height = height + 'px';
+        if (stage) {
+            stage.style.width = Math.max(previewSize.width, width) + 'px';
+            stage.style.height = Math.max(previewSize.height, height) + 'px';
+        }
+        const pannable = textureModalPreviewEl.scrollWidth > textureModalPreviewEl.clientWidth
+            || textureModalPreviewEl.scrollHeight > textureModalPreviewEl.clientHeight;
+        textureModalPreviewEl.classList.toggle('has-image', pannable);
+        textureModalPreviewEl.title = 'Mouse wheel: zoom (' + Math.round(textureModalZoom * 100) + '%)';
+    }
+
+    function setTextureModalZoom(nextZoom) {
+        const clamped = clampTextureModalZoom(nextZoom);
+        if (Math.abs(clamped - textureModalZoom) < 0.0001) return;
+        textureModalZoom = clamped;
+        updateTextureModalImageScale();
+    }
+
+    function resetTextureModalZoom() {
+        textureModalZoom = 1;
+        updateTextureModalImageScale();
+        textureModalPreviewEl.scrollLeft = 0;
+        textureModalPreviewEl.scrollTop = 0;
+    }
+
+    function centerTextureModal() {
+        textureModalPanelEl.style.left = '50%';
+        textureModalPanelEl.style.top = '50%';
+        textureModalPanelEl.style.transform = 'translate(-50%, -50%)';
+        textureModalPanelEl.style.width = '';
+        textureModalPanelEl.style.height = '';
+    }
+
+    function applyTextureModalBounds(bounds) {
+        if (!bounds) {
+            centerTextureModal();
+            return false;
+        }
+        const safeLeft = Number.isFinite(bounds.left) ? bounds.left : 0;
+        const safeTop = Number.isFinite(bounds.top) ? bounds.top : 0;
+        const safeWidth = Number.isFinite(bounds.width) ? bounds.width : textureModalPanelEl.offsetWidth;
+        const safeHeight = Number.isFinite(bounds.height) ? bounds.height : textureModalPanelEl.offsetHeight;
+        const clampedPos = clampTextureModalPosition(safeLeft, safeTop);
+        const clampedSize = clampTextureModalSize(safeWidth, safeHeight, clampedPos.left, clampedPos.top);
+        textureModalPanelEl.style.transform = 'none';
+        textureModalPanelEl.style.left = clampedPos.left + 'px';
+        textureModalPanelEl.style.top = clampedPos.top + 'px';
+        textureModalPanelEl.style.width = clampedSize.width + 'px';
+        textureModalPanelEl.style.height = clampedSize.height + 'px';
+        return true;
+    }
+
+    function startTextureModalDrag(event) {
+        if (event.button !== 0) return;
+        if (event.target.closest('button, input, select, textarea, a')) return;
+        stopTextureModalPan();
+        stopTextureModalResize();
+        const rect = textureModalPanelEl.getBoundingClientRect();
+        textureModalDrag = {
+            pointerId: event.pointerId,
+            offsetX: event.clientX - rect.left,
+            offsetY: event.clientY - rect.top,
+        };
+        textureModalPanelEl.style.transform = 'none';
+        textureModalPanelEl.style.left = rect.left + 'px';
+        textureModalPanelEl.style.top = rect.top + 'px';
+        textureModalPanelEl.classList.add('dragging');
+        textureModalHeaderEl.setPointerCapture(event.pointerId);
+        textureModalHeaderEl.addEventListener('pointermove', onTextureModalDrag);
+        textureModalHeaderEl.addEventListener('pointerup', stopTextureModalDrag);
+        textureModalHeaderEl.addEventListener('pointercancel', stopTextureModalDrag);
+        event.preventDefault();
+        event.stopPropagation();
+    }
+
+    function onTextureModalDrag(event) {
+        if (!textureModalDrag) return;
+        const next = clampTextureModalPosition(
+            event.clientX - textureModalDrag.offsetX,
+            event.clientY - textureModalDrag.offsetY,
+        );
+        textureModalPanelEl.style.left = next.left + 'px';
+        textureModalPanelEl.style.top = next.top + 'px';
+    }
+
+    function stopTextureModalDrag() {
+        if (!textureModalDrag) return;
+        try { textureModalHeaderEl.releasePointerCapture(textureModalDrag.pointerId); } catch {}
+        textureModalDrag = null;
+        textureModalPanelEl.classList.remove('dragging');
+        textureModalHeaderEl.removeEventListener('pointermove', onTextureModalDrag);
+        textureModalHeaderEl.removeEventListener('pointerup', stopTextureModalDrag);
+        textureModalHeaderEl.removeEventListener('pointercancel', stopTextureModalDrag);
+        saveTextureModalBounds();
+    }
+
+    function startTextureModalResize(event) {
+        if (event.button !== 0) return;
+        stopTextureModalDrag();
+        stopTextureModalPan();
+        const rect = textureModalPanelEl.getBoundingClientRect();
+        textureModalResize = {
+            pointerId: event.pointerId,
+            startX: event.clientX,
+            startY: event.clientY,
+            startWidth: rect.width,
+            startHeight: rect.height,
+            left: rect.left,
+            top: rect.top,
+        };
+        textureModalPanelEl.style.transform = 'none';
+        textureModalPanelEl.style.left = rect.left + 'px';
+        textureModalPanelEl.style.top = rect.top + 'px';
+        textureModalPanelEl.style.width = rect.width + 'px';
+        textureModalPanelEl.style.height = rect.height + 'px';
+        textureModalPanelEl.classList.add('resizing');
+        if (textureModalResizeEl) {
+            textureModalResizeEl.setPointerCapture(event.pointerId);
+            textureModalResizeEl.addEventListener('pointermove', onTextureModalResize);
+            textureModalResizeEl.addEventListener('pointerup', stopTextureModalResize);
+            textureModalResizeEl.addEventListener('pointercancel', stopTextureModalResize);
+        }
+        event.preventDefault();
+        event.stopPropagation();
+    }
+
+    function onTextureModalResize(event) {
+        if (!textureModalResize) return;
+        const rawWidth = textureModalResize.startWidth + (event.clientX - textureModalResize.startX);
+        const rawHeight = textureModalResize.startHeight + (event.clientY - textureModalResize.startY);
+        const next = clampTextureModalSize(rawWidth, rawHeight, textureModalResize.left, textureModalResize.top);
+        textureModalPanelEl.style.width = next.width + 'px';
+        textureModalPanelEl.style.height = next.height + 'px';
+    }
+
+    function stopTextureModalResize() {
+        if (!textureModalResize) return;
+        if (textureModalResizeEl) {
+            try { textureModalResizeEl.releasePointerCapture(textureModalResize.pointerId); } catch {}
+        }
+        textureModalResize = null;
+        textureModalPanelEl.classList.remove('resizing');
+        if (textureModalResizeEl) {
+            textureModalResizeEl.removeEventListener('pointermove', onTextureModalResize);
+            textureModalResizeEl.removeEventListener('pointerup', stopTextureModalResize);
+            textureModalResizeEl.removeEventListener('pointercancel', stopTextureModalResize);
+        }
+        saveTextureModalBounds();
+    }
+
     function openTextureModal(resId) {
         const tex = state.resources.find(r => r.resourceId === resId);
         if (!tex) return;
         state.modalResource = tex;
         state.modalChannel = -1;
+        textureModalZoom = 1;
         document.getElementById('tex-modal-title').textContent = tex.name || 'Texture ' + resId;
+        const subtitle = document.getElementById('tex-modal-subtitle');
+        if (subtitle) {
+            subtitle.textContent = (tex.format || 'Unknown format') + ' · ' + (tex.width || 0) + ' × ' + (tex.height || 0) + ' · Resource ' + resId;
+        }
         document.getElementById('tex-modal-preview').innerHTML = '<div class="muted">Loading…</div>';
         const meta = document.getElementById('tex-modal-meta');
         meta.innerHTML = '<div class="info-grid">' +
@@ -1138,7 +2516,11 @@
             kv('Bytes', tex.byteSize) +
             '</div>';
         document.querySelectorAll('#channel-toggle .ch').forEach(b => b.classList.toggle('active', parseInt(b.dataset.ch) === -1));
-        document.getElementById('texture-modal').hidden = false;
+        textureModalEl.hidden = false;
+        if (!textureModalPanelEl.dataset.positioned) {
+            applyTextureModalBounds(loadTextureModalBounds());
+            textureModalPanelEl.dataset.positioned = 'true';
+        }
         requestTexture();
     }
 
@@ -1225,12 +2607,69 @@
         if (!state.modalResource) return;
         const expectedKey = state.modalResource.resourceId + ':0:' + (state.eventId||0) + ':' + state.modalChannel;
         if (m.key !== expectedKey) return;
-        const area = document.getElementById('tex-modal-preview');
-        if (m.error) { area.innerHTML = '<div class="muted">Error: ' + esc(m.error) + '</div>'; return; }
-        area.innerHTML = '<img src="data:image/png;base64,' + m.base64 + '" alt="texture preview">';
+        if (m.error) {
+            textureModalPreviewEl.innerHTML = '<div class="muted">Error: ' + esc(m.error) + '</div>';
+            return;
+        }
+        textureModalPreviewEl.innerHTML = '<div class="tex-preview-stage"><img src="data:image/png;base64,' + m.base64 + '" alt="texture preview"></div>';
+        const img = getTextureModalImageEl();
+        if (!img) return;
+        img.addEventListener('load', () => {
+            updateTextureModalImageScale();
+            textureModalPreviewEl.scrollLeft = 0;
+            textureModalPreviewEl.scrollTop = 0;
+        }, { once: true });
+        if (img.complete) {
+            updateTextureModalImageScale();
+        }
     }
-    document.getElementById('tex-modal-close').addEventListener('click', () => { document.getElementById('texture-modal').hidden = true; state.modalResource = null; });
-    document.querySelector('#texture-modal .modal-backdrop').addEventListener('click', () => { document.getElementById('texture-modal').hidden = true; state.modalResource = null; });
+    function closeTextureModal() {
+        stopTextureModalDrag();
+        stopTextureModalResize();
+        stopTextureModalPan();
+        saveTextureModalBounds();
+        textureModalEl.hidden = true;
+        state.modalResource = null;
+    }
+
+    textureModalHeaderEl.addEventListener('pointerdown', startTextureModalDrag);
+    if (textureModalResizeEl) {
+        textureModalResizeEl.addEventListener('pointerdown', startTextureModalResize);
+    }
+    textureModalPreviewEl.addEventListener('pointerdown', startTextureModalPan);
+    textureModalPreviewEl.addEventListener('wheel', (event) => {
+        if (!getTextureModalImageEl()) return;
+        event.preventDefault();
+        const step = event.deltaY < 0 ? 1.1 : (1 / 1.1);
+        setTextureModalZoom(textureModalZoom * step);
+    }, { passive: false });
+    window.addEventListener('resize', () => {
+        if (textureModalEl.hidden) return;
+        if (textureModalPanelEl.style.transform) {
+            centerTextureModal();
+            updateTextureModalImageScale();
+            return;
+        }
+        const nextPos = clampTextureModalPosition(
+            parseFloat(textureModalPanelEl.style.left || '0'),
+            parseFloat(textureModalPanelEl.style.top || '0'),
+        );
+        const nextSize = clampTextureModalSize(
+            parseFloat(textureModalPanelEl.style.width || textureModalPanelEl.offsetWidth),
+            parseFloat(textureModalPanelEl.style.height || textureModalPanelEl.offsetHeight),
+            nextPos.left,
+            nextPos.top,
+        );
+        textureModalPanelEl.style.left = nextPos.left + 'px';
+        textureModalPanelEl.style.top = nextPos.top + 'px';
+        textureModalPanelEl.style.width = nextSize.width + 'px';
+        textureModalPanelEl.style.height = nextSize.height + 'px';
+        updateTextureModalImageScale();
+        saveTextureModalBounds();
+    });
+
+    document.getElementById('tex-modal-close').addEventListener('click', closeTextureModal);
+    document.querySelector('#texture-modal .modal-backdrop').addEventListener('click', closeTextureModal);
     document.querySelectorAll('#channel-toggle .ch').forEach(b => b.addEventListener('click', () => {
         state.modalChannel = parseInt(b.dataset.ch, 10);
         document.querySelectorAll('#channel-toggle .ch').forEach(x => x.classList.toggle('active', x === b));
