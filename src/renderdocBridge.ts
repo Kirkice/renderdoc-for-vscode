@@ -513,10 +513,9 @@ export class RenderDocBridge {
 
     async resolveShaderResourceMetadata(resourceId: string, fallbackName = ''): Promise<{ name: string; stages: string[] }> {
         const cached = this.shaderDisplayNameCache.get(resourceId);
-        const rid = parseInt(resourceId, 10) || 0;
         let entries: TGetShaderEntryPointsResponse['entryPoints'] = [];
         try {
-            const epRes = await this.nativeCallT('getShaderEntryPoints', GetShaderEntryPointsResponse, { resourceId: rid });
+            const epRes = await this.nativeCallT('getShaderEntryPoints', GetShaderEntryPointsResponse, { resourceId });
             entries = epRes.entryPoints;
         } catch {
             const fallback = fallbackName || `Shader ${resourceId}`;
@@ -539,7 +538,7 @@ export class RenderDocBridge {
                 const source = await this.nativeCallT(
                     'getShaderSource',
                     GetShaderSourceResponse,
-                    { resourceId: rid, entryPoint: entry.name, stage: entry.stage },
+                    { resourceId, entryPoint: entry.name, stage: entry.stage },
                 );
                 const resolved = deriveShaderDisplayName(source, fallbackName, resourceId);
                 this.shaderDisplayNameCache.set(resourceId, resolved);
@@ -564,9 +563,8 @@ export class RenderDocBridge {
             throw new Error(NATIVE_REPLAY_REQUIRED_MSG);
         }
 
-        const rid = parseInt(resourceId, 10) || 0;
         let entries: TGetShaderEntryPointsResponse['entryPoints'] = [];
-        const epRes = await this.nativeCallT('getShaderEntryPoints', GetShaderEntryPointsResponse, { resourceId: rid });
+        const epRes = await this.nativeCallT('getShaderEntryPoints', GetShaderEntryPointsResponse, { resourceId });
         entries = epRes.entryPoints;
         if (entries.length === 0) {
             entries = [{ name: 'main', stage: 0 }];
@@ -579,7 +577,7 @@ export class RenderDocBridge {
             const source = await this.nativeCallT(
                 'getShaderSource',
                 GetShaderSourceResponse,
-                { resourceId: rid, entryPoint: entry.name, stage: entry.stage },
+                { resourceId, entryPoint: entry.name, stage: entry.stage },
             );
             const files = source.sourceFiles || [];
             let code = '';
@@ -1088,7 +1086,12 @@ export class RenderDocBridge {
 
     /** Get texture data via native bridge (saves to temp PNG, returns base64) */
     async nativeGetTextureData(textureId: string, mip?: number, eventId?: number, channelExtract?: number): Promise<any> {
-        return this.nativeCall('getTexturePreview', { resourceId: parseInt(textureId, 10) || 0, mip: mip ?? 0, eventId: eventId ?? 0, channelExtract: channelExtract ?? -1 });
+        return this.nativeCall('getTexturePreview', { resourceId: textureId, mip: mip ?? 0, eventId: eventId ?? 0, channelExtract: channelExtract ?? -1 });
+    }
+
+    /** Get a RenderDoc replay-style current draw preview for the selected event. */
+    async nativeGetCurrentDrawPreview(eventId: number, channelExtract: number = -1): Promise<any> {
+        return this.nativeCall('getCurrentDrawPreview', { eventId, channelExtract });
     }
 
     /**
@@ -1100,7 +1103,7 @@ export class RenderDocBridge {
      * @param resourceIds Resource IDs to render
      */
     async nativeGetTextureThumbBatch(eventId: number, resourceIds: string[]): Promise<any> {
-        const textures = resourceIds.map(id => ({ resourceId: parseInt(id, 10) || 0, mip: 0 }));
+        const textures = resourceIds.map(id => ({ resourceId: id, mip: 0 }));
         return this.nativeCall('getTextureThumbBatch', { eventId, textures });
     }
 

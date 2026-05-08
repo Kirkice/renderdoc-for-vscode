@@ -26,6 +26,10 @@ export class CaptureInfoProvider implements vscode.TreeDataProvider<CaptureInfoI
         this._onDidChangeTreeData.fire(undefined);
     }
 
+    getReplayStatus(): 'none' | 'active' | 'failed' | 'unavailable' {
+        return this.replayStatus;
+    }
+
     getTreeItem(element: CaptureInfoItem): vscode.TreeItem {
         return element;
     }

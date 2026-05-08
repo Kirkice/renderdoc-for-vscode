@@ -79,6 +79,31 @@
         .content { flex: 1; overflow: hidden; position: relative; }
         .tab-panel { display: none; height: 100%; overflow: auto; padding: var(--pad); }
         .tab-panel.active { display: block; }
+        #tab-textures.tab-panel.active { display: flex; flex-direction: column; overflow: hidden; }
+        .textures-split {
+            flex: 1;
+            min-height: 0;
+            display: flex;
+            flex-direction: column;
+        }
+        .textures-list-pane {
+            flex: 1 1 auto;
+            min-height: 0;
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+        }
+        #tab-textures #textures-toolbar {
+            flex: 0 0 auto;
+            margin: 0 0 12px;
+            top: 0;
+        }
+        #tab-textures #textures-body {
+            flex: 1 1 auto;
+            min-height: 0;
+            overflow: auto;
+            align-content: start;
+        }
 
         .sub-toolbar {
             display: flex; gap: 8px; align-items: center;
@@ -856,19 +881,25 @@
 
         /* Current-draw RT preview (on top of Texture Viewer tab) */
         .tex-current {
+            display: flex;
+            flex-direction: column;
+            min-height: 160px;
             background: var(--vscode-sideBar-background);
             border: 1px solid var(--vscode-panel-border);
             border-radius: 4px;
-            margin-bottom: 12px;
             overflow: hidden;
         }
         .tex-current.empty-state {
+            display: flex;
+            align-items: center;
+            justify-content: center;
             padding: 24px 12px;
             color: var(--vscode-descriptionForeground);
             text-align: center;
         }
         .tex-current-header {
             display: flex; align-items: center; gap: 10px;
+            flex-wrap: wrap;
             padding: 6px 10px;
             background: var(--vscode-editorGroupHeader-tabsBackground, var(--vscode-sideBar-background));
             border-bottom: 1px solid var(--vscode-panel-border);
@@ -888,12 +919,30 @@
             font-family: var(--vscode-editor-font-family);
             font-size: 0.9em;
         }
-        .tex-current-open { margin-left: auto; }
+        .tex-current-actions {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            margin-left: auto;
+            flex-wrap: wrap;
+        }
+        .tex-current-hint {
+            white-space: nowrap;
+        }
+        .tex-current-channel-toggle {
+            flex-shrink: 0;
+        }
+        .tex-current-zoom-reset {
+            min-width: 64px;
+        }
         .tex-current-preview {
-            min-height: 180px;
-            max-height: 480px;
-            display: flex; align-items: center; justify-content: center;
-            padding: 8px;
+            flex: 1 1 auto;
+            min-height: 120px;
+            max-height: none;
+            padding: 12px;
+            overflow: auto;
+            display: block;
+            touch-action: none;
             background:
                 linear-gradient(45deg, #1e1e1e 25%, transparent 25%) 0 0 / 16px 16px,
                 linear-gradient(-45deg, #1e1e1e 25%, transparent 25%) 0 8px / 16px 16px,
@@ -901,9 +950,19 @@
                 linear-gradient(-45deg, transparent 75%, #1e1e1e 75%) 8px 0 / 16px 16px,
                 #2a2a2a;
         }
-        .tex-current-preview img {
-            max-width: 100%; max-height: 460px;
-            object-fit: contain;
+        .tex-current-stage {
+            min-width: 100%;
+            min-height: 100%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+        .tex-current-preview.has-image { cursor: grab; }
+        .tex-current-preview.panning { cursor: grabbing; }
+        .tex-current-preview.panning .tex-current-stage,
+        .tex-current-preview.panning img { pointer-events: none; }
+        .tex-current-stage img {
+            display: block;
             image-rendering: pixelated;
         }
         .tex-card {

@@ -77,16 +77,21 @@ export function buildInspectorHtml(
 
         <main class="content">
             <section id="tab-textures" class="tab-panel active">
-                <div id="tex-current" class="tex-current empty-state">Select an event to preview its render target.</div>
-                <div id="textures-toolbar" class="sub-toolbar">
-                    <div class="scope-toggle" data-scope="tex">
-                        <button class="scope active" data-val="output">Outputs (RTs)</button>
-                        <button class="scope" data-val="input">Inputs (Sampled)</button>
+                <div id="textures-split" class="textures-split">
+                    <div id="tex-current" class="tex-current empty-state">Select an event to preview its render target.</div>
+                    <div id="textures-splitter" class="horizontal-splitter" title="Drag to resize preview"></div>
+                    <div id="textures-list-pane" class="textures-list-pane">
+                        <div id="textures-toolbar" class="sub-toolbar">
+                            <div class="scope-toggle" data-scope="tex">
+                                <button class="scope active" data-val="output">Outputs (RTs)</button>
+                                <button class="scope" data-val="input">Inputs (Sampled)</button>
+                            </div>
+                            <input id="tex-filter" type="search" placeholder="Filter..." class="filter-input">
+                            <span id="tex-count" class="muted"></span>
+                        </div>
+                        <div id="textures-body" class="tex-grid empty-state">Select an event.</div>
                     </div>
-                    <input id="tex-filter" type="search" placeholder="Filter..." class="filter-input">
-                    <span id="tex-count" class="muted"></span>
                 </div>
-                <div id="textures-body" class="tex-grid empty-state">Select an event.</div>
             </section>
 
             <section id="tab-pipeline" class="tab-panel">

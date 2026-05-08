@@ -53,6 +53,111 @@ let currentDrawCalls: DrawCall[] = [];
 let currentResources: ResourceInfo[] = [];
 let shaderAliasScanGeneration = 0;
 
+const REPLAYABLE_DRAW_FLAGS = new Set([
+    'Drawcall',
+    'Dispatch',
+    'Clear',
+    'Copy',
+    'Resolve',
+    'GenMips',
+    'Present',
+]);
+
+function findDrawCallByEventId(eventId: number, list: DrawCall[] = currentDrawCalls): DrawCall | undefined {
+    for (const drawCall of list) {
+        if (drawCall.eventId === eventId) {
+            return drawCall;
+        }
+        if (drawCall.children?.length) {
+            const found = findDrawCallByEventId(eventId, drawCall.children);
+            if (found) {
+                return found;
+            }
+        }
+    }
+    return undefined;
+}
+
+async function recoverReplayForCurrentCapture(reason: string): Promise<boolean> {
+    if (!currentCapturePath || !captureInfoProvider) {
+        return false;
+    }
+    if (captureInfoProvider.getReplayStatus() !== 'active') {
+        return false;
+    }
+    if (!bridge.isNativeBridgeInstalled()) {
+        return false;
+    }
+
+    console.log('[RenderDoc] Recovering replay for current capture due to', reason);
+
+    if (!bridge.hasNativeBridge()) {
+        bridge.tryStartNativeBridge();
+    }
+    if (!bridge.hasNativeBridge()) {
+        return false;
+    }
+
+    try {
+        await bridge.nativeOpenCapture(currentCapturePath);
+        bridgeLoadedCapturePath = currentCapturePath;
+    } catch (error: any) {
+        console.warn('[RenderDoc] Replay recovery openCapture failed:', error?.message ?? String(error));
+        return false;
+    }
+
+    try {
+        const result = await bridge.nativeTryReplay();
+        if (result?.replay) {
+            captureInfoProvider.setReplayStatus('active');
+            InspectorPanel.currentPanel?.invalidateReplayCaches();
+            return true;
+        }
+        captureInfoProvider.setReplayStatus('failed');
+        console.warn('[RenderDoc] Replay recovery tryReplay failed:', result?.replayError || 'Unknown error');
+        return false;
+    } catch (error: any) {
+        captureInfoProvider.setReplayStatus('failed');
+        console.warn('[RenderDoc] Replay recovery crashed:', error?.message ?? String(error));
+        return false;
+    }
+}
+
+function isReplayableDrawCall(drawCall: DrawCall | undefined): boolean {
+    if (!drawCall) {
+        return false;
+    }
+    return REPLAYABLE_DRAW_FLAGS.has(drawCall.flags || '');
+}
+
+function findFirstReplayableDraw(list: DrawCall[]): DrawCall | undefined {
+    for (const drawCall of list) {
+        if (isReplayableDrawCall(drawCall)) {
+            return drawCall;
+        }
+        if (drawCall.children?.length) {
+            const found = findFirstReplayableDraw(drawCall.children);
+            if (found) {
+                return found;
+            }
+        }
+    }
+    return undefined;
+}
+
+function normalizeSelectedDrawCall(drawCall: DrawCall | undefined): DrawCall | undefined {
+    if (!drawCall) {
+        return undefined;
+    }
+    if (isReplayableDrawCall(drawCall)) {
+        return drawCall;
+    }
+    if (drawCall.children?.length) {
+        return findFirstReplayableDraw(drawCall.children) ?? drawCall;
+    }
+    return drawCall;
+}
+
 type ExclusiveRenderDocPanel = 'thumbnail' | 'inspector' | 'captureResult';
 
 function closeExclusiveRenderDocPanels(active: ExclusiveRenderDocPanel) {
@@ -672,23 +777,25 @@ export async function activate(context: vscode.ExtensionContext) {
     drawCallTreeView.onDidChangeSelection(e => {
         if (e.selection.length > 0) {
             const item = e.selection[0] as any;
-            currentSelectedDrawCall = item.drawCall ?? {
+            const selectedDrawCall = normalizeSelectedDrawCall(item.drawCall)
+                ?? normalizeSelectedDrawCall(findDrawCallByEventId(item.eventId));
+            currentSelectedDrawCall = selectedDrawCall ?? item.drawCall ?? {
                 label: item.label,
                 eventId: item.eventId,
             };
             // If the Inspector panel is open, update it to this event
             if (InspectorPanel.currentPanel && typeof currentSelectedDrawCall?.eventId === 'number') {
-                InspectorPanel.currentPanel.setEvent(currentSelectedDrawCall.eventId, item.drawCall);
+                InspectorPanel.currentPanel.setEvent(currentSelectedDrawCall.eventId, currentSelectedDrawCall);
             }
             // Populate the sidebar API Inspector with this event's chunks.
             if (typeof currentSelectedDrawCall?.eventId === 'number') {
-                const label = typeof item.label === 'string' ? item.label : item.label?.label;
+                const label = currentSelectedDrawCall.name || (typeof item.label === 'string' ? item.label : item.label?.label);
                 apiInspectorProvider.setEvent(currentSelectedDrawCall.eventId, label).catch(() => {});
             }
             // Drive the drawcall-overlay panel too, so clicking a draw call
             // reveals its geometry highlight just like RenderDoc desktop.
             if (DrawOverlayPanel.currentPanel && typeof currentSelectedDrawCall?.eventId === 'number') {
-                const label = typeof item.label === 'string' ? item.label : item.label?.label;
+                const label = currentSelectedDrawCall.name || (typeof item.label === 'string' ? item.label : item.label?.label);
                 DrawOverlayPanel.currentPanel.showEvent(currentSelectedDrawCall.eventId, label).catch(() => {});
             }
         }
@@ -739,6 +846,10 @@ export async function activate(context: vscode.ExtensionContext) {
             console.warn('[RenderDoc] captureProvider getResources failed:', e?.message);
         }
         return { captureInfo: info, drawCalls, resources };
+    };
+
+    InspectorPanel.replayRecoveryProvider = async (reason: string) => {
+        return recoverReplayForCurrentCapture(reason);
     };
 
     // Register commands
@@ -1808,9 +1919,19 @@ async function showDrawCallDetails(context: vscode.ExtensionContext, item: any) 
     if (!item) { return; }
     if (item.eventId === undefined) { return; }
 
+    const normalizedDrawCall = normalizeSelectedDrawCall(item.drawCall)
+        ?? normalizeSelectedDrawCall(findDrawCallByEventId(item.eventId));
+    const resolvedEventId = normalizedDrawCall?.eventId ?? item.eventId;
+
     closeExclusiveRenderDocPanels('inspector');
-    if (InspectorPanel.currentPanel) {
-        InspectorPanel.currentPanel.disposePanel();
+
+    const existingInspector = InspectorPanel.currentPanel;
+    if (existingInspector) {
+        existingInspector.reveal();
+        if (existingInspector.getCurrentEventId() !== resolvedEventId) {
+            await existingInspector.setEvent(resolvedEventId, normalizedDrawCall ?? item.drawCall);
+        }
+        return;
     }
 
     const info = captureInfoProvider.getCaptureInfo();
@@ -1822,7 +1943,7 @@ async function showDrawCallDetails(context: vscode.ExtensionContext, item: any) 
             inspector.setCapture(info, drawCalls, resources);
         } catch { /* best-effort */ }
     }
-    await inspector.setEvent(item.eventId, item.drawCall);
+    await inspector.setEvent(resolvedEventId, normalizedDrawCall ?? item.drawCall);
 }
 
 async function showResourceDetails(context: vscode.ExtensionContext, item: any) {
@@ -2053,6 +2174,7 @@ async function tryLocalReplay() {
                     captureInfoProvider.setReplayStatus('unavailable');
                 } else if (result && result.replay) {
                     captureInfoProvider.setReplayStatus('active');
+                    InspectorPanel.currentPanel?.invalidateReplayCaches();
                     vscode.window.showInformationMessage('Local replay active! Shader/pipeline/texture features are now available.');
                 } else {
                     captureInfoProvider.setReplayStatus('failed');

@@ -11,10 +11,8 @@
  *     `getShaderSourceForEvent`) use `.passthrough()` because their shape
  *     legitimately differs between GL/Vulkan/D3D11/D3D12 and new fields may
  *     be added without notice. We still validate the fields we depend on.
- *   - The `resourceId` field is emitted as a JS number by nlohmann::json
- *     (the C++ side writes a `uint64_t`). Very large IDs may lose precision,
- *     but the rest of the extension has always treated them as numbers — we
- *     keep that contract here.
+ *   - Resource IDs are now normalised to decimal strings. Older bridge builds
+ *     may still emit numbers, so the schema accepts both and coerces to string.
  */
 
 import { z } from 'zod';
@@ -22,7 +20,7 @@ import { BridgeError } from './bridgeError';
 
 // ─── Leaf types ──────────────────────────────────────────────────────────────
 
-const ResourceId = z.number();
+const ResourceId = z.union([z.string(), z.number()]).transform((value) => String(value));
 
 const EntryPoint = z.object({
     name: z.string(),

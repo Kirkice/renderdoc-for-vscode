@@ -32,6 +32,10 @@ export class InspectorPanel {
         | (() => Promise<{ captureInfo: CaptureInfo; drawCalls: DrawCall[]; resources: ResourceInfo[] } | undefined>)
         | undefined;
 
+    public static replayRecoveryProvider:
+        | ((reason: string) => Promise<boolean>)
+        | undefined;
+
     private readonly panel: vscode.WebviewPanel;
     private readonly context: vscode.ExtensionContext;
     private readonly bridge: RenderDocBridge;
@@ -50,6 +54,7 @@ export class InspectorPanel {
     // Cache rendered textures (base64 PNG) keyed by "resId:mip:eventId".
     // Each entry can be hundreds of KB so we keep a tighter cap.
     private texturePreviewCache = new LruCache<string, { base64: string; width: number; height: number; texFormat: string }>(128);
+    private currentDrawPreviewCache = new LruCache<string, { base64: string; width: number; height: number; texFormat: string; resourceId?: string; label?: string }>(64);
 
     // Mesh decode cache keyed by "eventId:stage:maxVerts:instance".
     private meshCache = new LruCache<string, any>(64);
@@ -62,6 +67,16 @@ export class InspectorPanel {
     private latestMaliAnalysis?: { source: string, stage: string, result: string };
 
     private disposables: vscode.Disposable[] = [];
+
+    private static readonly replayableDrawFlags = new Set([
+        'Drawcall',
+        'Dispatch',
+        'Clear',
+        'Copy',
+        'Resolve',
+        'GenMips',
+        'Present',
+    ]);
 
     public static createOrShow(context: vscode.ExtensionContext, bridge: RenderDocBridge) {
         const column = vscode.ViewColumn.Active;
@@ -144,6 +159,7 @@ export class InspectorPanel {
             this.shaderCache.clear();
             this.pipelineCache.clear();
             this.texturePreviewCache.clear();
+            this.currentDrawPreviewCache.clear();
             this.captureTimings = {};
             this.captureTimingsAvailable = false;
             this.captureTimingsError = undefined;
@@ -244,16 +260,27 @@ export class InspectorPanel {
 
     /** Set / change the focused event — the whole panel updates around this. */
     public async setEvent(eventId: number, drawCall?: DrawCall) {
-        this.currentEventId = eventId;
-        this.currentDrawCall = drawCall ?? this.findDrawCall(eventId);
-        this.panel.title = `Inspector — EID ${eventId}${this.currentDrawCall ? ': ' + this.currentDrawCall.name : ''}`;
+        const previousEventId = this.currentEventId;
+        const normalized = this.normalizeEventSelection(eventId, drawCall);
+        this.currentEventId = normalized.eventId;
+        this.currentDrawCall = normalized.drawCall;
+
+        // Force a fresh pipeline query when moving between events. Empirically
+        // some captures can show stale input-texture bindings when revisiting a
+        // previously viewed draw, while the native bridge returns the correct
+        // pipeline state when queried again for that event.
+        if (previousEventId !== undefined && previousEventId !== this.currentEventId) {
+            this.pipelineCache.clear();
+        }
+
+        this.panel.title = `Inspector — EID ${this.currentEventId}${this.currentDrawCall ? ': ' + this.currentDrawCall.name : ''}`;
 
         // Post eventChanged immediately so the header updates even while the
         // capture state is still being pulled (first draw click after reload
         // can take seconds to convert XML).
         this.panel.webview.postMessage({
             type: 'eventChanged',
-            eventId,
+            eventId: this.currentEventId,
             drawCall: this.currentDrawCall,
         });
 
@@ -264,10 +291,12 @@ export class InspectorPanel {
                     this.setCapture(pulled.captureInfo, pulled.drawCalls, pulled.resources);
                     // Re-post event so drawCall lookup picks up the now-loaded tree.
                     if (!this.currentDrawCall) {
-                        this.currentDrawCall = this.findDrawCall(eventId);
+                        const refreshed = this.normalizeEventSelection(this.currentEventId ?? eventId);
+                        this.currentEventId = refreshed.eventId;
+                        this.currentDrawCall = refreshed.drawCall;
                         this.panel.webview.postMessage({
                             type: 'eventChanged',
-                            eventId,
+                            eventId: this.currentEventId,
                             drawCall: this.currentDrawCall,
                         });
                     }
@@ -278,19 +307,19 @@ export class InspectorPanel {
         // Kick off async loads; webview gets incremental updates as data arrives.
         // Guard with .catch so even an uncaught async error still unblocks the
         // webview with an error message instead of leaving "Loading鈥? forever.
-        this.loadShadersForEvent(eventId).catch(e => {
+        this.loadShadersForEvent(this.currentEventId).catch(e => {
             console.warn('[Inspector] shader load failed:', e?.message);
             this.panel.webview.postMessage({
                 type: 'shadersLoaded',
-                eventId,
+                eventId: this.currentEventId,
                 data: { error: e?.message || 'Shader load failed.' },
             });
         });
-        this.loadPipelineForEvent(eventId).catch(e => {
+        this.loadPipelineForEvent(this.currentEventId).catch(e => {
             console.warn('[Inspector] pipeline load failed:', e?.message);
             this.panel.webview.postMessage({
                 type: 'pipelineLoaded',
-                eventId,
+                eventId: this.currentEventId,
                 data: { error: e?.message || 'Pipeline load failed.' },
             });
         });
@@ -298,6 +327,23 @@ export class InspectorPanel {
 
     public reveal() {
         this.panel.reveal(vscode.ViewColumn.Active, true);
+    }
+
+    /**
+     * Clear replay-derived caches when the native replay session is recreated
+     * for the same capture path. Without this, same-file replays can keep
+     * showing stale pipeline/input-texture results from a previous bridge run.
+     */
+    public invalidateReplayCaches() {
+        this.shaderCache.clear();
+        this.pipelineCache.clear();
+        this.texturePreviewCache.clear();
+        this.currentDrawPreviewCache.clear();
+        this.meshCache.clear();
+
+        if (this.currentEventId !== undefined) {
+            void this.setEvent(this.currentEventId, this.currentDrawCall);
+        }
     }
 
     /** Current focused event ID, or undefined if none selected. */
@@ -323,24 +369,84 @@ export class InspectorPanel {
 
     private findDrawCall(eventId: number, list = this.drawCalls): DrawCall | undefined {
         for (const dc of list) {
-            if (dc.eventId === eventId) { return dc; }
             if (dc.children?.length) {
                 const found = this.findDrawCall(eventId, dc.children);
                 if (found) { return found; }
+            }
+            if (dc.eventId === eventId) { return dc; }
+        }
+        return undefined;
+    }
+
+    private isReplayableDrawCall(drawCall: DrawCall | undefined): boolean {
+        if (!drawCall) {
+            return false;
+        }
+        return InspectorPanel.replayableDrawFlags.has(drawCall.flags || '');
+    }
+
+    private findFirstReplayableDraw(list: DrawCall[]): DrawCall | undefined {
+        for (const drawCall of list) {
+            if (this.isReplayableDrawCall(drawCall)) {
+                return drawCall;
+            }
+            if (drawCall.children?.length) {
+                const found = this.findFirstReplayableDraw(drawCall.children);
+                if (found) {
+                    return found;
+                }
             }
         }
         return undefined;
     }
 
+    private normalizeEventSelection(eventId: number, drawCall?: DrawCall): { eventId: number; drawCall?: DrawCall } {
+        const resolvedDrawCall = drawCall ?? this.findDrawCall(eventId);
+        if (!resolvedDrawCall) {
+            return { eventId, drawCall };
+        }
+        if (this.isReplayableDrawCall(resolvedDrawCall)) {
+            return { eventId: resolvedDrawCall.eventId, drawCall: resolvedDrawCall };
+        }
+        if (resolvedDrawCall.children?.length) {
+            const leaf = this.findFirstReplayableDraw(resolvedDrawCall.children);
+            if (leaf) {
+                return { eventId: leaf.eventId, drawCall: leaf };
+            }
+        }
+        return { eventId: resolvedDrawCall.eventId, drawCall: resolvedDrawCall };
+    }
+
+    private isNoReplayActiveError(error: unknown): boolean {
+        const message = String((error as any)?.message ?? error ?? '');
+        return message.includes('No replay active');
+    }
+
+    private async tryRecoverReplay(reason: string): Promise<boolean> {
+        const recover = InspectorPanel.replayRecoveryProvider;
+        if (!recover) {
+            return false;
+        }
+        try {
+            return await recover(reason);
+        } catch (error: any) {
+            console.warn('[Inspector ext] replay recovery failed:', error?.message ?? String(error));
+            return false;
+        }
+    }
+
     private async loadShadersForEvent(eventId: number) {
         console.log('[Inspector ext] loadShadersForEvent', eventId, 'hasNative=', this.bridge.hasNativeBridge());
         if (!this.bridge.hasNativeBridge()) {
-            this.panel.webview.postMessage({
-                type: 'shadersLoaded',
-                eventId,
-                data: { error: 'Native bridge unavailable (local replay required).' },
-            });
-            return;
+            const recovered = await this.tryRecoverReplay('shader request');
+            if (!recovered || !this.bridge.hasNativeBridge()) {
+                this.panel.webview.postMessage({
+                    type: 'shadersLoaded',
+                    eventId,
+                    data: { error: 'Native bridge unavailable (local replay required).' },
+                });
+                return;
+            }
         }
         if (!this.shaderCache.has(eventId)) {
             try {
@@ -351,7 +457,20 @@ export class InspectorPanel {
                 );
                 this.shaderCache.set(eventId, result);
             } catch (e: any) {
-                this.shaderCache.set(eventId, { error: e.message });
+                if (this.isNoReplayActiveError(e) && await this.tryRecoverReplay('shader request')) {
+                    try {
+                        const retried = await withTimeout(
+                            this.bridge.nativeGetShaderSource(eventId),
+                            30000,
+                            'Shader source request timed out after 30s.',
+                        );
+                        this.shaderCache.set(eventId, retried);
+                    } catch (retryError: any) {
+                        this.shaderCache.set(eventId, { error: retryError.message });
+                    }
+                } else {
+                    this.shaderCache.set(eventId, { error: e.message });
+                }
             }
         }
         if (this.currentEventId === eventId) {
@@ -366,12 +485,15 @@ export class InspectorPanel {
     private async loadPipelineForEvent(eventId: number) {
         console.log('[Inspector ext] loadPipelineForEvent', eventId, 'hasNative=', this.bridge.hasNativeBridge());
         if (!this.bridge.hasNativeBridge()) {
-            this.panel.webview.postMessage({
-                type: 'pipelineLoaded',
-                eventId,
-                data: { error: 'Native bridge unavailable (local replay required).' },
-            });
-            return;
+            const recovered = await this.tryRecoverReplay('pipeline request');
+            if (!recovered || !this.bridge.hasNativeBridge()) {
+                this.panel.webview.postMessage({
+                    type: 'pipelineLoaded',
+                    eventId,
+                    data: { error: 'Native bridge unavailable (local replay required).' },
+                });
+                return;
+            }
         }
         if (!this.pipelineCache.has(eventId)) {
             try {
@@ -387,7 +509,23 @@ export class InspectorPanel {
                     this.prefetchRTTextures(eventId, result).catch(() => { /* best-effort */ });
                 }
             } catch (e: any) {
-                this.pipelineCache.set(eventId, { error: e.message });
+                if (this.isNoReplayActiveError(e) && await this.tryRecoverReplay('pipeline request')) {
+                    try {
+                        const retried = await withTimeout(
+                            this.bridge.nativeGetPipelineState(eventId),
+                            30000,
+                            'Pipeline state request timed out after 30s.',
+                        );
+                        this.pipelineCache.set(eventId, retried);
+                        if (eventId === this.currentEventId && retried && !retried.error) {
+                            this.prefetchRTTextures(eventId, retried).catch(() => { /* best-effort */ });
+                        }
+                    } catch (retryError: any) {
+                        this.pipelineCache.set(eventId, { error: retryError.message });
+                    }
+                } else {
+                    this.pipelineCache.set(eventId, { error: e.message });
+                }
             }
         }
         if (this.currentEventId === eventId) {
@@ -406,26 +544,49 @@ export class InspectorPanel {
      * so the Textures tab renders without waiting when the user switches to it.
      */
     private async prefetchRTTextures(eventId: number, pipeline: any) {
-        const fb = pipeline.framebuffer || {};
-        const rtIds: string[] = [
-            ...(fb.colorTargets || []).map(String),
-            ...(fb.depthTarget ? [String(fb.depthTarget)] : []),
-        ];
+        const fb = pipeline?.framebuffer || {};
+        const actionOutputs = Array.isArray(pipeline?.actionOutputs) ? pipeline.actionOutputs : [];
+        const hasFramebufferOutputs = (fb.colorTargets || []).length || fb.depthTarget || fb.depthResolveTarget || fb.stencilTarget;
+        const hasActionFallback = !!(actionOutputs.length || pipeline?.actionDepth || pipeline?.actionCopyDestination);
+        const usesPresentationFallback = !hasFramebufferOutputs && !hasActionFallback && !!(pipeline?.presentationColorTarget || pipeline?.presentationDepthTarget);
+        const rtIds: string[] = Array.from(new Set([
+            ...((hasFramebufferOutputs
+                ? (fb.colorTargets || [])
+                : (hasActionFallback ? actionOutputs : (pipeline?.presentationColorTarget ? [pipeline.presentationColorTarget] : []))).map(String)),
+            ...((fb.depthTarget || (!hasFramebufferOutputs && (pipeline?.actionDepth || (usesPresentationFallback ? pipeline?.presentationDepthTarget : undefined))))
+                ? [String(fb.depthTarget || pipeline.actionDepth || pipeline.presentationDepthTarget)]
+                : []),
+            ...(fb.depthResolveTarget ? [String(fb.depthResolveTarget)] : []),
+            ...(fb.stencilTarget ? [String(fb.stencilTarget)] : []),
+            ...((!hasFramebufferOutputs && hasActionFallback && pipeline?.actionCopyDestination) ? [String(pipeline.actionCopyDestination)] : []),
+        ]));
         if (rtIds.length === 0) { return; }
 
         // Only fetch RTs that are not yet in cache for this event
-        const uncached = rtIds.filter(id => !this.texturePreviewCache.has(`${id}:0:${eventId}:-1`));
+        const uncached = rtIds.filter(id => !this.texturePreviewCache.has(`${id}:0:${eventId}:-1:thumb`));
         if (uncached.length === 0) { return; }
 
         try {
-            const batchResult = await this.bridge.nativeGetTextureThumbBatch(eventId, uncached);
+            const batchResult = await withTimeout(
+                this.bridge.nativeGetTextureThumbBatch(eventId, uncached),
+                30000,
+                'Render-target thumbnail request timed out after 30s.',
+            );
             if (!batchResult?.results) { return; }
             for (const r of batchResult.results as any[]) {
-                if (!r?.base64 || this.currentEventId !== eventId) { continue; }
-                const key = `${r.resourceId}:0:${eventId}:-1`;
-                const data = { base64: r.base64, width: r.width, height: r.height, texFormat: r.texFormat };
-                this.texturePreviewCache.set(key, data);
-                this.panel.webview.postMessage({ type: 'texturePreview', key, ...data });
+                const key = `${r.resourceId}:0:${eventId}:-1:thumb`;
+                if (this.currentEventId !== eventId) { continue; }
+                if (r?.base64) {
+                    const data = { base64: r.base64, width: r.width, height: r.height, texFormat: r.texFormat };
+                    this.texturePreviewCache.set(key, data);
+                    this.panel.webview.postMessage({ type: 'texturePreview', key, ...data });
+                } else {
+                    this.panel.webview.postMessage({
+                        type: 'texturePreview',
+                        key,
+                        error: r?.error || 'Thumbnail preview unavailable',
+                    });
+                }
             }
         } catch (_e) {
             // Pre-fetch failure is non-fatal; textures will load on demand instead
@@ -455,19 +616,27 @@ export class InspectorPanel {
         }
     }
 
-    private async loadTexturePreview(resourceId: string, mip: number, eventId: number, channelExtract: number) {
-        const key = `${resourceId}:${mip}:${eventId}:${channelExtract}`;
+    private async loadTexturePreview(resourceId: string, mip: number, eventId: number, channelExtract: number,
+        purpose: 'thumb' | 'preview' | 'modal' = 'preview') {
+        const key = `${resourceId}:${mip}:${eventId}:${channelExtract}:${purpose}`;
         if (this.texturePreviewCache.has(key)) {
             const cached = this.texturePreviewCache.get(key)!;
             this.panel.webview.postMessage({ type: 'texturePreview', key, ...cached });
             return;
         }
         if (!this.bridge.hasNativeBridge()) {
-            this.panel.webview.postMessage({ type: 'texturePreview', key, error: 'Native bridge not available (replay required).' });
-            return;
+            const recovered = await this.tryRecoverReplay('texture preview request');
+            if (!recovered || !this.bridge.hasNativeBridge()) {
+                this.panel.webview.postMessage({ type: 'texturePreview', key, error: 'Native bridge not available (replay required).' });
+                return;
+            }
         }
         try {
-            const result = await this.bridge.nativeGetTextureData(resourceId, mip, eventId, channelExtract);
+            const result = await withTimeout(
+                this.bridge.nativeGetTextureData(resourceId, mip, eventId, channelExtract),
+                30000,
+                'Texture preview request timed out after 30s.',
+            );
             if (result?.base64) {
                 const data = { base64: result.base64, width: result.width, height: result.height, texFormat: result.texFormat };
                 this.texturePreviewCache.set(key, data);
@@ -476,7 +645,91 @@ export class InspectorPanel {
                 this.panel.webview.postMessage({ type: 'texturePreview', key, error: 'No preview returned' });
             }
         } catch (e: any) {
-            this.panel.webview.postMessage({ type: 'texturePreview', key, error: e.message });
+            if (this.isNoReplayActiveError(e) && await this.tryRecoverReplay('texture preview request')) {
+                try {
+                    const retried = await withTimeout(
+                        this.bridge.nativeGetTextureData(resourceId, mip, eventId, channelExtract),
+                        30000,
+                        'Texture preview request timed out after 30s.',
+                    );
+                    if (retried?.base64) {
+                        const data = { base64: retried.base64, width: retried.width, height: retried.height, texFormat: retried.texFormat };
+                        this.texturePreviewCache.set(key, data);
+                        this.panel.webview.postMessage({ type: 'texturePreview', key, ...data });
+                    } else {
+                        this.panel.webview.postMessage({ type: 'texturePreview', key, error: 'No preview returned' });
+                    }
+                } catch (retryError: any) {
+                    this.panel.webview.postMessage({ type: 'texturePreview', key, error: retryError.message });
+                }
+            } else {
+                this.panel.webview.postMessage({ type: 'texturePreview', key, error: e.message });
+            }
+        }
+    }
+
+    private async loadCurrentDrawPreview(eventId: number, channelExtract: number = -1) {
+        const key = `current-draw:${eventId}:${channelExtract}`;
+        if (this.currentDrawPreviewCache.has(key)) {
+            const cached = this.currentDrawPreviewCache.get(key)!;
+            this.panel.webview.postMessage({ type: 'currentDrawPreview', key, ...cached });
+            return;
+        }
+        if (!this.bridge.hasNativeBridge()) {
+            const recovered = await this.tryRecoverReplay('current draw preview request');
+            if (!recovered || !this.bridge.hasNativeBridge()) {
+                this.panel.webview.postMessage({ type: 'currentDrawPreview', key, error: 'Native bridge not available (replay required).' });
+                return;
+            }
+        }
+        try {
+            const result = await withTimeout(
+                this.bridge.nativeGetCurrentDrawPreview(eventId, channelExtract),
+                30000,
+                'Current draw preview request timed out after 30s.',
+            );
+            if (result?.base64) {
+                const data = {
+                    base64: result.base64,
+                    width: result.width,
+                    height: result.height,
+                    texFormat: result.texFormat,
+                    resourceId: result.resourceId,
+                    label: result.label,
+                };
+                this.currentDrawPreviewCache.set(key, data);
+                this.panel.webview.postMessage({ type: 'currentDrawPreview', key, ...data });
+            } else {
+                this.panel.webview.postMessage({ type: 'currentDrawPreview', key, error: 'No preview returned' });
+            }
+        } catch (e: any) {
+            if (this.isNoReplayActiveError(e) && await this.tryRecoverReplay('current draw preview request')) {
+                try {
+                    const retried = await withTimeout(
+                        this.bridge.nativeGetCurrentDrawPreview(eventId, channelExtract),
+                        30000,
+                        'Current draw preview request timed out after 30s.',
+                    );
+                    if (retried?.base64) {
+                        const data = {
+                            base64: retried.base64,
+                            width: retried.width,
+                            height: retried.height,
+                            texFormat: retried.texFormat,
+                            resourceId: retried.resourceId,
+                            label: retried.label,
+                        };
+                        this.currentDrawPreviewCache.set(key, data);
+                        this.panel.webview.postMessage({ type: 'currentDrawPreview', key, ...data });
+                    } else {
+                        this.panel.webview.postMessage({ type: 'currentDrawPreview', key, error: 'No preview returned' });
+                    }
+                } catch (retryError: any) {
+                    this.panel.webview.postMessage({ type: 'currentDrawPreview', key, error: retryError.message });
+                }
+            } else {
+                this.panel.webview.postMessage({ type: 'currentDrawPreview', key, error: e.message });
+            }
         }
     }
 
@@ -532,7 +785,19 @@ export class InspectorPanel {
                 this.setEvent(msg.eventId);
                 break;
             case 'requestTexture':
-                this.loadTexturePreview(msg.resourceId, msg.mip ?? 0, msg.eventId ?? this.currentEventId ?? 0, msg.channelExtract ?? -1);
+                this.loadTexturePreview(
+                    msg.resourceId,
+                    msg.mip ?? 0,
+                    msg.eventId ?? this.currentEventId ?? 0,
+                    msg.channelExtract ?? -1,
+                    msg.purpose ?? 'preview',
+                );
+                break;
+            case 'requestCurrentDrawPreview':
+                this.loadCurrentDrawPreview(
+                    msg.eventId ?? this.currentEventId ?? 0,
+                    msg.channelExtract ?? -1,
+                );
                 break;
             case 'requestMesh':
                 this.loadMesh(

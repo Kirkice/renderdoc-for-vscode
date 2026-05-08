@@ -1,6 +1,9 @@
 
 (() => {
     const vscode = acquireVsCodeApi();
+    const TEXTURES_SPLIT_STORAGE_KEY = 'renderdoc.texturesPreviewHeight';
+    const TEXTURES_PREVIEW_MIN_HEIGHT = 140;
+    const TEXTURES_LIST_MIN_HEIGHT = 140;
     const state = {
         captureInfo: null,
         drawCalls: [],
@@ -19,6 +22,7 @@
         resTypeFilter: 'all',
         modalResource: null,
         modalChannel: -1,
+        currentPreviewChannel: -1,
         eventScope: 'all',   // 'all' | 'group'
         texScope: 'output',  // 'output' | 'input'
         meshStage: 'vsin',   // 'vsin' | 'vsout'
@@ -67,6 +71,125 @@
         return changed;
     }
 
+    function effectiveFramebuffer(pipe) {
+        const fb = (pipe && pipe.framebuffer) || {};
+        const colorTargets = Array.isArray(fb.colorTargets) ? fb.colorTargets.filter(Boolean) : [];
+        const actionOutputs = Array.isArray(pipe && pipe.actionOutputs) ? pipe.actionOutputs.filter(Boolean) : [];
+        const presentationColorTarget = pipe && pipe.presentationColorTarget;
+        const presentationDepthTarget = pipe && pipe.presentationDepthTarget;
+        const hasFramebufferOutputs = colorTargets.length || fb.depthTarget || fb.depthResolveTarget || fb.stencilTarget;
+        const hasActionFallback = !!(actionOutputs.length || (pipe && pipe.actionDepth) || (pipe && pipe.actionCopyDestination));
+        const usesPresentationFallback = !hasFramebufferOutputs && !hasActionFallback && !!(presentationColorTarget || presentationDepthTarget);
+        return {
+            colorTargets: hasFramebufferOutputs
+                ? colorTargets
+                : (hasActionFallback ? actionOutputs : (presentationColorTarget ? [presentationColorTarget] : [])),
+            depthTarget: fb.depthTarget || (hasFramebufferOutputs ? null : ((pipe && pipe.actionDepth) || (usesPresentationFallback ? presentationDepthTarget : null))),
+            depthResolveTarget: fb.depthResolveTarget || null,
+            stencilTarget: fb.stencilTarget || null,
+            copyDestination: hasFramebufferOutputs ? (pipe && pipe.actionCopyDestination) : (hasActionFallback ? (pipe && pipe.actionCopyDestination) : null),
+            usesActionFallback: !hasFramebufferOutputs && hasActionFallback,
+            usesPresentationFallback,
+        };
+    }
+
+    function currentOutputInfo(pipe) {
+        const fb = effectiveFramebuffer(pipe);
+        if (fb.colorTargets && fb.colorTargets.length) {
+            return { resourceId: fb.colorTargets[0], label: fb.usesPresentationFallback ? 'Presentation' : 'Cur Output 0', framebuffer: fb };
+        }
+        if (fb.depthResolveTarget) {
+            return { resourceId: fb.depthResolveTarget, label: 'Cur Depth Resolve', framebuffer: fb };
+        }
+        if (fb.depthTarget) {
+            return { resourceId: fb.depthTarget, label: fb.usesPresentationFallback ? 'Presentation Depth' : 'Cur Depth', framebuffer: fb };
+        }
+        if (fb.copyDestination) {
+            return { resourceId: fb.copyDestination, label: 'Cur Copy Dest', framebuffer: fb };
+        }
+        return null;
+    }
+
+    function currentPresentationInfo(pipe) {
+        if (!pipe || pipe.error) return null;
+        if (pipe.presentationColorTarget) {
+            return {
+                resourceId: String(pipe.presentationColorTarget),
+                label: 'Presentation',
+                metaBadge: 'backbuffer',
+            };
+        }
+        if (pipe.presentationDepthTarget) {
+            return {
+                resourceId: String(pipe.presentationDepthTarget),
+                label: 'Presentation Depth',
+                metaBadge: 'backbuffer',
+            };
+        }
+        return null;
+    }
+
+    function textureResourceById(resourceId) {
+        if (resourceId == null) return null;
+        const id = String(resourceId);
+        const resource = resById().get(id);
+        if (!resource) {
+            return {
+                resourceId: id,
+                type: 'Texture',
+                name: 'Texture ' + id,
+                format: '',
+                width: 0,
+                height: 0,
+                depth: 0,
+                mipLevels: 0,
+                byteSize: 0,
+            };
+        }
+        if (resource.type && resource.type !== 'Texture') {
+            return null;
+        }
+        return {
+            resourceId: id,
+            type: 'Texture',
+            name: resource.name || ('Texture ' + id),
+            format: resource.format || '',
+            width: resource.width || 0,
+            height: resource.height || 0,
+            depth: resource.depth || 0,
+            mipLevels: resource.mipLevels || 0,
+            byteSize: resource.byteSize || 0,
+        };
+    }
+
+    function collectScopedTextures(scopeIds, allTex) {
+        const textureMap = new Map(allTex.map(t => [String(t.resourceId), t]));
+        return Array.from(scopeIds)
+            .map(id => textureMap.get(String(id)) || textureResourceById(id))
+            .filter(Boolean);
+    }
+
+    function isOutputLikeResource(resourceId) {
+        if (resourceId == null) return false;
+        const pipe = state.pipeline;
+        if (!pipe || pipe.error) return false;
+        const fb = effectiveFramebuffer(pipe);
+        const targets = new Set([
+            ...((fb.colorTargets || []).map(id => String(id))),
+            ...(fb.depthTarget ? [String(fb.depthTarget)] : []),
+            ...(fb.depthResolveTarget ? [String(fb.depthResolveTarget)] : []),
+            ...(fb.stencilTarget ? [String(fb.stencilTarget)] : []),
+            ...(fb.copyDestination ? [String(fb.copyDestination)] : []),
+        ]);
+        return targets.has(String(resourceId));
+    }
+
+    function textureRequestEventId(resourceId, purpose) {
+        if (purpose === 'preview') return state.eventId || 0;
+        if (purpose === 'thumb') return state.eventId || 0;
+        return state.eventId || 0;
+    }
+
     // ── Tab switching ──────────────────────────────────────────────
     document.querySelectorAll('.tab').forEach(t => {
         t.addEventListener('click', () => switchTab(t.dataset.tab));
@@ -76,6 +199,12 @@
         document.querySelectorAll('.tab').forEach(el => el.classList.toggle('active', el.dataset.tab === tab));
         document.querySelectorAll('.tab-panel').forEach(el => el.classList.toggle('active', el.id === 'tab-' + tab));
         render();
+        if (tab === 'textures') {
+            requestAnimationFrame(() => {
+                applyTexturesPreviewHeight(loadTexturesPreviewHeight());
+                updateCurrentRTPreviewImageScale();
+            });
+        }
     }
 
     // ── Toolbar ────────────────────────────────────────────────────
@@ -100,7 +229,6 @@
     // If the event is a top-level leaf, returns null (caller falls back to root list).
     function findParentGroup(list, eventId, parent = null) {
         for (const dc of list) {
-            if (dc.eventId === eventId) return parent;
             if (dc.children?.length) {
                 const found = findParentGroup(dc.children, eventId, dc);
                 if (found !== null) return found;
@@ -108,17 +236,18 @@
                 const contains = flattenEvents(dc.children).some(c => c.eventId === eventId);
                 if (contains) return dc;
             }
+            if (dc.eventId === eventId) return parent;
         }
         return null;
     }
     function findEventPath(list, eventId, trail = []) {
         for (const dc of list) {
             const next = trail.concat(dc);
-            if (dc.eventId === eventId) return next;
             if (dc.children?.length) {
                 const found = findEventPath(dc.children, eventId, next);
                 if (found) return found;
             }
+            if (dc.eventId === eventId) return next;
         }
         return null;
     }
@@ -163,9 +292,17 @@
                 state.drawCalls = m.drawCalls || [];
                 state.resources = m.resources || [];
                 state.resourceAliases = {};
+                state.currentPreviewChannel = -1;
                 state.timings = {};
                 state.timingsAvailable = false;
                 state.timingsError = null;
+                thumbCache.clear();
+                thumbErrors.clear();
+                thumbPending.clear();
+                rtPreviewCache.clear();
+                rtPreviewErrors.clear();
+                rtPreviewPending.clear();
+                resetCurrentRTPreviewView();
                 render();
                 break;
             case 'eventChanged':
@@ -179,9 +316,20 @@
                         state.meshCache = {};
                         state.meshPending = {};
                         state.meshCam.auto = true;
+                        thumbCache.clear();
+                        thumbErrors.clear();
+                        thumbPending.clear();
+                        rtPreviewCache.clear();
+                        rtPreviewErrors.clear();
+                        rtPreviewPending.clear();
+                        resetCurrentRTPreviewView();
                     }
                     updateHeader();
                     render();
+                    if (state.modalResource) {
+                        textureModalPreviewEl.innerHTML = '<div class="muted">Loading…</div>';
+                        requestTexture();
+                    }
                 }
                 break;
             case 'shadersLoaded':
@@ -194,12 +342,19 @@
                 if (m.eventId === state.eventId) {
                     state.pipeline = m.data;
                     const aliasesChanged = updateShaderAliasesFromPipeline(m.data);
-                    if (state.activeTab === 'pipeline' || state.activeTab === 'overview' || state.activeTab === 'pipelinegraph') render();
+                    if (state.activeTab === 'pipeline' || state.activeTab === 'overview' || state.activeTab === 'pipelinegraph' || state.activeTab === 'textures') render();
                     else if (aliasesChanged && state.activeTab === 'resources') renderResources();
+                    if (state.modalResource && isOutputLikeResource(state.modalResource.resourceId)) {
+                        textureModalPreviewEl.innerHTML = '<div class="muted">Loading…</div>';
+                        requestTexture();
+                    }
                 }
                 break;
             case 'texturePreview':
                 handleTexturePreview(m);
+                break;
+            case 'currentDrawPreview':
+                handleCurrentDrawPreview(m);
                 break;
             case 'meshLoaded':
                 if (m.key) {
@@ -2041,16 +2196,18 @@
         const allTex = state.resources.filter(r => r.type === 'Texture');
 
         const pipe = state.pipeline || {};
-        const fb = pipe.framebuffer || {};
+        const fb = effectiveFramebuffer(pipe);
         const outputIds = new Set();
         (fb.colorTargets || []).forEach(id => outputIds.add(String(id)));
         if (fb.depthTarget)   outputIds.add(String(fb.depthTarget));
+        if (fb.depthResolveTarget) outputIds.add(String(fb.depthResolveTarget));
         if (fb.stencilTarget) outputIds.add(String(fb.stencilTarget));
+        if (fb.copyDestination) outputIds.add(String(fb.copyDestination));
         const inputIds = new Set();
         (pipe.boundTextures || []).forEach(id => inputIds.add(String(id)));
 
         const scopeIds = state.texScope === 'input' ? inputIds : outputIds;
-        let textures = allTex.filter(t => scopeIds.has(String(t.resourceId)));
+        let textures = collectScopedTextures(scopeIds, allTex);
         const scopeLabel = state.texScope === 'input' ? '(sampled by draw)' : '(render targets)';
 
         const f = state.texFilter;
@@ -2072,7 +2229,7 @@
                     : 'No textures match filter.';
             } else {
                 body.textContent = textures.length === 0
-                    ? 'This draw has no bound render targets.'
+                    ? 'This draw has no framebuffer, action output, or copy-destination resources.'
                     : 'No textures match filter.';
             }
             return;
@@ -2084,21 +2241,195 @@
         });
 
         for (const t of filtered) {
-            requestThumbnail(String(t.resourceId));
+            requestThumbnail(String(t.resourceId), textureRequestEventId(t.resourceId, 'thumb'));
         }
     }
 
     // Render the large "current draw output" preview panel on top of the
     // Texture Viewer tab — mirrors RenderDoc's "Cur Output" header image.
-    const rtPreviewCache = new Map();   // key → base64 PNG
+    const rtPreviewCache = new Map();   // key → preview payload
     const rtPreviewErrors = new Map();  // key → error message (prevents infinite re-request)
     const rtPreviewPending = new Set(); // key currently in flight
-    function rtKey(resId) {
-        return String(resId) + ':0:' + (state.eventId || 0) + ':-1';
+    const CURRENT_RT_PREVIEW_MIN_ZOOM = 0.1;
+    const CURRENT_RT_PREVIEW_MAX_ZOOM = 16;
+    let currentRTPreviewPan = null;
+    let currentRTPreviewZoom = 1;
+    function loadTexturesPreviewHeight() {
+        try {
+            const raw = localStorage.getItem(TEXTURES_SPLIT_STORAGE_KEY);
+            if (!raw) return null;
+            const parsed = parseFloat(raw);
+            return Number.isFinite(parsed) ? parsed : null;
+        } catch {
+            return null;
+        }
     }
+    function saveTexturesPreviewHeight(height) {
+        if (!Number.isFinite(height)) return;
+        try {
+            localStorage.setItem(TEXTURES_SPLIT_STORAGE_KEY, String(height));
+        } catch {
+            // Ignore storage failures in webview sandboxes.
+        }
+    }
+    function clampTexturesPreviewHeight(height) {
+        const splitEl = document.getElementById('textures-split');
+        const texCurrentEl = document.getElementById('tex-current');
+        if (!splitEl || !texCurrentEl) {
+            return Math.max(TEXTURES_PREVIEW_MIN_HEIGHT, height || 0);
+        }
+        const splitterSize = 4;
+        const available = splitEl.clientHeight || splitEl.getBoundingClientRect().height || 0;
+        const fallback = Math.max(TEXTURES_PREVIEW_MIN_HEIGHT, texCurrentEl.getBoundingClientRect().height || 260);
+        if (available <= 0) {
+            return Math.max(TEXTURES_PREVIEW_MIN_HEIGHT, height || fallback);
+        }
+        const maxHeight = Math.max(TEXTURES_PREVIEW_MIN_HEIGHT, available - splitterSize - TEXTURES_LIST_MIN_HEIGHT);
+        const preferred = Number.isFinite(height) ? height : fallback;
+        return Math.min(Math.max(TEXTURES_PREVIEW_MIN_HEIGHT, preferred), maxHeight);
+    }
+    function applyTexturesPreviewHeight(height) {
+        const texCurrentEl = document.getElementById('tex-current');
+        if (!texCurrentEl) return null;
+        const clamped = clampTexturesPreviewHeight(height);
+        texCurrentEl.style.flex = '0 0 ' + clamped + 'px';
+        return clamped;
+    }
+    function rtKey() {
+        return 'current-draw:' + (state.eventId || 0) + ':' + state.currentPreviewChannel;
+    }
+    function getCurrentRTPreviewAreaEl() {
+        return document.querySelector('#tex-current .tex-current-preview');
+    }
+    function getCurrentRTPreviewImageEl() {
+        const areaEl = getCurrentRTPreviewAreaEl();
+        return areaEl ? areaEl.querySelector('img') : null;
+    }
+    function getCurrentRTPreviewStageEl() {
+        const areaEl = getCurrentRTPreviewAreaEl();
+        return areaEl ? areaEl.querySelector('.tex-current-stage') : null;
+    }
+    function clampCurrentRTPreviewZoom(zoom) {
+        return Math.min(Math.max(CURRENT_RT_PREVIEW_MIN_ZOOM, zoom), CURRENT_RT_PREVIEW_MAX_ZOOM);
+    }
+    function updateCurrentRTPreviewZoomLabel() {
+        const btn = document.querySelector('#tex-current .tex-current-zoom-reset');
+        if (btn) btn.textContent = Math.round(currentRTPreviewZoom * 100) + '%';
+    }
+    function getCurrentRTPreviewContentSize() {
+        const areaEl = getCurrentRTPreviewAreaEl();
+        if (!areaEl) {
+            return { width: 1, height: 1 };
+        }
+        const style = window.getComputedStyle(areaEl);
+        const padX = parseFloat(style.paddingLeft || '0') + parseFloat(style.paddingRight || '0');
+        const padY = parseFloat(style.paddingTop || '0') + parseFloat(style.paddingBottom || '0');
+        return {
+            width: Math.max(1, areaEl.clientWidth - padX),
+            height: Math.max(1, areaEl.clientHeight - padY),
+        };
+    }
+    function stopCurrentRTPreviewPan() {
+        if (!currentRTPreviewPan) return;
+        const areaEl = currentRTPreviewPan.areaEl;
+        try { areaEl.releasePointerCapture(currentRTPreviewPan.pointerId); } catch {}
+        currentRTPreviewPan = null;
+        areaEl.classList.remove('panning');
+        areaEl.removeEventListener('pointermove', onCurrentRTPreviewPan);
+        areaEl.removeEventListener('pointerup', stopCurrentRTPreviewPan);
+        areaEl.removeEventListener('pointercancel', stopCurrentRTPreviewPan);
+    }
+    function startCurrentRTPreviewPan(event) {
+        const areaEl = event.currentTarget;
+        if (!areaEl || event.button !== 0) return;
+        if (!getCurrentRTPreviewImageEl()) return;
+        if (event.target.closest('.muted')) return;
+        stopCurrentRTPreviewPan();
+        currentRTPreviewPan = {
+            areaEl,
+            pointerId: event.pointerId,
+            startX: event.clientX,
+            startY: event.clientY,
+            scrollLeft: areaEl.scrollLeft,
+            scrollTop: areaEl.scrollTop,
+        };
+        areaEl.classList.add('panning');
+        areaEl.setPointerCapture(event.pointerId);
+        areaEl.addEventListener('pointermove', onCurrentRTPreviewPan);
+        areaEl.addEventListener('pointerup', stopCurrentRTPreviewPan);
+        areaEl.addEventListener('pointercancel', stopCurrentRTPreviewPan);
+        event.preventDefault();
+        event.stopPropagation();
+    }
+    function onCurrentRTPreviewPan(event) {
+        if (!currentRTPreviewPan) return;
+        const areaEl = currentRTPreviewPan.areaEl;
+        areaEl.scrollLeft = currentRTPreviewPan.scrollLeft - (event.clientX - currentRTPreviewPan.startX);
+        areaEl.scrollTop = currentRTPreviewPan.scrollTop - (event.clientY - currentRTPreviewPan.startY);
+    }
+    function updateCurrentRTPreviewImageScale() {
+        const areaEl = getCurrentRTPreviewAreaEl();
+        const img = getCurrentRTPreviewImageEl();
+        const stage = getCurrentRTPreviewStageEl();
+        updateCurrentRTPreviewZoomLabel();
+        if (!areaEl) return;
+        areaEl.classList.remove('has-image');
+        if (!img || !img.naturalWidth || !img.naturalHeight) {
+            areaEl.title = '';
+            return;
+        }
+        const previewSize = getCurrentRTPreviewContentSize();
+        const fitScale = Math.min(
+            previewSize.width / img.naturalWidth,
+            previewSize.height / img.naturalHeight,
+            1,
+        );
+        const width = Math.max(1, Math.round(img.naturalWidth * fitScale * currentRTPreviewZoom));
+        const height = Math.max(1, Math.round(img.naturalHeight * fitScale * currentRTPreviewZoom));
+        img.style.width = width + 'px';
+        img.style.height = height + 'px';
+        if (stage) {
+            stage.style.width = Math.max(previewSize.width, width) + 'px';
+            stage.style.height = Math.max(previewSize.height, height) + 'px';
+        }
+        const pannable = areaEl.scrollWidth > areaEl.clientWidth
+            || areaEl.scrollHeight > areaEl.clientHeight;
+        areaEl.classList.toggle('has-image', pannable);
+        areaEl.title = 'Mouse wheel: zoom (' + Math.round(currentRTPreviewZoom * 100) + '%)';
+    }
+    function setCurrentRTPreviewZoom(nextZoom) {
+        const clamped = clampCurrentRTPreviewZoom(nextZoom);
+        if (Math.abs(clamped - currentRTPreviewZoom) < 0.0001) {
+            updateCurrentRTPreviewZoomLabel();
+            return;
+        }
+        currentRTPreviewZoom = clamped;
+        updateCurrentRTPreviewImageScale();
+    }
+    function resetCurrentRTPreviewView() {
+        currentRTPreviewZoom = 1;
+        stopCurrentRTPreviewPan();
+        const areaEl = getCurrentRTPreviewAreaEl();
+        if (areaEl) {
+            areaEl.scrollLeft = 0;
+            areaEl.scrollTop = 0;
+        }
+        updateCurrentRTPreviewImageScale();
+    }
+    function setCurrentRTPreviewChannel(channelExtract) {
+        state.currentPreviewChannel = Number.isFinite(channelExtract) ? channelExtract : -1;
+        renderCurrentRTPreview();
+    }
+    window.addEventListener('resize', () => {
+        if (state.activeTab === 'textures') {
+            applyTexturesPreviewHeight(loadTexturesPreviewHeight());
+            updateCurrentRTPreviewImageScale();
+        }
+    });
     function renderCurrentRTPreview() {
         const area = document.getElementById('tex-current');
         if (!area) return;
+        stopCurrentRTPreviewPan();
         if (state.eventId == null) {
             area.className = 'tex-current empty-state';
             area.textContent = 'Select an event to preview its render target.';
@@ -2112,25 +2443,34 @@
                 : 'Loading render target…';
             return;
         }
-        const fb = pipe.framebuffer || {};
-        const rtId = (fb.colorTargets && fb.colorTargets[0]) || fb.depthTarget;
-        if (!rtId) {
-            area.className = 'tex-current empty-state';
-            area.textContent = 'No render target bound for this draw.';
-            return;
-        }
-        const tex = state.resources.find(r => String(r.resourceId) === String(rtId));
-        const name = (tex && tex.name) || ('Resource ' + rtId);
-        const fmt = (tex && tex.format) || '';
-        const dim = tex && tex.width ? (tex.width + '×' + tex.height) : '';
-
-        area.className = 'tex-current';
-        const key = rtKey(rtId);
+        const key = rtKey();
         const cached = rtPreviewCache.get(key);
         const errMsg = rtPreviewErrors.get(key);
+        const rtId = cached && cached.resourceId ? String(cached.resourceId) : null;
+        const output = currentOutputInfo(pipe);
+        const label = (cached && cached.label) || (output && output.label) || 'Current Draw';
+        const tex = state.resources.find(r => String(r.resourceId) === String(rtId));
+        const name = cached && cached.label ? cached.label : (tex && tex.name) || (rtId ? ('Resource ' + rtId) : 'Current Draw Preview');
+        const fmt = (cached && cached.texFormat) || (tex && tex.format) || '';
+        const dim = cached && cached.width ? (cached.width + '×' + cached.height) : (tex && tex.width ? (tex.width + '×' + tex.height) : '');
+        const badges = [];
+        const channelButtons = [
+            { value: -1, label: 'RGBA' },
+            { value: 0, label: 'R' },
+            { value: 1, label: 'G' },
+            { value: 2, label: 'B' },
+            { value: 3, label: 'A' },
+        ].map(ch =>
+            '<button data-ch="' + ch.value + '" class="ch' + (state.currentPreviewChannel === ch.value ? ' active' : '') + '">' + ch.label + '</button>'
+        ).join('');
+        badges.push('<span class="tex-current-meta">replay preview</span>');
+        if (output && output.framebuffer && output.framebuffer.usesActionFallback) badges.push('<span class="tex-current-meta">action fallback</span>');
+        if (output && output.framebuffer && output.framebuffer.usesPresentationFallback) badges.push('<span class="tex-current-meta">backbuffer fallback</span>');
+
+        area.className = 'tex-current';
         let body;
-        if (cached) {
-            body = '<img src="data:image/png;base64,' + cached + '" alt="current RT">';
+        if (cached && cached.base64) {
+            body = '<div class="tex-current-stage"><img src="data:image/png;base64,' + cached.base64 + '" alt="current RT"></div>';
         } else if (errMsg) {
             body = '<div class="muted" style="padding:8px;font-size:0.85em;">Preview unavailable: ' + esc(errMsg) + '</div>';
         } else {
@@ -2138,46 +2478,100 @@
         }
         area.innerHTML =
             '<div class="tex-current-header">' +
-                '<span class="tex-current-label">Cur Output 0</span>' +
+                '<span class="tex-current-label">' + esc(label) + '</span>' +
                 '<span class="tex-current-name" title="' + esc(name) + '">' + esc(name) + '</span>' +
                 '<span class="tex-current-meta">' + esc(dim) + ' ' + esc(fmt) + '</span>' +
-                '<button class="icon-btn tex-current-open" data-resid="' + esc(rtId) + '">Open</button>' +
+                badges.join('') +
+                '<div class="tex-current-actions">' +
+                    '<span class="tex-current-meta tex-current-hint">Wheel: zoom · Drag: pan</span>' +
+                    '<div class="channel-toggle tex-current-channel-toggle">' + channelButtons + '</div>' +
+                    '<button class="icon-btn tex-current-zoom-reset" title="Reset zoom and pan">' + Math.round(currentRTPreviewZoom * 100) + '%</button>' +
+                    (rtId ? ('<button class="icon-btn tex-current-open" data-resid="' + esc(rtId) + '">Open</button>') : '') +
+                '</div>' +
             '</div>' +
             '<div class="tex-current-preview">' + body + '</div>';
 
+        const previewEl = area.querySelector('.tex-current-preview');
+        if (previewEl) {
+            previewEl.addEventListener('pointerdown', startCurrentRTPreviewPan);
+            previewEl.addEventListener('wheel', (event) => {
+                if (!getCurrentRTPreviewImageEl()) return;
+                event.preventDefault();
+                const step = event.deltaY < 0 ? 1.1 : (1 / 1.1);
+                setCurrentRTPreviewZoom(currentRTPreviewZoom * step);
+            }, { passive: false });
+        }
+        area.querySelectorAll('.tex-current-channel-toggle .ch').forEach(btn => btn.addEventListener('click', () => {
+            setCurrentRTPreviewChannel(parseInt(btn.dataset.ch, 10));
+        }));
+        const resetBtn = area.querySelector('.tex-current-zoom-reset');
+        if (resetBtn) resetBtn.addEventListener('click', resetCurrentRTPreviewView);
         const btn = area.querySelector('.tex-current-open');
         if (btn) btn.addEventListener('click', () => openTextureModal(String(rtId)));
+        const img = getCurrentRTPreviewImageEl();
+        if (img) {
+            img.addEventListener('load', updateCurrentRTPreviewImageScale, { once: true });
+            if (img.complete) {
+                updateCurrentRTPreviewImageScale();
+            }
+        } else {
+            updateCurrentRTPreviewZoomLabel();
+        }
 
         if (!cached && !errMsg && !rtPreviewPending.has(key)) {
             rtPreviewPending.add(key);
             vscode.postMessage({
-                type: 'requestTexture',
-                resourceId: String(rtId),
-                mip: 0,
+                type: 'requestCurrentDrawPreview',
                 eventId: state.eventId || 0,
-                channelExtract: -1,
+                channelExtract: state.currentPreviewChannel,
             });
         }
     }
 
-    // Thumbnail management ──────────────────────────────────────
-    // We keep a client-side cache of already-loaded thumbnails, keyed by
-    // resId alone (no eventId) — thumbnail cards show a static preview of
-    // the texture's content and do NOT need to be re-fetched on every event
-    // switch.  Only the large "Cur Output" RT preview uses an eventId key
-    // so it correctly tracks the RT state at the selected draw.
-    const thumbCache = new Map();       // key → base64 PNG
-    const thumbPending = new Set();     // key currently in flight
-    function thumbKey(resId) {
-        // Use eventId=0 so the native bridge samples end-of-frame state.
-        // This key is stable across event changes, preventing the N-texture
-        // refetch stampede that made switching draws very slow.
-        return String(resId) + ':0:0:-1';
+    function handleCurrentDrawPreview(m) {
+        if (!m || !m.key) return;
+        rtPreviewPending.delete(m.key);
+        if (!m.error && m.base64) {
+            rtPreviewCache.set(m.key, {
+                base64: m.base64,
+                width: m.width,
+                height: m.height,
+                texFormat: m.texFormat,
+                resourceId: m.resourceId,
+                label: m.label,
+            });
+            rtPreviewErrors.delete(m.key);
+        } else if (m.error) {
+            rtPreviewErrors.set(m.key, m.error);
+        }
+        if (state.activeTab === 'textures') renderCurrentRTPreview();
     }
-    function requestThumbnail(resId) {
-        const key = thumbKey(resId);
+
+    // Thumbnail management ──────────────────────────────────────
+    // Thumbnails are keyed by resource + event so draw-scoped inputs/outputs
+    // don't reuse stale images from a previous draw when the same resource ID
+    // is visible across multiple events.
+    const thumbCache = new Map();       // key → base64 PNG
+    const thumbErrors = new Map();      // key → error string
+    const thumbPending = new Set();     // key currently in flight
+    function thumbKey(resId, eventId) {
+        return String(resId) + ':0:' + (eventId || 0) + ':-1:thumb';
+    }
+    function bindThumbnailRequest(resId, key) {
+        const card = document.querySelector('.tex-card[data-resid="' + CSS.escape(String(resId)) + '"] .thumb');
+        if (!card) return null;
+        card.dataset.thumbKey = key;
+        return card;
+    }
+    function requestThumbnail(resId, eventId = 0) {
+        const key = thumbKey(resId, eventId);
+        bindThumbnailRequest(resId, key);
         if (thumbCache.has(key)) {
-            applyThumbnail(resId, thumbCache.get(key));
+            applyThumbnail(resId, key, thumbCache.get(key));
+            return;
+        }
+        if (thumbErrors.has(key)) {
+            applyThumbnailError(resId, key, thumbErrors.get(key));
             return;
         }
         if (thumbPending.has(key)) return;
@@ -2186,18 +2580,21 @@
             type: 'requestTexture',
             resourceId: resId,
             mip: 0,
-            eventId: 0,   // end-of-frame state; thumbnails are capture-level, not per-event
+            eventId: eventId,
             channelExtract: -1,
+            purpose: 'thumb',
         });
     }
-    function applyThumbnail(resId, base64) {
+    function applyThumbnail(resId, key, base64) {
         const card = document.querySelector('.tex-card[data-resid="' + CSS.escape(String(resId)) + '"] .thumb');
         if (!card) return;
+        if (card.dataset.thumbKey !== key) return;
         card.innerHTML = '<img src="data:image/png;base64,' + base64 + '" alt="thumbnail">';
     }
-    function applyThumbnailError(resId, errMsg) {
+    function applyThumbnailError(resId, key, errMsg) {
         const card = document.querySelector('.tex-card[data-resid="' + CSS.escape(String(resId)) + '"] .thumb');
         if (!card) return;
+        if (card.dataset.thumbKey !== key) return;
         card.innerHTML = '<span class="placeholder">' + esc(errMsg || 'preview failed') + '</span>';
     }
 
@@ -2495,7 +2892,7 @@
     }
 
     function openTextureModal(resId) {
-        const tex = state.resources.find(r => r.resourceId === resId);
+        const tex = state.resources.find(r => r.resourceId === resId) || textureResourceById(resId);
         if (!tex) return;
         state.modalResource = tex;
         state.modalChannel = -1;
@@ -2563,12 +2960,14 @@
 
     function requestTexture() {
         if (!state.modalResource) return;
+        const eventId = textureRequestEventId(state.modalResource.resourceId, 'modal');
         vscode.postMessage({
             type: 'requestTexture',
             resourceId: state.modalResource.resourceId,
             mip: 0,
-            eventId: state.eventId || 0,
+            eventId: eventId,
             channelExtract: state.modalChannel,
+            purpose: 'modal',
         });
     }
     function handleTexturePreview(m) {
@@ -2589,14 +2988,18 @@
         // open) rather than the modal? Match by key — thumbnails always use
         // mip=0, channel=-1, so they share the same key shape we computed in
         // thumbKey().
-        if (thumbPending.has(m.key)) {
-            thumbPending.delete(m.key);
+        if (typeof m.key === 'string' && m.key.endsWith(':thumb')) {
+            if (thumbPending.has(m.key)) {
+                thumbPending.delete(m.key);
+            }
             const resId = m.key.split(':')[0];
             if (m.error) {
-                applyThumbnailError(resId, m.error);
+                thumbErrors.set(m.key, m.error);
+                applyThumbnailError(resId, m.key, m.error);
             } else if (m.base64) {
+                thumbErrors.delete(m.key);
                 thumbCache.set(m.key, m.base64);
-                applyThumbnail(resId, m.base64);
+                applyThumbnail(resId, m.key, m.base64);
             }
             // A thumbnail load does NOT block the modal; if the user also
             // happens to have the modal open for the same key, fall through.
@@ -2605,7 +3008,8 @@
             }
         }
         if (!state.modalResource) return;
-        const expectedKey = state.modalResource.resourceId + ':0:' + (state.eventId||0) + ':' + state.modalChannel;
+        const expectedEventId = textureRequestEventId(state.modalResource.resourceId, 'modal');
+        const expectedKey = state.modalResource.resourceId + ':0:' + expectedEventId + ':' + state.modalChannel + ':modal';
         if (m.key !== expectedKey) return;
         if (m.error) {
             textureModalPreviewEl.innerHTML = '<div class="muted">Error: ' + esc(m.error) + '</div>';
@@ -3556,6 +3960,52 @@
                 isDraggingSplitter = false;
                 meshSplitter.classList.remove('dragging');
                 try { meshSplitter.releasePointerCapture(e.pointerId); } catch {}
+            });
+        }
+
+        // Texture Viewer Splitter
+        const texturesSplitter = document.getElementById('textures-splitter');
+        const texCurrentEl = document.getElementById('tex-current');
+        if (texturesSplitter && texCurrentEl) {
+            let isDraggingTexturesSplitter = false;
+            let startY = 0;
+            let startHeight = 0;
+
+            const initialHeight = applyTexturesPreviewHeight(loadTexturesPreviewHeight());
+            if (initialHeight != null) {
+                saveTexturesPreviewHeight(initialHeight);
+            }
+
+            texturesSplitter.addEventListener('pointerdown', (e) => {
+                isDraggingTexturesSplitter = true;
+                startY = e.clientY;
+                startHeight = texCurrentEl.getBoundingClientRect().height;
+                texturesSplitter.classList.add('dragging');
+                texturesSplitter.setPointerCapture(e.pointerId);
+                e.preventDefault();
+            });
+
+            texturesSplitter.addEventListener('pointermove', (e) => {
+                if (!isDraggingTexturesSplitter) return;
+                const dy = e.clientY - startY;
+                const nextHeight = applyTexturesPreviewHeight(startHeight + dy);
+                if (nextHeight != null && state.activeTab === 'textures') {
+                    requestAnimationFrame(() => updateCurrentRTPreviewImageScale());
+                }
+            });
+
+            texturesSplitter.addEventListener('pointerup', (e) => {
+                isDraggingTexturesSplitter = false;
+                texturesSplitter.classList.remove('dragging');
+                saveTexturesPreviewHeight(texCurrentEl.getBoundingClientRect().height);
+                try { texturesSplitter.releasePointerCapture(e.pointerId); } catch {}
+            });
+
+            texturesSplitter.addEventListener('pointercancel', (e) => {
+                isDraggingTexturesSplitter = false;
+                texturesSplitter.classList.remove('dragging');
+                saveTexturesPreviewHeight(texCurrentEl.getBoundingClientRect().height);
+                try { texturesSplitter.releasePointerCapture(e.pointerId); } catch {}
             });
         }
     })();

@@ -28,6 +28,13 @@ export interface MsgRequestTexture {
     mip?: number;
     eventId?: number;
     channelExtract?: number;
+    purpose?: 'thumb' | 'preview' | 'modal';
+}
+
+export interface MsgRequestCurrentDrawPreview {
+    type: 'requestCurrentDrawPreview';
+    eventId?: number;
+    channelExtract?: number;
 }
 
 export interface MsgOpenShaderInEditor {
@@ -77,6 +84,7 @@ export type WebviewToExtensionMessage =
     | MsgReady
     | MsgSelectEvent
     | MsgRequestTexture
+    | MsgRequestCurrentDrawPreview
     | MsgOpenShaderInEditor
     | MsgAnalyzeMaliOffline
     | MsgCopyToClipboard
@@ -136,6 +144,18 @@ export interface MsgTexturePreview {
     error?: string;
 }
 
+export interface MsgCurrentDrawPreview {
+    type: 'currentDrawPreview';
+    key: string;
+    base64?: string;
+    width?: number;
+    height?: number;
+    texFormat?: string;
+    resourceId?: string;
+    label?: string;
+    error?: string;
+}
+
 export interface MsgMeshLoaded {
     type: 'meshLoaded';
     key: string;
@@ -162,6 +182,7 @@ export type ExtensionToWebviewMessage =
     | MsgShadersLoaded
     | MsgPipelineLoaded
     | MsgTexturePreview
+    | MsgCurrentDrawPreview
     | MsgMeshLoaded
     | MsgMaliAnalysisResult
     | MsgTimingsLoaded;
