@@ -92,6 +92,14 @@ export interface LiveTargetInfo {
     local: boolean;
 }
 
+export interface ReplayHostInfo {
+    connected: boolean;
+    url?: string;
+    protocol?: string;
+    localProxies?: string[];
+    remoteSupportedReplays?: string[];
+}
+
 export interface LaunchCaptureResult extends LiveTargetInfo {
 }
 

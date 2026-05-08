@@ -49,6 +49,8 @@ static DllLoader         g_dll;
 static ICaptureFile     *g_capFile    = nullptr;
 static IReplayController*g_replay     = nullptr;
 static bool              g_replayInit = false;
+static bool              g_replayIsRemote = false;
+static std::string       g_capturePath;
 
 // Guards all writes to stdout. The replay worker thread can emit progress
 // notifications while the main thread is also writing responses/logs, so
@@ -173,6 +175,7 @@ static void shutdownCachedReplayOutputs() {
     g_overlayW = 0;
     g_overlayH = 0;
 }
+
 // Live target-control session used for launch/attach workflows where the
 // user starts a program now and decides later when to trigger a capture.
 static IRemoteServer    *g_liveRemote = nullptr;
@@ -185,6 +188,34 @@ static std::string       g_liveTargetAPI;
 static uint32_t          g_liveTargetPID = 0;
 static uint32_t          g_liveTargetIdent = 0;
 static bool              g_liveTargetLocal = true;
+static IRemoteServer    *g_replayRemote = nullptr;
+static std::atomic<bool> g_replayRemoteKeepAlive{false};
+static std::thread       g_replayRemotePingThread;
+static std::string       g_replayRemoteUrl;
+static std::string       g_replayRemoteCapturePath;
+
+static void closeActiveReplay() {
+    shutdownCachedReplayOutputs();
+    resetEventCache();
+    if (g_replay) {
+        if (g_replayIsRemote && g_replayRemote) {
+            g_replayRemote->CloseCapture(g_replay);
+        } else {
+            g_replay->Shutdown();
+        }
+        g_replay = nullptr;
+    }
+    g_replayIsRemote = false;
+}
+
+static void closeOpenCaptureFile() {
+    if (g_capFile) {
+        g_capFile->Shutdown();
+        g_capFile = nullptr;
+    }
+    g_capturePath.clear();
+    g_replayRemoteCapturePath.clear();
+}
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -242,25 +273,34 @@ static bool connectRemoteServer(const std::string &url, IRemoteServer **remote, 
         return false;
     }
 
+    const std::string protocol = protocolFromUrl(url);
+    IDeviceProtocolController *controller = nullptr;
+    if (!protocol.empty() && g_dll.GetDeviceProtocolController) {
+        controller = g_dll.GetDeviceProtocolController(rdcstr(protocol.c_str()));
+        if (controller) {
+            // RenderDoc protocol controllers lazily initialise devices during
+            // enumeration; connection/start requests may fail if the device
+            // has not been seen via GetDevices() in this process yet.
+            controller->GetDevices();
+        }
+    }
+
     ResultDetails result = g_dll.CreateRemoteServerConnection(rdcstr(url.c_str()), remote);
     if (result.code == ResultCode::Succeeded && *remote) {
         return true;
     }
 
-    const std::string protocol = protocolFromUrl(url);
-    if (!protocol.empty() && g_dll.GetDeviceProtocolController) {
-        if (IDeviceProtocolController *controller = g_dll.GetDeviceProtocolController(rdcstr(protocol.c_str()))) {
-            emitStatusNote("Starting remote server on device...");
-            ResultDetails startResult = controller->StartRemoteServer(rdcstr(url.c_str()));
-            if (startResult.code == ResultCode::Succeeded) {
-                result = g_dll.CreateRemoteServerConnection(rdcstr(url.c_str()), remote);
-                if (result.code == ResultCode::Succeeded && *remote) {
-                    return true;
-                }
-            } else {
-                errorMessage = resultMessage(startResult);
-                return false;
+    if (controller) {
+        emitStatusNote("Starting remote server on device...");
+        ResultDetails startResult = controller->StartRemoteServer(rdcstr(url.c_str()));
+        if (startResult.code == ResultCode::Succeeded) {
+            result = g_dll.CreateRemoteServerConnection(rdcstr(url.c_str()), remote);
+            if (result.code == ResultCode::Succeeded && *remote) {
+                return true;
             }
+        } else {
+            errorMessage = resultMessage(startResult);
+            return false;
         }
     }
 
@@ -324,6 +364,57 @@ static void clearLiveTargetSession() {
     g_liveTargetPID = 0;
     g_liveTargetIdent = 0;
     g_liveTargetLocal = true;
+}
+
+static void clearReplayRemoteSession() {
+    closeActiveReplay();
+    stopRemoteKeepAlive(g_replayRemoteKeepAlive, g_replayRemotePingThread);
+    if (g_replayRemote) {
+        g_replayRemote->ShutdownConnection();
+        g_replayRemote = nullptr;
+    }
+    g_replayRemoteUrl.clear();
+    g_replayRemoteCapturePath.clear();
+}
+
+static void teardownBridge() {
+    clearReplayRemoteSession();
+    clearLiveTargetSession();
+    closeOpenCaptureFile();
+    shutdownCachedReplayOutputs();
+    resetEventCache();
+    if (g_replayInit && g_dll.isLoaded()) {
+        g_dll.ShutdownReplay();
+        g_replayInit = false;
+    }
+    g_dll.unload();
+}
+
+static json currentReplayHostJson() {
+    if (!g_replayRemote) {
+        return {{"connected", false}};
+    }
+
+    json result = {
+        {"connected", true},
+        {"url", g_replayRemoteUrl},
+        {"localProxies", json::array()},
+        {"remoteSupportedReplays", json::array()},
+    };
+
+    const std::string protocol = protocolFromUrl(g_replayRemoteUrl);
+    if (!protocol.empty()) {
+        result["protocol"] = protocol;
+    }
+
+    for (const rdcstr &proxy : g_replayRemote->LocalProxies()) {
+        result["localProxies"].push_back(rdcToStr(proxy));
+    }
+    for (const rdcstr &replay : g_replayRemote->RemoteSupportedReplays()) {
+        result["remoteSupportedReplays"].push_back(rdcToStr(replay));
+    }
+
+    return result;
 }
 
 static json currentLiveTargetJson() {
@@ -693,12 +784,14 @@ static json handleOpenCapture(int id, const json &params) {
     // Close previous capture if any. The overlay output is owned by the
     // replay controller, so Shutdown() tears it down — just null our cache.
     g_overlayOut = nullptr; g_overlayW = 0; g_overlayH = 0;
-    if (g_replay) { g_replay->Shutdown(); g_replay = nullptr; }
-    if (g_capFile) { g_capFile->Shutdown(); g_capFile = nullptr; }
+    closeActiveReplay();
+    closeOpenCaptureFile();
 
     g_capFile = g_dll.OpenCaptureFile();
     if (!g_capFile)
         return makeError(id, -3, "RENDERDOC_OpenCaptureFile returned null");
+
+    g_capturePath = path;
 
     rdcstr filename(path.c_str());
     rdcstr filetype;  // empty = auto-detect
@@ -709,6 +802,7 @@ static json handleOpenCapture(int id, const json &params) {
         std::string msg = "OpenFile failed: " + resultMessage(openResult);
         g_capFile->Shutdown();
         g_capFile = nullptr;
+        g_capturePath.clear();
         return makeError(id, -4, msg);
     }
 
@@ -716,6 +810,25 @@ static json handleOpenCapture(int id, const json &params) {
     fprintf(stderr, "[bridge] Checking LocalReplaySupport...\n");
     ReplaySupport localSupport = g_capFile->LocalReplaySupport();
     fprintf(stderr, "[bridge] LocalReplaySupport: %d\n", (int)localSupport);
+
+    if (g_replayRemote) {
+        json result;
+        result["path"] = path;
+        result["driver"] = rdcToStr(g_capFile->DriverName());
+        result["replay"] = false;
+        result["replayRemote"] = true;
+        result["replayHost"] = g_replayRemoteUrl;
+        result["canTryReplay"] = true;
+        if (localSupport == ReplaySupport::SuggestRemote) {
+            result["suggestRemote"] = true;
+            result["replayMessage"] = "Capture will be replayed remotely on " + g_replayRemoteUrl + ".";
+        } else if (localSupport == ReplaySupport::Unsupported) {
+            result["replayMessage"] = "Local replay is unsupported for this capture, but remote replay is configured on " + g_replayRemoteUrl + ".";
+        } else {
+            result["replayMessage"] = "Capture is ready for remote replay on " + g_replayRemoteUrl + ".";
+        }
+        return makeResult(id, result);
+    }
 
     if (localSupport == ReplaySupport::Unsupported) {
         // Truly unsupported — return file info without replay
@@ -761,11 +874,43 @@ static json handleOpenCapture(int id, const json &params) {
 }
 
 static json handleCloseCapture(int id) {
-    shutdownCachedReplayOutputs();
-    resetEventCache();
-    if (g_replay) { g_replay->Shutdown(); g_replay = nullptr; }
-    if (g_capFile) { g_capFile->Shutdown(); g_capFile = nullptr; }
+    closeActiveReplay();
+    closeOpenCaptureFile();
     return makeResult(id, {{"closed", true}});
+}
+
+static json handleSetReplayHost(int id, const json &params) {
+    if (!g_dll.isLoaded())
+        return makeError(id, -1, "DLL not loaded. Call init first.");
+
+    const std::string url = params.value("url", "");
+    if (url.empty())
+        return makeError(id, -2, "url is required");
+
+    if (g_replayRemote && g_replayRemoteUrl == url) {
+        return makeResult(id, currentReplayHostJson());
+    }
+
+    clearReplayRemoteSession();
+
+    std::string errorMessage;
+    IRemoteServer *remote = nullptr;
+    if (!connectRemoteServer(url, &remote, errorMessage)) {
+        return makeError(id, -3, "Failed to connect replay host: " + errorMessage);
+    }
+
+    g_replayRemote = remote;
+    g_replayRemoteUrl = url;
+    return makeResult(id, currentReplayHostJson());
+}
+
+static json handleGetReplayHost(int id) {
+    return makeResult(id, currentReplayHostJson());
+}
+
+static json handleDisconnectReplayHost(int id) {
+    clearReplayRemoteSession();
+    return makeResult(id, currentReplayHostJson());
 }
 
 // Explicitly try local replay for SuggestRemote captures (user-initiated).
@@ -779,7 +924,105 @@ static json handleTryReplay(int id) {
 
     ReplayOptions opts;
     opts.apiValidation = false;
-    fprintf(stderr, "[bridge] tryReplay: attempting local replay...\n");
+    fprintf(stderr, "[bridge] tryReplay: attempting %s replay...\n",
+            g_replayRemote ? "remote" : "local");
+
+    auto lastEmitNs = std::chrono::steady_clock::now();
+    float lastProgress = -1.0f;
+    std::atomic<float> sharedProgress{0.0f};
+    std::atomic<bool> openCaptureDone{false};
+    auto emitTryReplayProgress = [&](float p) {
+        sharedProgress.store(p, std::memory_order_relaxed);
+        auto now = std::chrono::steady_clock::now();
+        auto sinceMs = std::chrono::duration_cast<std::chrono::milliseconds>(now - lastEmitNs).count();
+        if (sinceMs < 50 && std::abs(p - lastProgress) < 0.01f) return;
+        lastEmitNs = now;
+        lastProgress = p;
+        fprintf(stderr, "[bridge] OpenCapture progress: %.3f\n", p);
+        fflush(stderr);
+        writeJsonLine({
+            {"method", "tryReplayProgress"},
+            {"params", {{"progress", p}}},
+        });
+    };
+
+    std::thread watchdog([&]() {
+        auto start = std::chrono::steady_clock::now();
+        while (!openCaptureDone.load(std::memory_order_acquire)) {
+            std::this_thread::sleep_for(std::chrono::seconds(5));
+            if (openCaptureDone.load(std::memory_order_acquire)) break;
+            auto secs = std::chrono::duration_cast<std::chrono::seconds>(
+                std::chrono::steady_clock::now() - start).count();
+            fprintf(stderr,
+                "[bridge] OpenCapture still running: elapsed=%llds, lastProgress=%.3f\n",
+                (long long)secs, sharedProgress.load(std::memory_order_relaxed));
+            fflush(stderr);
+        }
+    });
+
+    if (g_replayRemote) {
+        if (g_capturePath.empty()) {
+            openCaptureDone.store(true, std::memory_order_release);
+            if (watchdog.joinable()) watchdog.join();
+            return makeError(id, -2, "No local capture path is loaded for remote replay.");
+        }
+
+        auto copyProgress = [&](float p) {
+            emitTryReplayProgress(std::max(0.0f, std::min(1.0f, p * 0.35f)));
+        };
+        auto openProgress = [&](float p) {
+            emitTryReplayProgress(std::max(0.35f, std::min(1.0f, 0.35f + p * 0.65f)));
+        };
+
+        fprintf(stderr, "[bridge] Copying capture to remote host: %s\n", g_replayRemoteUrl.c_str());
+        fflush(stderr);
+        g_replayRemoteCapturePath = rdcToStr(
+            g_replayRemote->CopyCaptureToRemote(rdcstr(g_capturePath.c_str()), copyProgress));
+
+        if (g_replayRemoteCapturePath.empty()) {
+            openCaptureDone.store(true, std::memory_order_release);
+            if (watchdog.joinable()) watchdog.join();
+            return makeResult(id, {
+                {"replay", false},
+                {"replayRemote", true},
+                {"replayHost", g_replayRemoteUrl},
+                {"replayError", "CopyCaptureToRemote returned an empty path."},
+            });
+        }
+
+        fprintf(stderr, "[bridge] Opening capture remotely: %s\n", g_replayRemoteCapturePath.c_str());
+        fflush(stderr);
+        rdcpair<ResultDetails, IReplayController *> replayResult =
+            g_replayRemote->OpenCapture(IRemoteServer::NoPreference,
+                                        rdcstr(g_replayRemoteCapturePath.c_str()),
+                                        opts,
+                                        openProgress);
+
+        openCaptureDone.store(true, std::memory_order_release);
+        if (watchdog.joinable()) watchdog.join();
+
+        fprintf(stderr, "[bridge] Remote OpenCapture() returned, code=%d\n", (int)replayResult.first.code);
+        fflush(stderr);
+        if (replayResult.first.code != ResultCode::Succeeded) {
+            return makeResult(id, {
+                {"replay", false},
+                {"replayRemote", true},
+                {"replayHost", g_replayRemoteUrl},
+                {"replayError", resultMessage(replayResult.first)},
+            });
+        }
+
+        g_replay = replayResult.second;
+        g_replayIsRemote = true;
+        resetEventCache();
+        emitTryReplayProgress(1.0f);
+        fprintf(stderr, "[bridge] tryReplay succeeded remotely!\n");
+        return makeResult(id, {
+            {"replay", true},
+            {"replayRemote", true},
+            {"replayHost", g_replayRemoteUrl},
+        });
+    }
 
 #ifdef _WIN32
     // Override RenderDoc's crash handler to prevent Bug Reporter dialog.
@@ -797,44 +1040,9 @@ static json handleTryReplay(int id) {
     // callback from its replay-worker thread, so we emit at most ~20 fps
     // and only when the value changes meaningfully (>=1%). The notification
     // has no `id` field; the TS dispatcher treats such messages as events.
-    auto lastEmitNs = std::chrono::steady_clock::now();
-    float lastProgress = -1.0f;
-    std::atomic<float> sharedProgress{0.0f};
-    std::atomic<bool>  openCaptureDone{false};
     RENDERDOC_ProgressCallback progressCb = [&](float p) {
-        sharedProgress.store(p, std::memory_order_relaxed);
-        auto now = std::chrono::steady_clock::now();
-        auto sinceMs = std::chrono::duration_cast<std::chrono::milliseconds>(now - lastEmitNs).count();
-        if (sinceMs < 50 && std::abs(p - lastProgress) < 0.01f) return;
-        lastEmitNs = now;
-        lastProgress = p;
-        fprintf(stderr, "[bridge] OpenCapture progress: %.3f\n", p);
-        fflush(stderr);
-        json note = {
-            {"method", "tryReplayProgress"},
-            {"params", {{"progress", p}}},
-        };
-        writeJsonLine(note);
+        emitTryReplayProgress(p);
     };
-
-    // Watchdog: RenderDoc's ProgressCallback is not monotonic and for some
-    // phases (e.g. shader compilation) it can be silent for tens of seconds.
-    // Print a heartbeat every 5s with the last-seen progress value so the
-    // user can tell we're alive and waiting for renderdoc.dll, rather than
-    // the bridge being hung on our side.
-    std::thread watchdog([&]() {
-        auto start = std::chrono::steady_clock::now();
-        while (!openCaptureDone.load(std::memory_order_acquire)) {
-            std::this_thread::sleep_for(std::chrono::seconds(5));
-            if (openCaptureDone.load(std::memory_order_acquire)) break;
-            auto secs = std::chrono::duration_cast<std::chrono::seconds>(
-                std::chrono::steady_clock::now() - start).count();
-            fprintf(stderr,
-                "[bridge] OpenCapture still running: elapsed=%llds, lastProgress=%.3f\n",
-                (long long)secs, sharedProgress.load(std::memory_order_relaxed));
-            fflush(stderr);
-        }
-    });
 
     fprintf(stderr, "[bridge] Calling g_capFile->OpenCapture() ...\n");
     fflush(stderr);
@@ -857,9 +1065,11 @@ static json handleTryReplay(int id) {
     }
 
     g_replay = replayResult.second;
+    g_replayIsRemote = false;
     resetEventCache();  // next request sets frame event from clean state
     fprintf(stderr, "[bridge] tryReplay succeeded!\n");
-    return makeResult(id, {{"replay", true}});
+    emitTryReplayProgress(1.0f);
+    return makeResult(id, {{"replay", true}, {"replayRemote", false}});
 }
 
 static json handleSetFrameEvent(int id, const json &params) {
@@ -1954,6 +2164,23 @@ static void applyChannelExtractToRGBA(std::vector<uint8_t> &rgba, int channelExt
     }
 }
 
+static void forceOpaqueAlpha(std::vector<uint8_t> &rgba) {
+    const size_t pixelCount = rgba.size() / 4;
+    for (size_t i = 0; i < pixelCount; i++) {
+        rgba[i * 4 + 3] = 255;
+    }
+}
+
+// Default texture previews should stay opaque in the browser. Alpha is only
+// shown explicitly when the user switches to the A-channel view.
+static void normalizeColorPreviewRGBA(std::vector<uint8_t> &rgba, int channelExtract) {
+    if (channelExtract >= 0 && channelExtract <= 3) {
+        applyChannelExtractToRGBA(rgba, channelExtract);
+    } else {
+        forceOpaqueAlpha(rgba);
+    }
+}
+
 // GPU-render a texture to PNG via IReplayOutput at its native dimensions.
 // Used as a fallback when SaveTexture fails (e.g. backbuffer / GPU-only resources).
 // Uses IReplayOutput::DrawThumbnail which manages its own internal headless output windows
@@ -2079,6 +2306,13 @@ static bool renderTextureGPU(ResourceId resId, uint32_t mip,
         const int thumbStride = THUMB_DIM * thumbComp;
         if (pixels.size() < (size_t)thumbStride * THUMB_DIM) return false;
 
+        if (thumbComp == 4) {
+            std::vector<uint8_t> rgba((size_t)THUMB_DIM * THUMB_DIM * 4);
+            memcpy(rgba.data(), pixels.data(), rgba.size());
+            forceOpaqueAlpha(rgba);
+            return encodePNGToMemory(rgba, THUMB_DIM, THUMB_DIM, pngOut);
+        }
+
         if (!stbi_write_png_to_func(stbiWriteToVector, &pngOut,
                                     THUMB_DIM, THUMB_DIM, thumbComp,
                                     pixels.data(), thumbStride)) {
@@ -2097,8 +2331,14 @@ static bool renderTextureGPU(ResourceId resId, uint32_t mip,
 
     if (rgbaReadback) {
         memcpy(rgba.data(), src, pixelCount * 4);
-        if (channelExtract >= 0) {
-            applyChannelExtractToRGBA(rgba, channelExtract);
+        if (isDepthFmt) {
+            if (channelExtract >= 0) {
+                applyChannelExtractToRGBA(rgba, channelExtract);
+            } else {
+                applyChannelExtractToRGBA(rgba, 0);
+            }
+        } else {
+            normalizeColorPreviewRGBA(rgba, channelExtract);
         }
     } else {
         for (size_t i = 0; i < pixelCount; i++) {
@@ -2214,9 +2454,7 @@ static json handleGetTexturePreview(int id, const json &params) {
                 if (decompressASTCNative(rawData.data(), rawData.size(),
                                           width, height, blockW, blockH,
                                           isSRGB, rgba)) {
-                    if (channelExtract >= 0) {
-                        applyChannelExtractToRGBA(rgba, channelExtract);
-                    }
+                    normalizeColorPreviewRGBA(rgba, channelExtract);
                     if (encodePNGToMemory(rgba, width, height, pngData)) {
                         usedASTCFallback = true;
                         fprintf(stderr, "[bridge] ASTC decoded: %ux%u block=%dx%d srgb=%d\n",
@@ -2277,11 +2515,10 @@ static json handleGetTexturePreview(int id, const json &params) {
             save.slice.sliceIndex = 0;
             save.comp.blackPoint = 0.0f;
             save.comp.whitePoint = 1.0f;
-            // Formats without an alpha channel (compCount < 4) have no alpha data;
-            // AlphaMapping::Preserve would output alpha=0 (fully transparent) for
-            // those formats. Use Discard to force alpha=1.0 (fully opaque) so that
-            // R8, RG16, RGB24 and similar textures are visible in the PNG viewer.
-            save.alpha = (compCount >= 4) ? AlphaMapping::Preserve : AlphaMapping::Discard;
+            // Preview images should ignore source alpha by default so the color
+            // data remains visible. The A-channel view still works through
+            // channelExtract, which remaps alpha into RGB.
+            save.alpha = AlphaMapping::Discard;
             save.channelExtract = channelExtract;
 
             rdcstr outPath(tmpPath.c_str());
@@ -2566,10 +2803,14 @@ static json handleGetCurrentDrawPreview(int id, const json &params) {
     const uint8_t *src = pixels.data();
     if (rgbaReadback) {
         memcpy(rgba.data(), src, pixelCount * 4);
-        if (channelExtract >= 0) {
-            applyChannelExtractToRGBA(rgba, channelExtract);
-        } else if (isDepthFormat) {
-            applyChannelExtractToRGBA(rgba, 0);
+        if (isDepthFormat) {
+            if (channelExtract >= 0) {
+                applyChannelExtractToRGBA(rgba, channelExtract);
+            } else {
+                applyChannelExtractToRGBA(rgba, 0);
+            }
+        } else {
+            normalizeColorPreviewRGBA(rgba, channelExtract);
         }
     } else {
         for (size_t i = 0; i < pixelCount; i++) {
@@ -4484,16 +4725,6 @@ static json handleGetMeshData(int id, const json &params) {
 }
 
 static json handleShutdown(int id) {
-    clearLiveTargetSession();
-    if (g_thumbOut) { g_thumbOut->Shutdown(); g_thumbOut = nullptr; }
-    g_overlayOut = nullptr; g_overlayW = 0; g_overlayH = 0;
-    if (g_replay) { g_replay->Shutdown(); g_replay = nullptr; }
-    if (g_capFile) { g_capFile->Shutdown(); g_capFile = nullptr; }
-    if (g_replayInit && g_dll.isLoaded()) {
-        g_dll.ShutdownReplay();
-        g_replayInit = false;
-    }
-    g_dll.unload();
     return makeResult(id, {{"shutdown", true}});
 }
 
@@ -4553,7 +4784,14 @@ static json renderOneThumbnail(ResourceId resId, uint32_t mip,
     }
 
     std::vector<uint8_t> pngData;
-    if (!stbi_write_png_to_func(stbiWriteToVector, &pngData,
+    if (comp == 4) {
+        std::vector<uint8_t> rgba((size_t)THUMB_DIM * THUMB_DIM * 4);
+        memcpy(rgba.data(), pixels.data(), rgba.size());
+        forceOpaqueAlpha(rgba);
+        if (!encodePNGToMemory(rgba, THUMB_DIM, THUMB_DIM, pngData)) {
+            r["error"] = "png encode failed"; return r;
+        }
+    } else if (!stbi_write_png_to_func(stbiWriteToVector, &pngData,
                                 THUMB_DIM, THUMB_DIM, comp,
                                 pixels.data(), THUMB_DIM * comp)) {
         r["error"] = "png encode failed"; return r;
@@ -4603,6 +4841,9 @@ static json dispatch(const json &req) {
         if (method == "getVersion")         return handleGetVersion(id);
         if (method == "openCapture")        return handleOpenCapture(id, params);
         if (method == "closeCapture")       return handleCloseCapture(id);
+        if (method == "setReplayHost")     return handleSetReplayHost(id, params);
+        if (method == "getReplayHost")     return handleGetReplayHost(id);
+        if (method == "disconnectReplayHost") return handleDisconnectReplayHost(id);
         if (method == "tryReplay")          return handleTryReplay(id);
         if (method == "setFrameEvent")      return handleSetFrameEvent(id, params);
         if (method == "getRootActions")     return handleGetRootActions(id);
@@ -4667,13 +4908,7 @@ int main(int argc, char *argv[]) {
             break;
     }
 
-    // Cleanup
-    if (g_replay) { g_replay->Shutdown(); g_replay = nullptr; }
-    if (g_capFile) { g_capFile->Shutdown(); g_capFile = nullptr; }
-    if (g_replayInit && g_dll.isLoaded()) {
-        g_dll.ShutdownReplay();
-    }
-    g_dll.unload();
+    teardownBridge();
 
     return 0;
 }

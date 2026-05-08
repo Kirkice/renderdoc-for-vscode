@@ -72,6 +72,8 @@ export const OpenCaptureResponse = z.object({
     replay: z.boolean(),
     replayError: z.string().optional(),
     replayMessage: z.string().optional(),
+    replayRemote: z.boolean().optional(),
+    replayHost: z.string().optional(),
     suggestRemote: z.boolean().optional(),
     canTryReplay: z.boolean().optional(),
 });
@@ -80,6 +82,16 @@ export const TryReplayResponse = z.object({
     replay: z.boolean(),
     message: z.string().optional(),
     replayError: z.string().optional(),
+    replayRemote: z.boolean().optional(),
+    replayHost: z.string().optional(),
+});
+
+export const ReplayHostInfoResponse = z.object({
+    connected: z.boolean(),
+    url: z.string().optional(),
+    protocol: z.string().optional(),
+    localProxies: z.array(z.string()).optional(),
+    remoteSupportedReplays: z.array(z.string()).optional(),
 });
 
 export const CloseCaptureResponse = z.object({
@@ -280,6 +292,7 @@ export const GetPipelineStateResponse = z
 export type TInitResponse                = z.infer<typeof InitResponse>;
 export type TGetVersionResponse          = z.infer<typeof GetVersionResponse>;
 export type TOpenCaptureResponse         = z.infer<typeof OpenCaptureResponse>;
+export type TReplayHostInfoResponse      = z.infer<typeof ReplayHostInfoResponse>;
 export type TTryReplayResponse           = z.infer<typeof TryReplayResponse>;
 export type TCloseCaptureResponse        = z.infer<typeof CloseCaptureResponse>;
 export type TSetFrameEventResponse       = z.infer<typeof SetFrameEventResponse>;

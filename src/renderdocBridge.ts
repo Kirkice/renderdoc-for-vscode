@@ -13,6 +13,7 @@ import {
     LiveTargetInfo,
     LaunchCaptureOptions,
     LaunchCaptureResult,
+    ReplayHostInfo,
     ResourceInfo,
     ResourceDetail,
     ThumbnailData,
@@ -37,6 +38,7 @@ import {
     GetPipelineStateResponse,
     GetTexturePreviewResponse,
     OpenCaptureResponse,
+    ReplayHostInfoResponse,
     TryReplayResponse,
     GetTimingsResponse,
     validateResponse,
@@ -54,6 +56,7 @@ import {
     type TGetPipelineStateResponse,
     type TGetTexturePreviewResponse,
     type TOpenCaptureResponse,
+    type TReplayHostInfoResponse,
     type TTryReplayResponse,
     type TGetTimingsResponse,
 } from './ipc/schemas';
@@ -1057,21 +1060,51 @@ export class RenderDocBridge {
     }
 
     /** Open a capture in the native replay controller */
-    async nativeOpenCapture(filePath: string): Promise<any> {
+    async nativeOpenCapture(filePath: string): Promise<TOpenCaptureResponse> {
         await this.ensureNativeBridgeReady();
         this.shaderDisplayNameCache.clear();
-        return this.nativeCall('openCapture', { path: filePath });
+        return this.nativeCallT('openCapture', OpenCaptureResponse, { path: filePath });
+    }
+
+    async nativeSetReplayHost(url: string): Promise<ReplayHostInfo> {
+        await this.ensureNativeBridgeReady();
+        const result: TReplayHostInfoResponse = await this.nativeCallT(
+            'setReplayHost',
+            ReplayHostInfoResponse,
+            { url },
+        );
+        return result;
+    }
+
+    async nativeGetReplayHost(): Promise<ReplayHostInfo> {
+        await this.ensureNativeBridgeReady();
+        const result: TReplayHostInfoResponse = await this.nativeCallT(
+            'getReplayHost',
+            ReplayHostInfoResponse,
+            {},
+        );
+        return result;
+    }
+
+    async nativeDisconnectReplayHost(): Promise<ReplayHostInfo> {
+        await this.ensureNativeBridgeReady();
+        const result: TReplayHostInfoResponse = await this.nativeCallT(
+            'disconnectReplayHost',
+            ReplayHostInfoResponse,
+            {},
+        );
+        return result;
     }
 
     /** Explicitly try local replay for SuggestRemote captures (user-initiated) */
-    async nativeTryReplay(): Promise<any> {
+    async nativeTryReplay(): Promise<TTryReplayResponse> {
         await this.ensureNativeBridgeReady();
         // Initialising a replay driver can be very expensive for large
         // captures (Unity GLES, big D3D12 frames): compiling shaders,
         // creating a GL/D3D context, uploading resources, etc. RenderDoc's
         // own GUI doesn't time-box this operation, so we disable the
         // per-call timeout here (0 = no timeout) to match that behaviour.
-        return this.nativeCall('tryReplay', {}, 0);
+        return this.nativeCallT('tryReplay', TryReplayResponse, {}, 0);
     }
 
     /** Get pipeline state at a specific event via native bridge */

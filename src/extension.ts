@@ -98,6 +98,8 @@ async function recoverReplayForCurrentCapture(reason: string): Promise<boolean> 
         return false;
     }
 
+    await syncReplayHostSelection();
+
     try {
         await bridge.nativeOpenCapture(currentCapturePath);
         bridgeLoadedCapturePath = currentCapturePath;
@@ -177,6 +179,54 @@ function closeExclusiveRenderDocPanels(active: ExclusiveRenderDocPanel) {
 // because some backends (GL/ANGLE) crash when a second capture is opened
 // in the same process after a prior replay was torn down.
 let bridgeLoadedCapturePath: string | undefined;
+
+function getPreferredReplayHostUrl(): string | undefined {
+    const selected = launchTargetState.getSelected();
+    return selected.kind === 'device' ? selected.url : undefined;
+}
+
+async function syncReplayHostSelection(silent = true): Promise<string | undefined> {
+    if (!bridge.isNativeBridgeInstalled()) {
+        return undefined;
+    }
+
+    const desiredUrl = getPreferredReplayHostUrl();
+
+    try {
+        const currentHost = await bridge.nativeGetReplayHost();
+        if (!desiredUrl) {
+            if (currentHost.connected) {
+                await bridge.nativeDisconnectReplayHost();
+                console.log('[RenderDoc] Cleared remote replay host selection.');
+            }
+            return undefined;
+        }
+
+        if (!currentHost.connected || currentHost.url !== desiredUrl) {
+            const connected = await bridge.nativeSetReplayHost(desiredUrl);
+            console.log('[RenderDoc] Remote replay host ready:', JSON.stringify(connected));
+            if (!connected.connected) {
+                if (!silent) {
+                    vscode.window.showWarningMessage(
+                        `RenderDoc: the selected device did not accept a remote replay connection. Falling back to local replay.`
+                    );
+                }
+                return undefined;
+            }
+        }
+
+        return desiredUrl;
+    } catch (error: any) {
+        console.warn('[RenderDoc] Failed to sync remote replay host:', error?.message ?? String(error));
+        if (!silent) {
+            vscode.window.showWarningMessage(
+                `RenderDoc: failed to connect the selected remote replay host. Falling back to local replay. ` +
+                `(${error?.message ?? String(error)})`
+            );
+        }
+        return undefined;
+    }
+}
 
 const LAST_LAUNCH_CAPTURE_STATE_KEY = 'renderdoc.lastLaunchCaptureState';
 const LAST_ATTACH_CAPTURE_STATE_KEY = 'renderdoc.lastAttachCaptureState';
@@ -1582,6 +1632,8 @@ async function loadCapture(context: vscode.ExtensionContext, filePath: string, s
         console.log('[RenderDoc] hasNativeBridge after tryStart:', bridge.hasNativeBridge());
     }
 
+    await syncReplayHostSelection(!silent);
+
     // Open in native bridge if available
     let nativeResult: any;
     if (bridge.hasNativeBridge()) {
@@ -1626,7 +1678,11 @@ async function loadCapture(context: vscode.ExtensionContext, filePath: string, s
         async (progress, token) => {
             // ───── Phase 1: replay driver init (0–70%) ─────
             if (nativeResult && nativeResult.canTryReplay && !nativeResult.replay) {
-                progress.report({ message: 'Initialising local replay...', increment: 0 });
+                const replayMode = nativeResult.replayRemote ? 'remote replay' : 'local replay';
+                const replayTarget = nativeResult.replayRemote && nativeResult.replayHost
+                    ? ` on ${nativeResult.replayHost}`
+                    : '';
+                progress.report({ message: `Initialising ${replayMode}${replayTarget}...`, increment: 0 });
                 let lastPct = 0;
                 let cancelled = false;
                 const unsubscribe = bridge.onNativeNotification('tryReplayProgress', (params) => {
@@ -1635,7 +1691,7 @@ async function loadCapture(context: vscode.ExtensionContext, filePath: string, s
                     const delta = pct - lastPct;
                     if (delta > 0) {
                         lastPct = pct;
-                        progress.report({ message: `Initialising local replay... ${Math.round(p * 100)}%`, increment: delta });
+                        progress.report({ message: `Initialising ${replayMode}${replayTarget}... ${Math.round(p * 100)}%`, increment: delta });
                     }
                 });
                 // Cancel handler: renderdoc.dll's OpenCapture can't be aborted
@@ -1653,14 +1709,17 @@ async function loadCapture(context: vscode.ExtensionContext, filePath: string, s
                         captureInfoProvider.setReplayStatus('unavailable');
                     } else if (tryResult && tryResult.replay) {
                         captureInfoProvider.setReplayStatus('active');
-                        if (!silent && nativeResult.suggestRemote) {
+                        if (!silent && tryResult.replayRemote && tryResult.replayHost) {
+                            vscode.window.showInformationMessage(`RenderDoc: remote replay started on ${tryResult.replayHost}.`);
+                        } else if (!silent && nativeResult.suggestRemote) {
                             vscode.window.showInformationMessage('RenderDoc: local replay started (cross-OS capture).');
                         }
                     } else {
                         captureInfoProvider.setReplayStatus('failed');
                         if (!silent) {
                             const msg = tryResult?.replayError || nativeResult.replayMessage || 'Unknown error';
-                            vscode.window.showWarningMessage(`RenderDoc: local replay failed — ${msg}`);
+                            const label = tryResult?.replayRemote || nativeResult.replayRemote ? 'remote replay' : 'local replay';
+                            vscode.window.showWarningMessage(`RenderDoc: ${label} failed — ${msg}`);
                         }
                     }
                 } catch (err: any) {
@@ -1673,7 +1732,7 @@ async function loadCapture(context: vscode.ExtensionContext, filePath: string, s
                         bridge.restartNativeBridge();
                         if (!silent) {
                             vscode.window.showWarningMessage(
-                                `RenderDoc: local replay crashed — ${err?.message || err}. ` +
+                                `RenderDoc: replay initialisation failed — ${err?.message || err}. ` +
                                 `Basic capture info (draw calls, resources, thumbnail) is still available.`
                             );
                         }
@@ -1689,6 +1748,7 @@ async function loadCapture(context: vscode.ExtensionContext, filePath: string, s
                 // phase which would all fail with "No replay active".
                 if (cancelled) {
                     if (bridge.hasNativeBridge()) {
+                        await syncReplayHostSelection();
                         try { await bridge.nativeOpenCapture(filePath); } catch { /* ignore */ }
                     }
                     if (!silent) {
@@ -2129,6 +2189,7 @@ async function tryLocalReplay() {
             );
             return;
         }
+        await syncReplayHostSelection(false);
         try { await bridge.nativeOpenCapture(currentCapturePath); }
         catch (err: any) {
             vscode.window.showWarningMessage(`Native bridge restarted but failed to open capture: ${err.message}`);
@@ -2137,17 +2198,22 @@ async function tryLocalReplay() {
         bridgeLoadedCapturePath = currentCapturePath;
     }
 
-    const confirm = await vscode.window.showWarningMessage(
-        'Attempting local replay may crash if the capture is from a different platform. Continue?',
-        { modal: true },
-        'Try Replay'
-    );
-    if (confirm !== 'Try Replay') { return; }
+    const replayHostUrl = await syncReplayHostSelection(false);
+    if (!replayHostUrl) {
+        const confirm = await vscode.window.showWarningMessage(
+            'Attempting local replay may crash if the capture is from a different platform. Continue?',
+            { modal: true },
+            'Try Replay'
+        );
+        if (confirm !== 'Try Replay') { return; }
+    }
 
     await vscode.window.withProgress(
         {
             location: vscode.ProgressLocation.Notification,
-            title: 'RenderDoc — Initialising local replay...',
+            title: replayHostUrl
+                ? `RenderDoc — Initialising remote replay on ${replayHostUrl}...`
+                : 'RenderDoc — Initialising local replay...',
             cancellable: true,
         },
         async (progress, token) => {
@@ -2175,10 +2241,15 @@ async function tryLocalReplay() {
                 } else if (result && result.replay) {
                     captureInfoProvider.setReplayStatus('active');
                     InspectorPanel.currentPanel?.invalidateReplayCaches();
-                    vscode.window.showInformationMessage('Local replay active! Shader/pipeline/texture features are now available.');
+                    if (result.replayRemote && result.replayHost) {
+                        vscode.window.showInformationMessage(`Remote replay active on ${result.replayHost}. Shader/pipeline/texture features are now available.`);
+                    } else {
+                        vscode.window.showInformationMessage('Local replay active! Shader/pipeline/texture features are now available.');
+                    }
                 } else {
                     captureInfoProvider.setReplayStatus('failed');
-                    vscode.window.showWarningMessage(`Replay failed: ${result?.replayError || 'Unknown error'}`);
+                    const label = result?.replayRemote ? 'Remote replay' : 'Local replay';
+                    vscode.window.showWarningMessage(`${label} failed: ${result?.replayError || 'Unknown error'}`);
                 }
             } catch (err: any) {
                 if (cancelled) {
@@ -2189,11 +2260,13 @@ async function tryLocalReplay() {
                 console.log('[RenderDoc] tryLocalReplay crashed, restarting bridge...');
                 bridge.tryStartNativeBridge();
                 if (bridge.hasNativeBridge()) {
+                    await syncReplayHostSelection();
                     try { await bridge.nativeOpenCapture(currentCapturePath!); } catch { /* ignore */ }
                 }
                 vscode.window.showWarningMessage(
-                    'Local replay crashed — this capture cannot be replayed on this GPU. ' +
-                    'Inspection features are disabled for this capture.'
+                    replayHostUrl
+                        ? 'Remote replay failed — inspection features are disabled for this capture until replay is restored.'
+                        : 'Local replay crashed — this capture cannot be replayed on this GPU. Inspection features are disabled for this capture.'
                 );
             } finally {
                 unsubscribe();

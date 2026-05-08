@@ -2515,7 +2515,7 @@
                 updateCurrentRTPreviewImageScale();
             }
         } else {
-            updateCurrentRTPreviewZoomLabel();
+            updateCurrentRTPreviewImageScale();
         }
 
         if (!cached && !errMsg && !rtPreviewPending.has(key)) {
