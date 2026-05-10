@@ -80,6 +80,10 @@ export interface MsgRequestMesh {
     instance?: number;
 }
 
+export interface MsgUseRecommendedReplayHost {
+    type: 'useRecommendedReplayHost';
+}
+
 export type WebviewToExtensionMessage =
     | MsgReady
     | MsgSelectEvent
@@ -91,7 +95,8 @@ export type WebviewToExtensionMessage =
     | MsgExportTexture
     | MsgShowResourceDetails
     | MsgShowShaderSource
-    | MsgRequestMesh;
+    | MsgRequestMesh
+    | MsgUseRecommendedReplayHost;
 
 // ───────────────────────────── Extension → Webview ─────────────────────────────
 
@@ -176,6 +181,15 @@ export interface MsgTimingsLoaded {
     error?: string;
 }
 
+export interface MsgReplayStatus {
+    type: 'replayStatus';
+    status: 'none' | 'active' | 'failed' | 'unavailable';
+    mode: 'none' | 'local' | 'remote';
+    hostUrl?: string;
+    hint?: string;
+    recommendRemote?: boolean;
+}
+
 export type ExtensionToWebviewMessage =
     | MsgCaptureLoaded
     | MsgEventChanged
@@ -185,4 +199,5 @@ export type ExtensionToWebviewMessage =
     | MsgCurrentDrawPreview
     | MsgMeshLoaded
     | MsgMaliAnalysisResult
-    | MsgTimingsLoaded;
+    | MsgTimingsLoaded
+    | MsgReplayStatus;

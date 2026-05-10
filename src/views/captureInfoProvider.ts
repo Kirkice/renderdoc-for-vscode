@@ -1,12 +1,22 @@
 import * as vscode from 'vscode';
 import { CaptureInfo } from '../types';
 
+type ReplayMode = 'none' | 'local' | 'remote';
+
+interface ReplayDetails {
+    mode: ReplayMode;
+    hostUrl?: string;
+    hint?: string;
+    recommendRemote?: boolean;
+}
+
 export class CaptureInfoProvider implements vscode.TreeDataProvider<CaptureInfoItem> {
     private _onDidChangeTreeData = new vscode.EventEmitter<CaptureInfoItem | undefined>();
     readonly onDidChangeTreeData = this._onDidChangeTreeData.event;
 
     private captureInfo: CaptureInfo | undefined;
     private replayStatus: 'none' | 'active' | 'failed' | 'unavailable' = 'none';
+    private replayDetails: ReplayDetails = { mode: 'none' };
 
     getCaptureInfo(): CaptureInfo | undefined {
         return this.captureInfo;
@@ -16,6 +26,7 @@ export class CaptureInfoProvider implements vscode.TreeDataProvider<CaptureInfoI
         this.captureInfo = info;
         if (!info) {
             this.replayStatus = 'none';
+            this.replayDetails = { mode: 'none' };
         }
         this._onDidChangeTreeData.fire(undefined);
     }
@@ -28,6 +39,14 @@ export class CaptureInfoProvider implements vscode.TreeDataProvider<CaptureInfoI
 
     getReplayStatus(): 'none' | 'active' | 'failed' | 'unavailable' {
         return this.replayStatus;
+    }
+
+    setReplayDetails(details: Partial<ReplayDetails>) {
+        this.replayDetails = {
+            ...this.replayDetails,
+            ...details,
+        };
+        this._onDidChangeTreeData.fire(undefined);
     }
 
     getTreeItem(element: CaptureInfoItem): vscode.TreeItem {
@@ -52,11 +71,47 @@ export class CaptureInfoProvider implements vscode.TreeDataProvider<CaptureInfoI
 
             // Replay status indicator
             if (this.replayStatus === 'active') {
-                items.push(new CaptureInfoItem('Replay', 'Active — all features available', vscode.TreeItemCollapsibleState.None, 'debug-start'));
+                items.push(new CaptureInfoItem(
+                    'Replay',
+                    this.replayDetails.mode === 'remote'
+                        ? 'Active — replaying on remote host'
+                        : 'Active — replaying locally',
+                    vscode.TreeItemCollapsibleState.None,
+                    'debug-start'));
             } else if (this.replayStatus === 'failed') {
-                items.push(new CaptureInfoItem('Replay', 'Failed — use View All Shaders for shader access', vscode.TreeItemCollapsibleState.None, 'error'));
+                items.push(new CaptureInfoItem('Replay', 'Failed — inspection features unavailable', vscode.TreeItemCollapsibleState.None, 'error'));
             } else if (this.replayStatus === 'unavailable') {
-                items.push(new CaptureInfoItem('Replay', 'Cross-platform capture — click Try Local Replay', vscode.TreeItemCollapsibleState.None, 'warning'));
+                items.push(new CaptureInfoItem('Replay', 'Replay not active yet', vscode.TreeItemCollapsibleState.None, 'warning'));
+            }
+
+            if (this.replayDetails.mode !== 'none') {
+                items.push(new CaptureInfoItem(
+                    'Replay Mode',
+                    this.replayDetails.mode === 'remote' ? 'Remote' : 'Local',
+                    vscode.TreeItemCollapsibleState.None,
+                    this.replayDetails.mode === 'remote' ? 'vm-connect' : 'device-desktop'
+                ));
+            }
+
+            if (this.replayDetails.hostUrl) {
+                items.push(new CaptureInfoItem('Replay Host', this.replayDetails.hostUrl, vscode.TreeItemCollapsibleState.None, 'remote'));
+            }
+
+            if (this.replayDetails.hint) {
+                items.push(new CaptureInfoItem('Replay Hint', this.replayDetails.hint, vscode.TreeItemCollapsibleState.None, 'info'));
+            }
+
+            if (this.replayDetails.recommendRemote) {
+                items.push(new CaptureInfoItem(
+                    'Action',
+                    'Use Recommended Replay Host',
+                    vscode.TreeItemCollapsibleState.None,
+                    'vm-connect',
+                    {
+                        command: 'renderdoc.useRecommendedReplayHost',
+                        title: 'Use Recommended Replay Host',
+                    }
+                ));
             }
 
             if (this.captureInfo.sections && this.captureInfo.sections.length > 0) {
@@ -91,12 +146,14 @@ class CaptureInfoItem extends vscode.TreeItem {
         public readonly label: string,
         private value: string,
         public readonly collapsibleState: vscode.TreeItemCollapsibleState,
-        iconId: string
+        iconId: string,
+        command?: vscode.Command,
     ) {
         super(label, collapsibleState);
         this.description = value;
         this.iconPath = new vscode.ThemeIcon(iconId);
         this.tooltip = `${label}: ${value}`;
+        this.command = command;
     }
 }
 

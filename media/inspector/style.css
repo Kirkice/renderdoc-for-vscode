@@ -32,6 +32,50 @@
             font-size: 0.75em; padding: 2px 8px; border-radius: 8px;
         }
         .toolbar-actions { display: flex; gap: 4px; align-items: center; }
+        .replay-banner {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 12px;
+            padding: 8px 12px;
+            border-bottom: 1px solid var(--vscode-panel-border);
+            background: color-mix(in srgb, var(--vscode-sideBar-background) 82%, transparent);
+            flex-shrink: 0;
+        }
+        .replay-banner[data-tone="good"] {
+            background: color-mix(in srgb, var(--vscode-testing-iconPassed, #2ea043) 12%, var(--vscode-sideBar-background));
+        }
+        .replay-banner[data-tone="warn"] {
+            background: color-mix(in srgb, var(--vscode-testing-iconQueued, #d29922) 14%, var(--vscode-sideBar-background));
+        }
+        .replay-banner[data-tone="danger"] {
+            background: color-mix(in srgb, var(--vscode-testing-iconFailed, #f85149) 12%, var(--vscode-sideBar-background));
+        }
+        .replay-banner-main {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            min-width: 0;
+        }
+        .replay-banner-badge {
+            display: inline-flex;
+            align-items: center;
+            padding: 2px 8px;
+            border-radius: 999px;
+            font-size: 0.75em;
+            font-weight: 600;
+            background: var(--vscode-badge-background);
+            color: var(--vscode-badge-foreground);
+            white-space: nowrap;
+        }
+        .replay-banner-text {
+            color: var(--vscode-foreground);
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+        .replay-banner-actions { display: flex; align-items: center; gap: 8px; }
+        .replay-banner-btn { white-space: nowrap; }
         .icon-btn {
             background: transparent;
             color: var(--vscode-foreground);

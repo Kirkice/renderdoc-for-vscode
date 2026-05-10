@@ -65,6 +65,16 @@ export function buildInspectorHtml(
             </div>
         </header>
 
+        <div id="replay-banner" class="replay-banner" hidden>
+            <div class="replay-banner-main">
+                <span id="replay-banner-badge" class="replay-banner-badge">Replay</span>
+                <span id="replay-banner-text" class="replay-banner-text"></span>
+            </div>
+            <div class="replay-banner-actions">
+                <button id="replay-banner-action" class="icon-btn replay-banner-btn" hidden>Use Recommended Replay Host</button>
+            </div>
+        </div>
+
         <nav class="tabs" role="tablist">
             <button class="tab active" data-tab="textures" role="tab">Texture Viewer</button>
             <button class="tab" data-tab="pipeline" role="tab">Pipeline State</button>

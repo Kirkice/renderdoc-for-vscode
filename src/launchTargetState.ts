@@ -1,6 +1,7 @@
 import * as vscode from 'vscode';
 import { RenderDocBridge } from './renderdocBridge';
-import { CaptureLaunchTarget, LiveTargetInfo } from './types';
+import { CaptureLaunchTarget, LiveCaptureEntry, LiveTargetInfo, ReplayHostInfo } from './types';
+import { withTimeout } from './util/async';
 
 const STATE_KEY = 'renderdoc.selectedLaunchTarget';
 
@@ -15,6 +16,14 @@ export class LaunchTargetState {
     private devices: CaptureLaunchTarget[] = [];
     private selected: SelectedLaunchTarget;
     private liveTarget: LiveTargetInfo | undefined;
+    private replayHost: ReplayHostInfo | undefined;
+    private recentCaptures: LiveCaptureEntry[] = [];
+    private lastStatusNote: string | undefined;
+    private bridgeVersion: string | undefined;
+    private sessionHint: string | undefined;
+    private refreshing = false;
+    private lastRefreshError: string | undefined;
+    private refreshGeneration = 0;
 
     constructor(private readonly context: vscode.ExtensionContext) {
         const persisted = context.workspaceState.get<string>(STATE_KEY);
@@ -40,12 +49,58 @@ export class LaunchTargetState {
         return this.liveTarget;
     }
 
+    getReplayHost(): ReplayHostInfo | undefined {
+        return this.replayHost;
+    }
+
+    getRecentCaptures(): LiveCaptureEntry[] {
+        return this.recentCaptures;
+    }
+
+    getRecentCapture(id: string): LiveCaptureEntry | undefined {
+        return this.recentCaptures.find((capture) => capture.id === id);
+    }
+
+    getLastStatusNote(): string | undefined {
+        return this.lastStatusNote;
+    }
+
+    getBridgeVersion(): string | undefined {
+        return this.bridgeVersion;
+    }
+
+    getSessionHint(): string | undefined {
+        return this.sessionHint;
+    }
+
+    isRefreshing(): boolean {
+        return this.refreshing;
+    }
+
+    getLastRefreshError(): string | undefined {
+        return this.lastRefreshError;
+    }
+
     async refresh(bridge: RenderDocBridge): Promise<void> {
+        const generation = ++this.refreshGeneration;
+        this.refreshing = true;
+        this.lastRefreshError = undefined;
+        this._onDidChange.fire();
+
         let nextDevices: CaptureLaunchTarget[] = [];
         try {
-            nextDevices = await bridge.nativeListCaptureTargets();
+            nextDevices = await withTimeout(
+                bridge.nativeListCaptureTargets(),
+                8000,
+                'Timed out while enumerating capture targets.',
+            );
         } catch (err: any) {
             console.warn('[RenderDoc] LaunchTargetState.refresh failed:', err?.message);
+            this.lastRefreshError = err?.message || String(err);
+        }
+
+        if (generation !== this.refreshGeneration) {
+            return;
         }
 
         this.devices = nextDevices;
@@ -53,6 +108,7 @@ export class LaunchTargetState {
             this.selected = { kind: 'local' };
             await this.context.workspaceState.update(STATE_KEY, undefined);
         }
+        this.refreshing = false;
         this._onDidChange.fire();
     }
 
@@ -66,8 +122,48 @@ export class LaunchTargetState {
         this._onDidChange.fire();
     }
 
+    async refreshReplayHost(bridge: RenderDocBridge): Promise<void> {
+        try {
+            this.replayHost = await bridge.nativeGetReplayHost();
+        } catch (err: any) {
+            console.warn('[RenderDoc] LaunchTargetState.refreshReplayHost failed:', err?.message);
+            this.replayHost = undefined;
+        }
+        this._onDidChange.fire();
+    }
+
     setLiveTarget(target: LiveTargetInfo | undefined): void {
         this.liveTarget = target;
+        this._onDidChange.fire();
+    }
+
+    setLastStatusNote(message: string | undefined): void {
+        this.lastStatusNote = message;
+        this._onDidChange.fire();
+    }
+
+    setBridgeVersion(version: string | undefined): void {
+        this.bridgeVersion = version;
+        this._onDidChange.fire();
+    }
+
+    setSessionHint(message: string | undefined): void {
+        this.sessionHint = message;
+        this._onDidChange.fire();
+    }
+
+    addRecentCapture(capture: LiveCaptureEntry): void {
+        this.recentCaptures = [capture, ...this.recentCaptures.filter((entry) => entry.id !== capture.id)].slice(0, 12);
+        this._onDidChange.fire();
+    }
+
+    updateRecentCapture(id: string, updates: Partial<LiveCaptureEntry>): void {
+        this.recentCaptures = this.recentCaptures.map((entry) => entry.id === id ? { ...entry, ...updates } : entry);
+        this._onDidChange.fire();
+    }
+
+    removeRecentCapture(id: string): void {
+        this.recentCaptures = this.recentCaptures.filter((entry) => entry.id !== id);
         this._onDidChange.fire();
     }
 

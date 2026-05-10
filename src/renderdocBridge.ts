@@ -25,6 +25,7 @@ import { withTimeout } from './util/async';
 import {
     InitResponse,
     GetRootActionsResponse,
+    GetVersionResponse,
     GetResourcesResponse,
     GetTexturesResponse,
     GetCaptureStatisticsResponse,
@@ -43,6 +44,7 @@ import {
     GetTimingsResponse,
     validateResponse,
     type TGetRootActionsResponse,
+    type TGetVersionResponse,
     type TGetResourcesResponse,
     type TGetTexturesResponse,
     type TGetCaptureStatisticsResponse,
@@ -359,6 +361,7 @@ export class RenderDocBridge {
     /** Global-storage directory where we cache a downloaded renderdoc_bridge.exe. */
     private downloadedBridgeDir: string | undefined;
     private shaderDisplayNameCache = new Map<string, string>();
+    private nativeFeatureSupport = new Map<string, boolean>();
 
     constructor() {}
 
@@ -820,6 +823,7 @@ export class RenderDocBridge {
                 cwd: this.renderdocPath || undefined,
             });
             this.nativeProcess = child;
+            this.nativeFeatureSupport.clear();
             console.log('[RenderDoc] Native bridge spawned, pid:', child.pid);
 
             child.stdout?.on('data', (data: Buffer) => {
@@ -844,6 +848,7 @@ export class RenderDocBridge {
                 // requests queued against the new bridge.
                 if (this.nativeProcess !== child) { return; }
                 this.nativeProcess = undefined;
+                this.nativeFeatureSupport.clear();
                 // Reject all pending requests
                 for (const [, pending] of this.nativePendingRequests) {
                     pending.reject(new BridgeError('exited', 'Native bridge process exited', { method: pending.method }));
@@ -872,6 +877,7 @@ export class RenderDocBridge {
             try { this.nativeProcess.kill(); } catch { /* ignore */ }
             this.nativeProcess = undefined;
         }
+        this.nativeFeatureSupport.clear();
         for (const [, pending] of this.nativePendingRequests) {
             pending.reject(new BridgeError('restarting', 'Native bridge restarting', { method: pending.method }));
         }
@@ -1050,6 +1056,8 @@ export class RenderDocBridge {
 
         if (!this.hasNativeBridge()) {
             this.tryStartNativeBridge();
+        } else if (!(await this.nativePing())) {
+            this.restartNativeBridge();
         }
 
         if (!this.hasNativeBridge()) {
@@ -1119,12 +1127,72 @@ export class RenderDocBridge {
 
     /** Get texture data via native bridge (saves to temp PNG, returns base64) */
     async nativeGetTextureData(textureId: string, mip?: number, eventId?: number, channelExtract?: number): Promise<any> {
-        return this.nativeCall('getTexturePreview', { resourceId: textureId, mip: mip ?? 0, eventId: eventId ?? 0, channelExtract: channelExtract ?? -1 });
+        try {
+            return await this.nativeCall('getTexturePreview', { resourceId: textureId, mip: mip ?? 0, eventId: eventId ?? 0, channelExtract: channelExtract ?? -1 });
+        } catch (error) {
+            this.rethrowBridgeCompatibilityError('getTexturePreview', error);
+        }
     }
 
     /** Get a RenderDoc replay-style current draw preview for the selected event. */
     async nativeGetCurrentDrawPreview(eventId: number, channelExtract: number = -1): Promise<any> {
-        return this.nativeCall('getCurrentDrawPreview', { eventId, channelExtract });
+        await this.ensureNativeFeature('getCurrentDrawPreview', { eventId: 0, channelExtract: -1 });
+        try {
+            return await this.nativeCall('getCurrentDrawPreview', { eventId, channelExtract });
+        } catch (error) {
+            this.rethrowBridgeCompatibilityError('getCurrentDrawPreview', error);
+        }
+    }
+
+    private async ensureNativeFeature(method: string, probeParams: any): Promise<void> {
+        if (this.nativeFeatureSupport.get(method)) {
+            return;
+        }
+        try {
+            await this.nativeCall(method, probeParams, NATIVE_PING_TIMEOUT_MS);
+            this.nativeFeatureSupport.set(method, true);
+            return;
+        } catch (error: any) {
+            const message = String(error?.message ?? error ?? '');
+            if (message.includes(`Unknown method: ${method}`)) {
+                this.nativeFeatureSupport.set(method, false);
+                throw new Error(
+                    `The native bridge executable is outdated and does not support '${method}'. ` +
+                    `Rebuild or replace renderdoc_bridge.exe, then reload VS Code.`
+                );
+            }
+            this.nativeFeatureSupport.set(method, true);
+        }
+    }
+
+    private rethrowBridgeCompatibilityError(method: string, error: unknown): never {
+        const message = String((error as any)?.message ?? error ?? '');
+        let compatibilityMessage: string | undefined;
+
+        if (message.includes(`Unknown method: ${method}`)) {
+            compatibilityMessage =
+                `The native bridge executable is outdated and does not support '${method}'. ` +
+                `Rebuild or replace renderdoc_bridge.exe, then reload VS Code.`;
+        } else if (message.includes('[json.exception.type_error.302]') && message.includes('type must be number, but is string')) {
+            compatibilityMessage =
+                'The native bridge executable is outdated and is incompatible with the current resource-id protocol. ' +
+                'Rebuild or replace renderdoc_bridge.exe, then reload VS Code.';
+        }
+
+        if (!compatibilityMessage) {
+            throw error;
+        }
+
+        if (BridgeError.is(error)) {
+            throw new BridgeError(error.kind, `${compatibilityMessage} (${message})`, {
+                method: error.method,
+                code: error.code,
+                issues: error.issues,
+                cause: error,
+            });
+        }
+
+        throw new Error(`${compatibilityMessage} (${message})`);
     }
 
     /**
@@ -1153,6 +1221,16 @@ export class RenderDocBridge {
             {},
         );
         return result.targets;
+    }
+
+    async nativeGetVersion(): Promise<string> {
+        await this.ensureNativeBridgeReady();
+        const result: TGetVersionResponse = await this.nativeCallT(
+            'getVersion',
+            GetVersionResponse,
+            {},
+        );
+        return result.version;
     }
 
     async nativeListAttachTargets(url = ''): Promise<CaptureAttachTarget[]> {

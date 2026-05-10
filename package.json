@@ -360,6 +360,12 @@
         "icon": "$(debug-start)"
       },
       {
+        "command": "renderdoc.useRecommendedReplayHost",
+        "title": "Use Recommended Replay Host",
+        "category": "RenderDoc",
+        "icon": "$(vm-connect)"
+      },
+      {
         "command": "renderdoc.downloadNativeBridge",
         "title": "Download Native Bridge…",
         "category": "RenderDoc",
@@ -649,6 +655,11 @@
           "type": "string",
           "default": "",
           "description": "Override the path to renderdoc_bridge(.exe). If empty, the extension looks next to itself, in its download cache, or prompts you to download the prebuilt binary on first run."
+        },
+        "renderdoc.alwaysReplayLocally": {
+          "type": "boolean",
+          "default": false,
+          "description": "When a capture suggests remote replay because it was created on another platform, skip the prompt and continue with local replay."
         },
         "renderdoc.maliOfflineCompilerPath": {
           "type": "string",

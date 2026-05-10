@@ -5,6 +5,7 @@ import { withTimeout } from '../util/async';
 import { LruCache } from '../util/lruCache';
 import type {
     ExtensionToWebviewMessage,
+    MsgReplayStatus,
     WebviewToExtensionMessage,
 } from '../ipc/messages';
 import { buildInspectorHtml } from './inspector/html';
@@ -65,6 +66,11 @@ export class InspectorPanel {
     private timingsLoadingForPath: string | undefined;
 
     private latestMaliAnalysis?: { source: string, stage: string, result: string };
+    private replayStatus: MsgReplayStatus = {
+        type: 'replayStatus',
+        status: 'none',
+        mode: 'none',
+    };
 
     private disposables: vscode.Disposable[] = [];
 
@@ -199,6 +205,15 @@ export class InspectorPanel {
                 this.panel.webview.postMessage({ type: 'pipelineLoaded', eventId: eid, data: this.pipelineCache.get(eid) });
             }
         }
+    }
+
+    public setReplayStatus(status: Omit<MsgReplayStatus, 'type'>) {
+        this.replayStatus = { type: 'replayStatus', ...status };
+        this.postReplayStatus();
+    }
+
+    private postReplayStatus() {
+        this.panel.webview.postMessage(this.replayStatus satisfies ExtensionToWebviewMessage);
     }
 
     private postCaptureTimings() {
@@ -770,6 +785,7 @@ export class InspectorPanel {
                     if (this.timingCapturePath && (this.captureTimingsAvailable || this.captureTimingsError)) {
                         this.postCaptureTimings();
                     }
+                    this.postReplayStatus();
                     if (this.currentEventId !== undefined) {
                         // Re-post eventChanged directly (don't re-trigger loads
                         // unnecessarily if setEvent already ran).
@@ -829,6 +845,9 @@ export class InspectorPanel {
                 break;
             case 'showResourceDetails':
                 vscode.commands.executeCommand('renderdoc.showResourceDetails', { resourceId: msg.resourceId, label: msg.label });
+                break;
+            case 'useRecommendedReplayHost':
+                vscode.commands.executeCommand('renderdoc.useRecommendedReplayHost');
                 break;
         }
     }

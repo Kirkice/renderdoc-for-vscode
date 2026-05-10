@@ -4,15 +4,22 @@ import { LaunchTargetState } from '../launchTargetState';
 type LaunchTargetViewMessage =
     | { type: 'ready' }
     | { type: 'selectLocal' }
-    | { type: 'selectDevice'; url: string };
+    | { type: 'selectDevice'; url: string }
+    | { type: 'openCapture'; captureId: string }
+    | { type: 'saveCapture'; captureId: string }
+    | { type: 'deleteCapture'; captureId: string };
 
 export class LaunchTargetViewProvider implements vscode.WebviewViewProvider {
     private view: vscode.WebviewView | undefined;
+    private refreshInFlight: Promise<void> | undefined;
 
     constructor(
         private readonly context: vscode.ExtensionContext,
         private readonly state: LaunchTargetState,
         private readonly onRefresh: () => Promise<void>,
+        private readonly onOpenCapture: (captureId: string) => Promise<void>,
+        private readonly onSaveCapture: (captureId: string) => Promise<void>,
+        private readonly onDeleteCapture: (captureId: string) => Promise<void>,
     ) {
         this.state.onDidChange(() => {
             void this.pushState();
@@ -26,12 +33,18 @@ export class LaunchTargetViewProvider implements vscode.WebviewViewProvider {
         };
         webviewView.webview.html = this.getHtml(webviewView.webview);
         webviewView.webview.onDidReceiveMessage((message: LaunchTargetViewMessage) => this.handleMessage(message));
+        webviewView.onDidDispose(() => {
+            if (this.view === webviewView) {
+                this.view = undefined;
+            }
+        });
         void this.pushState();
     }
 
     private async handleMessage(message: LaunchTargetViewMessage): Promise<void> {
         switch (message.type) {
             case 'ready':
+                await this.refreshState();
                 await this.pushState();
                 break;
             case 'selectLocal':
@@ -40,20 +53,59 @@ export class LaunchTargetViewProvider implements vscode.WebviewViewProvider {
             case 'selectDevice':
                 await this.state.selectDevice(message.url);
                 break;
+            case 'openCapture':
+                await this.onOpenCapture(message.captureId);
+                break;
+            case 'saveCapture':
+                await this.onSaveCapture(message.captureId);
+                break;
+            case 'deleteCapture':
+                await this.onDeleteCapture(message.captureId);
+                break;
         }
     }
 
     private async pushState(): Promise<void> {
-        if (!this.view) {
+        const view = this.view;
+        if (!view) {
             return;
         }
         const selected = this.state.getSelected();
-        await this.view.webview.postMessage({
-            type: 'state',
-            selected,
-            devices: this.state.getDevices(),
-            liveTarget: this.state.getLiveTarget(),
-        });
+        try {
+            await view.webview.postMessage({
+                type: 'state',
+                selected,
+                devices: this.state.getDevices(),
+                liveTarget: this.state.getLiveTarget(),
+                replayHost: this.state.getReplayHost(),
+                recentCaptures: this.state.getRecentCaptures(),
+                statusNote: this.state.getLastStatusNote(),
+                bridgeVersion: this.state.getBridgeVersion(),
+                sessionHint: this.state.getSessionHint(),
+                refreshing: this.state.isRefreshing(),
+                refreshError: this.state.getLastRefreshError(),
+            });
+        } catch (error: any) {
+            if (this.view === view) {
+                this.view = undefined;
+            }
+            console.warn('[RenderDoc] LaunchTargetViewProvider pushState failed:', error?.message ?? String(error));
+        }
+    }
+
+    private async refreshState(): Promise<void> {
+        if (!this.refreshInFlight) {
+            this.refreshInFlight = (async () => {
+                try {
+                    await this.onRefresh();
+                } catch (error: any) {
+                    console.warn('[RenderDoc] LaunchTargetViewProvider refresh failed:', error?.message ?? String(error));
+                } finally {
+                    this.refreshInFlight = undefined;
+                }
+            })();
+        }
+        await this.refreshInFlight;
     }
 
     private getHtml(webview: vscode.Webview): string {
@@ -249,6 +301,61 @@ export class LaunchTargetViewProvider implements vscode.WebviewViewProvider {
             flex-wrap: wrap;
             gap: 6px;
         }
+        .captureList {
+            display: grid;
+            gap: 10px;
+        }
+        .captureItem {
+            border: 1px solid var(--line);
+            border-radius: 14px;
+            padding: 12px;
+            background: rgba(18, 24, 31, 0.72);
+            display: grid;
+            gap: 8px;
+        }
+        .captureRow {
+            display: flex;
+            align-items: flex-start;
+            justify-content: space-between;
+            gap: 10px;
+        }
+        .captureMetaRow {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 6px;
+        }
+        .captureActions {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 8px;
+        }
+        .statusStack {
+            display: grid;
+            gap: 10px;
+        }
+        .statusNote {
+            font-size: 12px;
+            line-height: 1.5;
+            color: #eef4f8;
+            padding: 10px 12px;
+            border-radius: 12px;
+            background: rgba(117, 208, 199, 0.08);
+            border: 1px solid rgba(117, 208, 199, 0.18);
+        }
+        .actionBtn {
+            border: 1px solid rgba(132, 153, 176, 0.22);
+            border-radius: 999px;
+            background: rgba(132, 153, 176, 0.08);
+            color: #eef4f8;
+            font: inherit;
+            font-size: 11px;
+            padding: 5px 10px;
+            cursor: pointer;
+        }
+        .actionBtn:hover {
+            border-color: rgba(117, 208, 199, 0.3);
+            background: rgba(117, 208, 199, 0.12);
+        }
         @keyframes riseIn {
             from {
                 opacity: 0;
@@ -276,18 +383,31 @@ export class LaunchTargetViewProvider implements vscode.WebviewViewProvider {
 
         <div class="sectionLabel">Target Selection</div>
         <div id="liveTarget"></div>
+        <div id="sessionStatus"></div>
+        <div id="recentCaptures"></div>
+        <div id="replayHost"></div>
         <div id="targets" class="targetGrid"></div>
     </div>
     <script nonce="${nonce}">
         const vscode = acquireVsCodeApi();
         const targetsEl = document.getElementById('targets');
         const liveTargetEl = document.getElementById('liveTarget');
+        const sessionStatusEl = document.getElementById('sessionStatus');
+        const recentCapturesEl = document.getElementById('recentCaptures');
+        const replayHostEl = document.getElementById('replayHost');
         const sessionBadgeEl = document.getElementById('sessionBadge');
 
         function render(state) {
             const devices = Array.isArray(state.devices) ? state.devices : [];
             const selected = state.selected || { kind: 'local' };
             const liveTarget = state.liveTarget;
+            const recentCaptures = Array.isArray(state.recentCaptures) ? state.recentCaptures : [];
+            const replayHost = state.replayHost;
+            const statusNote = typeof state.statusNote === 'string' ? state.statusNote : '';
+            const bridgeVersion = typeof state.bridgeVersion === 'string' ? state.bridgeVersion : '';
+            const sessionHint = typeof state.sessionHint === 'string' ? state.sessionHint : '';
+            const refreshing = !!state.refreshing;
+            const refreshError = typeof state.refreshError === 'string' ? state.refreshError : '';
             targetsEl.innerHTML = '';
             if (liveTarget) {
                 const location = liveTarget.local ? 'Local target' : (liveTarget.url || 'Remote target');
@@ -302,13 +422,64 @@ export class LaunchTargetViewProvider implements vscode.WebviewViewProvider {
                 sessionBadgeEl.className = 'badge idle';
             }
 
+            const versionChip = bridgeVersion ? '<span class="chip">RenderDoc ' + bridgeVersion + '</span>' : '';
+            const liveChip = liveTarget && !liveTarget.local ? '<span class="chip good">Remote Session</span>' : (liveTarget ? '<span class="chip good">Local Session</span>' : '<span class="chip">No Session</span>');
+            const noteBlock = statusNote ? '<div class="statusNote">' + statusNote + '</div>' : '<div class="empty">No live capture or replay status messages yet.</div>';
+            const hintBlock = sessionHint ? '<div class="panelMeta">' + sessionHint + '</div>' : '<div class="panelMeta">Session status, version, and replay compatibility guidance will appear here as you connect devices and capture frames.</div>';
+            sessionStatusEl.innerHTML = '<div class="panel"><div class="panelTitle">Session Status</div><div class="statusStack"><div class="liveMetaRow">' + liveChip + versionChip + '</div>' + noteBlock + hintBlock + '</div></div>';
+
+            if (replayHost && replayHost.connected) {
+                const protocolChip = replayHost.protocol ? '<span class="chip good">' + replayHost.protocol + '</span>' : '';
+                replayHostEl.innerHTML = '<div class="panel"><div class="panelTitle">Current Replay Host</div><div class="live"><div class="title">' + (replayHost.url || 'Remote Replay Host') + '</div><div class="panelMeta">Replay queries will open captures on this host when remote replay is selected.</div><div class="liveMetaRow">' + protocolChip + '</div></div></div>';
+            } else {
+                replayHostEl.innerHTML = '<div class="panel"><div class="panelTitle">Current Replay Host</div><div class="empty">No remote replay host is selected. Cross-platform captures will default to local replay unless you pick a device host.</div></div>';
+            }
+
+            if (recentCaptures.length) {
+                recentCapturesEl.innerHTML = '<div class="panel"><div class="panelTitle">Current Session Captures</div><div class="panelMeta">Recent live captures from this session. Open them again, keep a permanent copy, or delete the temporary file.</div><div class="captureList">' + recentCaptures.map((capture) => {
+                    const savedChip = capture.saved ? '<span class="chip good">Saved</span>' : '<span class="chip">Temporary</span>';
+                    const apiChip = capture.api ? '<span class="chip">' + capture.api + '</span>' : '';
+                    const frameChip = capture.frameNumber ? '<span class="chip">Frame ' + capture.frameNumber + '</span>' : '';
+                    const sourceChip = capture.sourceUrl ? '<span class="chip">' + capture.sourceUrl + '</span>' : '<span class="chip">Local</span>';
+                    const saveButton = capture.saved ? '' : '<button class="actionBtn" data-action="saveCapture" data-id="' + capture.id + '">Save As</button>';
+                    return '<div class="captureItem"><div class="captureRow"><div><div class="title">' + capture.displayName + '</div><div class="meta">' + capture.filePath + '</div></div>' + savedChip + '</div><div class="captureMetaRow">' + apiChip + frameChip + sourceChip + '</div><div class="captureActions"><button class="actionBtn" data-action="openCapture" data-id="' + capture.id + '">Open</button>' + saveButton + '<button class="actionBtn" data-action="deleteCapture" data-id="' + capture.id + '">Delete</button></div></div>';
+                }).join('') + '</div></div>';
+            } else {
+                recentCapturesEl.innerHTML = '<div class="panel"><div class="panelTitle">Current Session Captures</div><div class="empty">No live captures have been produced yet. Once you capture a frame from a local or remote target, it will appear here for reopen, save, or deletion.</div></div>';
+            }
+
+            recentCapturesEl.querySelectorAll('[data-action]').forEach((button) => {
+                button.addEventListener('click', (event) => {
+                    event.stopPropagation();
+                    const action = button.getAttribute('data-action');
+                    const captureId = button.getAttribute('data-id');
+                    if (action && captureId) {
+                        vscode.postMessage({ type: action, captureId });
+                    }
+                });
+            });
+
             const local = document.createElement('div');
             local.className = 'target' + (selected.kind === 'local' ? ' active' : '');
             local.innerHTML = '<div class="targetTop"><div class="title">Local Workspace</div><div class="chip good">Desktop</div></div><div class="meta">Launch on this machine with direct process control and immediate local replay access.</div>';
             local.addEventListener('click', () => vscode.postMessage({ type: 'selectLocal' }));
             targetsEl.appendChild(local);
 
-            if (!devices.length) {
+            if (refreshing) {
+                const loading = document.createElement('div');
+                loading.className = 'empty';
+                loading.textContent = 'Refreshing capture targets…';
+                targetsEl.appendChild(loading);
+            }
+
+            if (refreshError) {
+                const error = document.createElement('div');
+                error.className = 'empty';
+                error.textContent = 'Unable to refresh capture targets: ' + refreshError;
+                targetsEl.appendChild(error);
+            }
+
+            if (!devices.length && !refreshing) {
                 const empty = document.createElement('div');
                 empty.className = 'empty';
                 empty.textContent = 'No mobile or remote devices detected.';

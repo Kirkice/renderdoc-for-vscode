@@ -38,6 +38,13 @@
         timingsAvailable: false,
         timingsError: null,
         graphFocus: null,
+        replayStatus: {
+            status: 'none',
+            mode: 'none',
+            hostUrl: null,
+            hint: null,
+            recommendRemote: false,
+        },
     };
 
     // Build resourceId -> resource info lookup (strings for consistent key match)
@@ -214,6 +221,9 @@
         const v = parseInt(document.getElementById('event-jump').value, 10);
         if (!isNaN(v)) vscode.postMessage({ type: 'selectEvent', eventId: v });
     });
+    document.getElementById('replay-banner-action').addEventListener('click', () => {
+        vscode.postMessage({ type: 'useRecommendedReplayHost' });
+    });
     document.getElementById('event-jump').addEventListener('keydown', e => {
         if (e.key === 'Enter') document.getElementById('btn-jump').click();
     });
@@ -304,6 +314,16 @@
                 rtPreviewPending.clear();
                 resetCurrentRTPreviewView();
                 render();
+                break;
+            case 'replayStatus':
+                state.replayStatus = {
+                    status: m.status || 'none',
+                    mode: m.mode || 'none',
+                    hostUrl: m.hostUrl || null,
+                    hint: m.hint || null,
+                    recommendRemote: !!m.recommendRemote,
+                };
+                renderReplayBanner();
                 break;
             case 'eventChanged':
                 {
@@ -402,6 +422,49 @@
         } else {
             apiBadge.hidden = true;
         }
+    }
+
+    function renderReplayBanner() {
+        const banner = document.getElementById('replay-banner');
+        const badge = document.getElementById('replay-banner-badge');
+        const text = document.getElementById('replay-banner-text');
+        const action = document.getElementById('replay-banner-action');
+        const replay = state.replayStatus || { status: 'none', mode: 'none' };
+
+        if (!state.captureInfo || replay.status === 'none') {
+            banner.hidden = true;
+            return;
+        }
+
+        let tone = 'neutral';
+        let label = 'Replay';
+        let message = '';
+
+        if (replay.status === 'active' && replay.mode === 'remote') {
+            tone = 'good';
+            label = 'Remote Replay';
+            message = replay.hostUrl
+                ? `Replaying on ${replay.hostUrl}. Inspection requests are using the remote renderer.`
+                : 'Remote replay is active.';
+        } else if (replay.status === 'active') {
+            tone = replay.recommendRemote ? 'warn' : 'good';
+            label = 'Local Replay';
+            message = replay.hint || 'Replaying locally on this machine.';
+        } else if (replay.status === 'unavailable') {
+            tone = 'warn';
+            label = 'Replay Pending';
+            message = replay.hint || 'Replay is not active yet for this capture.';
+        } else if (replay.status === 'failed') {
+            tone = 'danger';
+            label = 'Replay Failed';
+            message = replay.hint || 'Inspection features are currently unavailable.';
+        }
+
+        banner.dataset.tone = tone;
+        badge.textContent = label;
+        text.textContent = message;
+        action.hidden = !replay.recommendRemote;
+        banner.hidden = false;
     }
 
     // ── Overview ───────────────────────────────────────────────────

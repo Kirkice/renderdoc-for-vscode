@@ -108,6 +108,19 @@ export interface TriggerCaptureResult extends LiveTargetInfo {
     frameNumber?: number;
 }
 
+export interface LiveCaptureEntry {
+    id: string;
+    filePath: string;
+    displayName: string;
+    target?: string;
+    api?: string;
+    frameNumber?: number;
+    local: boolean;
+    saved: boolean;
+    sourceUrl?: string;
+    createdAt: string;
+}
+
 export interface CaptureInfo {
     filePath: string;
     api: string;
