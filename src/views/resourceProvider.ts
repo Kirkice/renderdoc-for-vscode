@@ -18,7 +18,6 @@ export class ResourceProvider implements vscode.TreeDataProvider<ResourceItem> {
 
     getChildren(element?: ResourceItem): ResourceItem[] {
         if (!element) {
-            // Group by type
             const groups = new Map<string, ResourceInfo[]>();
             for (const r of this.resources) {
                 const list = groups.get(r.type) || [];
@@ -38,7 +37,6 @@ export class ResourceProvider implements vscode.TreeDataProvider<ResourceItem> {
             );
         }
 
-        // Children of a group
         if (element.childResources) {
             return element.childResources.map(r => {
                 let desc = '';
@@ -102,7 +100,6 @@ class ResourceItem extends vscode.TreeItem {
             this.tooltip = `${label}\n${description}\nID: ${resourceId}`;
         }
 
-        // Context value for menus — set based on resource type
         if (resourceType) {
             this.contextValue = resourceType;
         }

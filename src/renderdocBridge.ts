@@ -17,10 +17,11 @@ import {
     ResourceInfo,
     ResourceDetail,
     ThumbnailData,
+    TextureOverlayMode,
     TriggerCaptureOptions,
     TriggerCaptureResult,
 } from './types';
-import { parseRdcFile } from './rdcParser';
+import { parseRdcFile, parseRdcThumbnail } from './rdcParser';
 import { withTimeout } from './util/async';
 import {
     InitResponse,
@@ -662,8 +663,17 @@ export class RenderDocBridge {
         );
     }
 
-    /** Get capture thumbnail using renderdoccmd thumb */
+    /** Get capture thumbnail, preferring the embedded RDC thumbnail parser. */
     async getThumbnail(filePath: string): Promise<ThumbnailData | null> {
+        try {
+            const parsedThumbnail = await parseRdcThumbnail(filePath);
+            if (parsedThumbnail) {
+                return parsedThumbnail;
+            }
+        } catch {
+            // Fall through to renderdoccmd for unsupported or malformed thumbnail payloads.
+        }
+
         const tmpFile = path.join(os.tmpdir(), `rdcthumb_${Date.now()}.jpg`);
         try {
             await this.runCmd(['thumb', `--out=${tmpFile}`, filePath]);
@@ -1135,10 +1145,24 @@ export class RenderDocBridge {
     }
 
     /** Get a RenderDoc replay-style current draw preview for the selected event. */
-    async nativeGetCurrentDrawPreview(eventId: number, channelExtract: number = -1): Promise<any> {
-        await this.ensureNativeFeature('getCurrentDrawPreview', { eventId: 0, channelExtract: -1 });
+    async nativeGetCurrentDrawPreview(
+        eventId: number,
+        channelExtract: number = -1,
+        overlayMode: TextureOverlayMode = 'none',
+        resourceId?: string,
+        overlayResourceId?: string,
+        label?: string,
+    ): Promise<any> {
+        await this.ensureNativeFeature('getCurrentDrawPreview', { eventId: 0, channelExtract: -1, overlayMode: 'none' });
         try {
-            return await this.nativeCall('getCurrentDrawPreview', { eventId, channelExtract });
+            return await this.nativeCall('getCurrentDrawPreview', {
+                eventId,
+                channelExtract,
+                overlayMode,
+                resourceId,
+                overlayResourceId,
+                label,
+            });
         } catch (error) {
             this.rethrowBridgeCompatibilityError('getCurrentDrawPreview', error);
         }

@@ -23,6 +23,7 @@
         modalResource: null,
         modalChannel: -1,
         currentPreviewChannel: -1,
+        currentPreviewOverlay: 'none',
         eventScope: 'all',   // 'all' | 'group'
         texScope: 'output',  // 'output' | 'input'
         meshStage: 'vsin',   // 'vsin' | 'vsout'
@@ -114,6 +115,25 @@
         if (fb.copyDestination) {
             return { resourceId: fb.copyDestination, label: 'Cur Copy Dest', framebuffer: fb };
         }
+        return null;
+    }
+
+    function currentOverlayTargetInfo(pipe) {
+        const fb = effectiveFramebuffer(pipe);
+        if (fb.colorTargets && fb.colorTargets.length) {
+            return {
+                resourceId: String(fb.colorTargets[0]),
+                label: fb.usesPresentationFallback ? 'Presentation' : 'Current Draw Output',
+            };
+        }
+
+        if (pipe && pipe.presentationColorTarget) {
+            return {
+                resourceId: String(pipe.presentationColorTarget),
+                label: 'Presentation',
+            };
+        }
+
         return null;
     }
 
@@ -298,6 +318,19 @@
         console.log('[Inspector webview] msg:', m.type);
         switch (m.type) {
             case 'captureLoaded':
+                {
+                    const previousCapturePath = state.captureInfo?.filePath || null;
+                    const nextCapturePath = m.captureInfo?.filePath || null;
+                    const sameCapture = previousCapturePath === nextCapturePath;
+                    if (!sameCapture) {
+                        state.eventId = null;
+                        state.drawCall = null;
+                        state.shaders = null;
+                        state.pipeline = null;
+                        state.meshCache = {};
+                        state.meshPending = {};
+                    }
+                }
                 state.captureInfo = m.captureInfo;
                 state.drawCalls = m.drawCalls || [];
                 state.resources = m.resources || [];
@@ -2358,8 +2391,22 @@
         texCurrentEl.style.flex = '0 0 ' + clamped + 'px';
         return clamped;
     }
-    function rtKey() {
-        return 'current-draw:' + (state.eventId || 0) + ':' + state.currentPreviewChannel;
+    function currentPreviewOverlayLabel(mode) {
+        switch (mode) {
+            case 'drawcall': return 'Highlight DrawCall';
+            case 'wireframe': return 'Wireframe Mesh';
+            case 'depth': return 'Depth Test';
+            case 'stencil': return 'Stencil Test';
+            default: return 'None';
+        }
+    }
+    function rtKeyFor(eventId, channelExtract, overlayMode, resourceId, overlayResourceId) {
+        return 'current-draw:' +
+            (eventId || 0) + ':' +
+            channelExtract + ':' +
+            (overlayMode || 'none') + ':' +
+            (resourceId || '') + ':' +
+            (overlayResourceId || '');
     }
     function getCurrentRTPreviewAreaEl() {
         return document.querySelector('#tex-current .tex-current-preview');
@@ -2483,6 +2530,10 @@
         state.currentPreviewChannel = Number.isFinite(channelExtract) ? channelExtract : -1;
         renderCurrentRTPreview();
     }
+    function setCurrentRTPreviewOverlay(mode) {
+        state.currentPreviewOverlay = typeof mode === 'string' && mode ? mode : 'none';
+        renderCurrentRTPreview();
+    }
     window.addEventListener('resize', () => {
         if (state.activeTab === 'textures') {
             applyTexturesPreviewHeight(loadTexturesPreviewHeight());
@@ -2506,14 +2557,27 @@
                 : 'Loading render target…';
             return;
         }
-        const key = rtKey();
+        const overlayMode = state.currentPreviewOverlay || 'none';
+        const requestedOutput = currentOutputInfo(pipe);
+        const requestedOverlayTarget = currentOverlayTargetInfo(pipe);
+        const requestedResourceId = requestedOutput && requestedOutput.resourceId ? String(requestedOutput.resourceId) : '';
+        const requestedOverlayResourceId = requestedOverlayTarget && requestedOverlayTarget.resourceId
+            ? String(requestedOverlayTarget.resourceId)
+            : '';
+        const key = rtKeyFor(
+            state.eventId || 0,
+            state.currentPreviewChannel,
+            overlayMode,
+            requestedResourceId,
+            requestedOverlayResourceId,
+        );
         const cached = rtPreviewCache.get(key);
         const errMsg = rtPreviewErrors.get(key);
         const rtId = cached && cached.resourceId ? String(cached.resourceId) : null;
-        const output = currentOutputInfo(pipe);
+        const output = requestedOutput;
         const label = (cached && cached.label) || (output && output.label) || 'Current Draw';
         const tex = state.resources.find(r => String(r.resourceId) === String(rtId));
-        const name = cached && cached.label ? cached.label : (tex && tex.name) || (rtId ? ('Resource ' + rtId) : 'Current Draw Preview');
+        const name = (tex && tex.name) || (rtId ? ('Resource ' + rtId) : 'Current Draw Preview');
         const fmt = (cached && cached.texFormat) || (tex && tex.format) || '';
         const dim = cached && cached.width ? (cached.width + '×' + cached.height) : (tex && tex.width ? (tex.width + '×' + tex.height) : '');
         const badges = [];
@@ -2526,16 +2590,31 @@
         ].map(ch =>
             '<button data-ch="' + ch.value + '" class="ch' + (state.currentPreviewChannel === ch.value ? ' active' : '') + '">' + ch.label + '</button>'
         ).join('');
+        const overlayOptions = [
+            { value: 'none', label: 'None' },
+            { value: 'drawcall', label: 'Highlight DrawCall' },
+            { value: 'wireframe', label: 'Wireframe Mesh' },
+            { value: 'depth', label: 'Depth Test' },
+            { value: 'stencil', label: 'Stencil Test' },
+        ].map(opt =>
+            '<option value="' + opt.value + '"' + (overlayMode === opt.value ? ' selected' : '') + '>' + esc(opt.label) + '</option>'
+        ).join('');
         badges.push('<span class="tex-current-meta">replay preview</span>');
+        if (overlayMode !== 'none') badges.push('<span class="tex-current-meta">overlay: ' + esc(currentPreviewOverlayLabel(overlayMode)) + '</span>');
         if (output && output.framebuffer && output.framebuffer.usesActionFallback) badges.push('<span class="tex-current-meta">action fallback</span>');
         if (output && output.framebuffer && output.framebuffer.usesPresentationFallback) badges.push('<span class="tex-current-meta">backbuffer fallback</span>');
 
         area.className = 'tex-current';
+        if (overlayMode !== 'none') area.classList.add('overlay-active');
         let body;
         if (cached && cached.base64) {
             body = '<div class="tex-current-stage"><img src="data:image/png;base64,' + cached.base64 + '" alt="current RT"></div>';
         } else if (errMsg) {
-            body = '<div class="muted" style="padding:8px;font-size:0.85em;">Preview unavailable: ' + esc(errMsg) + '</div>';
+            body =
+                '<div class="tex-current-error">' +
+                    '<div class="muted" style="font-size:0.85em;">Preview unavailable: ' + esc(errMsg) + '</div>' +
+                    '<button class="icon-btn tex-current-retry" type="button">Retry</button>' +
+                '</div>';
         } else {
             body = '<div class="muted">Loading…</div>';
         }
@@ -2548,6 +2627,7 @@
                 '<div class="tex-current-actions">' +
                     '<span class="tex-current-meta tex-current-hint">Wheel: zoom · Drag: pan</span>' +
                     '<div class="channel-toggle tex-current-channel-toggle">' + channelButtons + '</div>' +
+                    '<label class="tex-current-overlay-control"><span class="tex-current-meta">Overlay</span><select class="tex-current-overlay-select">' + overlayOptions + '</select></label>' +
                     '<button class="icon-btn tex-current-zoom-reset" title="Reset zoom and pan">' + Math.round(currentRTPreviewZoom * 100) + '%</button>' +
                     (rtId ? ('<button class="icon-btn tex-current-open" data-resid="' + esc(rtId) + '">Open</button>') : '') +
                 '</div>' +
@@ -2567,8 +2647,21 @@
         area.querySelectorAll('.tex-current-channel-toggle .ch').forEach(btn => btn.addEventListener('click', () => {
             setCurrentRTPreviewChannel(parseInt(btn.dataset.ch, 10));
         }));
+        const overlaySelect = area.querySelector('.tex-current-overlay-select');
+        if (overlaySelect) {
+            overlaySelect.addEventListener('change', () => setCurrentRTPreviewOverlay(overlaySelect.value));
+        }
         const resetBtn = area.querySelector('.tex-current-zoom-reset');
         if (resetBtn) resetBtn.addEventListener('click', resetCurrentRTPreviewView);
+        const retryBtn = area.querySelector('.tex-current-retry');
+        if (retryBtn) {
+            retryBtn.addEventListener('click', () => {
+                rtPreviewErrors.delete(key);
+                rtPreviewPending.delete(key);
+                rtPreviewCache.delete(key);
+                renderCurrentRTPreview();
+            });
+        }
         const btn = area.querySelector('.tex-current-open');
         if (btn) btn.addEventListener('click', () => openTextureModal(String(rtId)));
         const img = getCurrentRTPreviewImageEl();
@@ -2587,6 +2680,12 @@
                 type: 'requestCurrentDrawPreview',
                 eventId: state.eventId || 0,
                 channelExtract: state.currentPreviewChannel,
+                overlayMode: overlayMode,
+                resourceId: requestedResourceId || undefined,
+                overlayResourceId: requestedOverlayResourceId || undefined,
+                label: overlayMode !== 'none'
+                    ? ((requestedOverlayTarget && requestedOverlayTarget.label) || label)
+                    : label,
             });
         }
     }
@@ -2602,6 +2701,7 @@
                 texFormat: m.texFormat,
                 resourceId: m.resourceId,
                 label: m.label,
+                overlayMode: m.overlayMode,
             });
             rtPreviewErrors.delete(m.key);
         } else if (m.error) {

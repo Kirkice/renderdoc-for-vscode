@@ -1,6 +1,6 @@
 ﻿import * as vscode from 'vscode';
 import { RenderDocBridge } from '../renderdocBridge';
-import { DrawCall, ResourceInfo, CaptureInfo } from '../types';
+import { DrawCall, ResourceInfo, CaptureInfo, TextureOverlayMode } from '../types';
 import { withTimeout } from '../util/async';
 import { LruCache } from '../util/lruCache';
 import type {
@@ -55,7 +55,15 @@ export class InspectorPanel {
     // Cache rendered textures (base64 PNG) keyed by "resId:mip:eventId".
     // Each entry can be hundreds of KB so we keep a tighter cap.
     private texturePreviewCache = new LruCache<string, { base64: string; width: number; height: number; texFormat: string }>(128);
-    private currentDrawPreviewCache = new LruCache<string, { base64: string; width: number; height: number; texFormat: string; resourceId?: string; label?: string }>(64);
+    private currentDrawPreviewCache = new LruCache<string, {
+        base64: string;
+        width: number;
+        height: number;
+        texFormat: string;
+        resourceId?: string;
+        label?: string;
+        overlayMode?: TextureOverlayMode;
+    }>(64);
 
     // Mesh decode cache keyed by "eventId:stage:maxVerts:instance".
     private meshCache = new LruCache<string, any>(64);
@@ -171,6 +179,9 @@ export class InspectorPanel {
             this.captureTimingsError = undefined;
             this.timingCapturePath = undefined;
             this.timingsLoadingForPath = undefined;
+            this.currentEventId = undefined;
+            this.currentDrawCall = undefined;
+            this.panel.title = 'Inspector';
         }
 
         this.panel.webview.postMessage({
@@ -432,9 +443,30 @@ export class InspectorPanel {
         return { eventId: resolvedDrawCall.eventId, drawCall: resolvedDrawCall };
     }
 
-    private isNoReplayActiveError(error: unknown): boolean {
+    private shouldRecoverReplayError(
+        error: unknown,
+        request: 'generic' | 'texturePreview' | 'currentDrawPreview' = 'generic',
+    ): boolean {
         const message = String((error as any)?.message ?? error ?? '');
-        return message.includes('No replay active');
+        if (!message) {
+            return false;
+        }
+        if (message.includes('No replay active')) {
+            return true;
+        }
+        if (message.includes("Data was requested through RenderDoc's API which is not available")) {
+            return true;
+        }
+        if (this.replayStatus.mode !== 'remote') {
+            return false;
+        }
+        if (request === 'texturePreview' && message.includes("Couldn't readback bytes")) {
+            return true;
+        }
+        if (request === 'currentDrawPreview' && message.includes('Current draw preview readback empty')) {
+            return true;
+        }
+        return false;
     }
 
     private async tryRecoverReplay(reason: string): Promise<boolean> {
@@ -472,7 +504,7 @@ export class InspectorPanel {
                 );
                 this.shaderCache.set(eventId, result);
             } catch (e: any) {
-                if (this.isNoReplayActiveError(e) && await this.tryRecoverReplay('shader request')) {
+                if (this.shouldRecoverReplayError(e) && await this.tryRecoverReplay('shader request')) {
                     try {
                         const retried = await withTimeout(
                             this.bridge.nativeGetShaderSource(eventId),
@@ -524,7 +556,7 @@ export class InspectorPanel {
                     this.prefetchRTTextures(eventId, result).catch(() => { /* best-effort */ });
                 }
             } catch (e: any) {
-                if (this.isNoReplayActiveError(e) && await this.tryRecoverReplay('pipeline request')) {
+                if (this.shouldRecoverReplayError(e) && await this.tryRecoverReplay('pipeline request')) {
                     try {
                         const retried = await withTimeout(
                             this.bridge.nativeGetPipelineState(eventId),
@@ -660,7 +692,7 @@ export class InspectorPanel {
                 this.panel.webview.postMessage({ type: 'texturePreview', key, error: 'No preview returned' });
             }
         } catch (e: any) {
-            if (this.isNoReplayActiveError(e) && await this.tryRecoverReplay('texture preview request')) {
+            if (this.shouldRecoverReplayError(e, 'texturePreview') && await this.tryRecoverReplay('texture preview request')) {
                 try {
                     const retried = await withTimeout(
                         this.bridge.nativeGetTextureData(resourceId, mip, eventId, channelExtract),
@@ -683,8 +715,15 @@ export class InspectorPanel {
         }
     }
 
-    private async loadCurrentDrawPreview(eventId: number, channelExtract: number = -1) {
-        const key = `current-draw:${eventId}:${channelExtract}`;
+    private async loadCurrentDrawPreview(
+        eventId: number,
+        channelExtract: number = -1,
+        overlayMode: TextureOverlayMode = 'none',
+        resourceId?: string,
+        overlayResourceId?: string,
+        label?: string,
+    ) {
+        const key = `current-draw:${eventId}:${channelExtract}:${overlayMode}:${resourceId ?? ''}:${overlayResourceId ?? ''}`;
         if (this.currentDrawPreviewCache.has(key)) {
             const cached = this.currentDrawPreviewCache.get(key)!;
             this.panel.webview.postMessage({ type: 'currentDrawPreview', key, ...cached });
@@ -699,7 +738,14 @@ export class InspectorPanel {
         }
         try {
             const result = await withTimeout(
-                this.bridge.nativeGetCurrentDrawPreview(eventId, channelExtract),
+                this.bridge.nativeGetCurrentDrawPreview(
+                    eventId,
+                    channelExtract,
+                    overlayMode,
+                    resourceId,
+                    overlayResourceId,
+                    label,
+                ),
                 30000,
                 'Current draw preview request timed out after 30s.',
             );
@@ -711,6 +757,7 @@ export class InspectorPanel {
                     texFormat: result.texFormat,
                     resourceId: result.resourceId,
                     label: result.label,
+                    overlayMode: result.overlayMode,
                 };
                 this.currentDrawPreviewCache.set(key, data);
                 this.panel.webview.postMessage({ type: 'currentDrawPreview', key, ...data });
@@ -718,10 +765,17 @@ export class InspectorPanel {
                 this.panel.webview.postMessage({ type: 'currentDrawPreview', key, error: 'No preview returned' });
             }
         } catch (e: any) {
-            if (this.isNoReplayActiveError(e) && await this.tryRecoverReplay('current draw preview request')) {
+            if (this.shouldRecoverReplayError(e, 'currentDrawPreview') && await this.tryRecoverReplay('current draw preview request')) {
                 try {
                     const retried = await withTimeout(
-                        this.bridge.nativeGetCurrentDrawPreview(eventId, channelExtract),
+                        this.bridge.nativeGetCurrentDrawPreview(
+                            eventId,
+                            channelExtract,
+                            overlayMode,
+                            resourceId,
+                            overlayResourceId,
+                            label,
+                        ),
                         30000,
                         'Current draw preview request timed out after 30s.',
                     );
@@ -733,6 +787,7 @@ export class InspectorPanel {
                             texFormat: retried.texFormat,
                             resourceId: retried.resourceId,
                             label: retried.label,
+                            overlayMode: retried.overlayMode,
                         };
                         this.currentDrawPreviewCache.set(key, data);
                         this.panel.webview.postMessage({ type: 'currentDrawPreview', key, ...data });
@@ -813,6 +868,10 @@ export class InspectorPanel {
                 this.loadCurrentDrawPreview(
                     msg.eventId ?? this.currentEventId ?? 0,
                     msg.channelExtract ?? -1,
+                    msg.overlayMode ?? 'none',
+                    msg.resourceId,
+                    msg.overlayResourceId,
+                    msg.label,
                 );
                 break;
             case 'requestMesh':

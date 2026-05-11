@@ -1,7 +1,6 @@
 import * as vscode from 'vscode';
 import { DrawCall } from '../types';
 
-/** Walk the subtree and collect the minimum/maximum eventId across all descendants. */
 function computeEidRange(dc: DrawCall): { min: number; max: number } {
     let min = dc.eventId;
     let max = dc.eventId;
@@ -15,7 +14,6 @@ function computeEidRange(dc: DrawCall): { min: number; max: number } {
     return { min, max };
 }
 
-/** Format microseconds to a compact human-readable string. */
 function formatDuration(us: number): string {
     if (us >= 1_000_000) { return `${(us / 1_000_000).toFixed(2)} s`; }
     if (us >= 1_000)     { return `${(us / 1_000).toFixed(2)} ms`; }
@@ -62,21 +60,16 @@ class DrawCallItem extends vscode.TreeItem {
         public readonly drawCall: DrawCall,
         public readonly collapsibleState: vscode.TreeItemCollapsibleState
     ) {
-        // Build a RenderDoc Event-Browser-style label:
-        //   leaf:  "1159  glDrawElements(54)"
-        //   group: "11-559  Camera.Render"
         super(DrawCallItem.buildLabel(drawCall), collapsibleState);
 
         this.tooltip = this.buildTooltip();
         this.iconPath = this.pickIcon();
         this.contextValue = 'drawcall';
 
-        // Show duration as the secondary description column when available
         if (drawCall.durationUs !== undefined) {
             this.description = formatDuration(drawCall.durationUs);
         }
 
-        // Clicking any node jumps the Inspector to that event.
         this.command = {
             command: 'renderdoc.showDrawCallDetails',
             title: 'Show Details',

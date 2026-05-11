@@ -9,7 +9,7 @@
  * standalone media bundle it will also import from this module.
  */
 
-import type { CaptureInfo, DrawCall, ResourceInfo } from '../types';
+import type { CaptureInfo, DrawCall, ResourceInfo, TextureOverlayMode } from '../types';
 
 // ───────────────────────────── Webview → Extension ─────────────────────────────
 
@@ -35,6 +35,10 @@ export interface MsgRequestCurrentDrawPreview {
     type: 'requestCurrentDrawPreview';
     eventId?: number;
     channelExtract?: number;
+    overlayMode?: TextureOverlayMode;
+    resourceId?: string;
+    overlayResourceId?: string;
+    label?: string;
 }
 
 export interface MsgOpenShaderInEditor {
@@ -158,6 +162,7 @@ export interface MsgCurrentDrawPreview {
     texFormat?: string;
     resourceId?: string;
     label?: string;
+    overlayMode?: TextureOverlayMode;
     error?: string;
 }
 

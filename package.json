@@ -243,37 +243,37 @@
       },
       {
         "command": "renderdoc.launchCapture",
-        "title": "Launch Application",
+        "title": "Open Launch Application",
         "category": "RenderDoc",
         "icon": "$(play-circle)"
       },
       {
         "command": "renderdoc.refreshCaptureTargets",
-        "title": "Refresh Capture Targets",
+        "title": "Refresh Target List",
         "category": "RenderDoc",
         "icon": "$(refresh)"
       },
       {
         "command": "renderdoc.attachCapture",
-        "title": "Attach To Process",
+        "title": "Attach On Selected Target",
         "category": "RenderDoc",
         "icon": "$(plug)"
       },
       {
         "command": "renderdoc.triggerCapture",
-        "title": "Capture Frame",
+        "title": "Capture Frame From Live Session",
         "category": "RenderDoc",
         "icon": "$(device-camera-video)"
       },
       {
         "command": "renderdoc.disconnectLiveTarget",
-        "title": "Disconnect Live Target",
+        "title": "Disconnect Live Session",
         "category": "RenderDoc",
         "icon": "$(debug-disconnect)"
       },
       {
         "command": "renderdoc.clearSavedCaptures",
-        "title": "Clear Saved RDC Files",
+        "title": "Delete Saved RDC Files",
         "category": "RenderDoc",
         "icon": "$(trash)"
       },
@@ -366,6 +366,12 @@
         "icon": "$(vm-connect)"
       },
       {
+        "command": "renderdoc.enableRemoteReplayPrompts",
+        "title": "Re-enable Remote Replay Prompts",
+        "category": "RenderDoc",
+        "icon": "$(settings-gear)"
+      },
+      {
         "command": "renderdoc.downloadNativeBridge",
         "title": "Download Native Bridge…",
         "category": "RenderDoc",
@@ -439,7 +445,7 @@
     "viewsWelcome": [
       {
         "view": "renderdoc-launchTarget",
-        "contents": "Choose **Local** or a connected device, then use [Launch Application](command:renderdoc.launchCapture) or [Attach To Process](command:renderdoc.attachCapture)."
+        "contents": "Use the Capture Target workflow to 1) choose a target, 2) launch or attach, and 3) capture from the live session."
       },
       {
         "view": "renderdoc-captureInfo",
@@ -675,7 +681,8 @@
     "watch": "node esbuild.js --watch",
     "package": "npm run typecheck && node esbuild.js --production",
     "typecheck": "tsc -p ./ --noEmit",
-    "lint": "eslint src --ext ts"
+    "lint": "eslint src --ext ts",
+    "test:rdc-parser": "node scripts/test-rdc-parser.js"
   },
   "devDependencies": {
     "@types/node": "^20.11.0",

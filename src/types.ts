@@ -179,6 +179,8 @@ export interface ResourceDetail extends ResourceInfo {
 export interface ThumbnailData {
     width: number;
     height: number;
-    base64: string;     // base64 encoded JPG/PNG
-    format: string;     // "jpg" | "png"
+    base64: string;     // base64 encoded JPG/PNG/BMP
+    format: string;     // "jpg" | "png" | "bmp"
 }
+
+export type TextureOverlayMode = 'none' | 'drawcall' | 'wireframe' | 'depth' | 'stencil';

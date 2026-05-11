@@ -21,6 +21,7 @@
 #include <vector>
 #include <map>
 #include <set>
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <thread>
@@ -68,7 +69,43 @@ static const ActionDescription *findReplayActionByEventId(
     const rdcarray<ActionDescription> &actions, uint32_t eventId);
 static const ActionDescription *findStructuredActionByEventId(
     const rdcarray<ActionDescription> &actions, uint32_t eventId);
+static ResourceId getCurrentColorTargetId();
 static std::string resultMessage(const ResultDetails &r);
+
+static std::string lowerAscii(std::string value) {
+    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char ch) {
+        return static_cast<char>(std::tolower(ch));
+    });
+    return value;
+}
+
+static DebugOverlay parseTextureOverlayMode(const std::string &mode, bool &ok, std::string &normalizedMode) {
+    normalizedMode = lowerAscii(mode);
+    if (normalizedMode.empty() || normalizedMode == "none") {
+        normalizedMode = "none";
+        ok = true;
+        return DebugOverlay::NoOverlay;
+    }
+    if (normalizedMode == "drawcall") {
+        ok = true;
+        return DebugOverlay::Drawcall;
+    }
+    if (normalizedMode == "wireframe") {
+        ok = true;
+        return DebugOverlay::Wireframe;
+    }
+    if (normalizedMode == "depth") {
+        ok = true;
+        return DebugOverlay::Depth;
+    }
+    if (normalizedMode == "stencil") {
+        ok = true;
+        return DebugOverlay::Stencil;
+    }
+
+    ok = false;
+    return DebugOverlay::NoOverlay;
+}
 
 // Cached headless replay output for drawcall-overlay rendering.
 // Reused across events as long as the backing dimensions don't change.
@@ -194,11 +231,16 @@ static std::thread       g_replayRemotePingThread;
 static std::string       g_replayRemoteUrl;
 static std::string       g_replayRemoteCapturePath;
 
-static void closeActiveReplay() {
+static void stopRemoteKeepAlive(std::atomic<bool> &keepRemoteAlive,
+                                std::thread &remotePingThread);
+static void ensureReplayRemoteKeepAlive();
+
+static void closeActiveReplay(bool resumeReplayHostKeepAlive = true) {
     shutdownCachedReplayOutputs();
     resetEventCache();
     if (g_replay) {
         if (g_replayIsRemote && g_replayRemote) {
+            stopRemoteKeepAlive(g_replayRemoteKeepAlive, g_replayRemotePingThread);
             g_replayRemote->CloseCapture(g_replay);
         } else {
             g_replay->Shutdown();
@@ -206,6 +248,9 @@ static void closeActiveReplay() {
         g_replay = nullptr;
     }
     g_replayIsRemote = false;
+    if (resumeReplayHostKeepAlive) {
+        ensureReplayRemoteKeepAlive();
+    }
 }
 
 static void closeOpenCaptureFile() {
@@ -267,6 +312,35 @@ static bool ensureParentDirectory(const std::string &filePath, std::string &erro
     }
 }
 
+static bool tryConnectRemoteServer(const std::string &url,
+                                   IRemoteServer **remote,
+                                   ResultDetails &result,
+                                   int attempts,
+                                   int delayMs) {
+    if (!remote) {
+        return false;
+    }
+
+    *remote = nullptr;
+    for (int attempt = 0; attempt < attempts; ++attempt) {
+        IRemoteServer *candidate = nullptr;
+        result = g_dll.CreateRemoteServerConnection(rdcstr(url.c_str()), &candidate);
+        if (result.code == ResultCode::Succeeded && candidate) {
+            *remote = candidate;
+            return true;
+        }
+        if (candidate) {
+            candidate->ShutdownConnection();
+            candidate = nullptr;
+        }
+        if (attempt + 1 < attempts && delayMs > 0) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(delayMs));
+        }
+    }
+
+    return false;
+}
+
 static bool connectRemoteServer(const std::string &url, IRemoteServer **remote, std::string &errorMessage) {
     if (!g_dll.CreateRemoteServerConnection) {
         errorMessage = "RenderDoc remote server APIs are unavailable in the loaded DLL.";
@@ -285,27 +359,72 @@ static bool connectRemoteServer(const std::string &url, IRemoteServer **remote, 
         }
     }
 
-    ResultDetails result = g_dll.CreateRemoteServerConnection(rdcstr(url.c_str()), remote);
-    if (result.code == ResultCode::Succeeded && *remote) {
+    ResultDetails result = {};
+    const int initialAttempts = controller ? 20 : 1;
+    const int initialDelayMs = controller ? 500 : 0;
+    if (tryConnectRemoteServer(url, remote, result, initialAttempts, initialDelayMs)) {
         return true;
     }
 
     if (controller) {
-        emitStatusNote("Starting remote server on device...");
+        // Mirror RenderDoc's own Android flow: only launch the app-side
+        // remote server if the connection attempt failed with plain I/O.
+        // Other failures such as Busy or VersionMismatch should not trigger
+        // a destructive restart because StartRemoteServer() force-stops the
+        // app package before relaunching .Loader.
+        if (result.code != ResultCode::NetworkIOFailed) {
+            fprintf(stderr,
+                    "[bridge] Not calling StartRemoteServer(%s) because CreateRemoteServerConnection returned %s\n",
+                    url.c_str(),
+                    resultMessage(result).c_str());
+            errorMessage = resultMessage(result);
+            return false;
+        }
+
+        emitStatusNote("Starting or reusing remote server on device...");
         ResultDetails startResult = controller->StartRemoteServer(rdcstr(url.c_str()));
-        if (startResult.code == ResultCode::Succeeded) {
-            result = g_dll.CreateRemoteServerConnection(rdcstr(url.c_str()), remote);
-            if (result.code == ResultCode::Succeeded && *remote) {
-                return true;
-            }
-        } else {
-            errorMessage = resultMessage(startResult);
+        if (startResult.code != ResultCode::Succeeded) {
+            fprintf(stderr,
+                    "[bridge] StartRemoteServer(%s) returned %s; retrying connection anyway\n",
+                    url.c_str(),
+                    resultMessage(startResult).c_str());
+        }
+
+        emitStatusNote("Connecting to remote server...");
+        if (tryConnectRemoteServer(url, remote, result, 20, 500)) {
+            return true;
+        }
+
+        if (startResult.code != ResultCode::Succeeded) {
+            errorMessage = resultMessage(startResult) + "; " + resultMessage(result);
             return false;
         }
     }
 
     errorMessage = resultMessage(result);
     return false;
+}
+
+static bool reconnectReplayRemote(std::string &errorMessage) {
+    if (g_replayRemoteUrl.empty()) {
+        errorMessage = "No replay host is selected.";
+        return false;
+    }
+
+    stopRemoteKeepAlive(g_replayRemoteKeepAlive, g_replayRemotePingThread);
+    if (g_replayRemote) {
+        g_replayRemote->ShutdownConnection();
+        g_replayRemote = nullptr;
+    }
+    g_replayRemoteCapturePath.clear();
+
+    IRemoteServer *remote = nullptr;
+    if (!connectRemoteServer(g_replayRemoteUrl, &remote, errorMessage)) {
+        return false;
+    }
+
+    g_replayRemote = remote;
+    return true;
 }
 
 static ITargetControl *waitForTargetControl(const std::string &url, uint32_t ident, int timeoutMs) {
@@ -326,12 +445,19 @@ static ITargetControl *waitForTargetControl(const std::string &url, uint32_t ide
 
 static void startRemoteKeepAlive(IRemoteServer *remote,
                                  std::atomic<bool> &keepRemoteAlive,
-                                 std::thread &remotePingThread) {
+                                 std::thread &remotePingThread,
+                                 const char *connectionLabel) {
     if (!remote) return;
     keepRemoteAlive.store(true, std::memory_order_release);
-    remotePingThread = std::thread([remote, &keepRemoteAlive]() {
+    remotePingThread = std::thread([remote, &keepRemoteAlive, connectionLabel]() {
         while (keepRemoteAlive.load(std::memory_order_acquire)) {
-            if (remote->Ping().code != ResultCode::Succeeded) {
+            const ResultDetails ping = remote->Ping();
+            if (ping.code != ResultCode::Succeeded) {
+                fprintf(stderr,
+                        "[bridge] %s keep-alive ping failed: %s\n",
+                        connectionLabel,
+                        resultMessage(ping).c_str());
+                fflush(stderr);
                 break;
             }
             std::this_thread::sleep_for(std::chrono::seconds(1));
@@ -345,6 +471,13 @@ static void stopRemoteKeepAlive(std::atomic<bool> &keepRemoteAlive,
     if (remotePingThread.joinable()) {
         remotePingThread.join();
     }
+}
+
+static void ensureReplayRemoteKeepAlive() {
+    if (!g_replayRemote || g_replay || g_replayRemoteKeepAlive.load(std::memory_order_acquire)) {
+        return;
+    }
+    startRemoteKeepAlive(g_replayRemote, g_replayRemoteKeepAlive, g_replayRemotePingThread, "replay host");
 }
 
 static void clearLiveTargetSession() {
@@ -367,7 +500,7 @@ static void clearLiveTargetSession() {
 }
 
 static void clearReplayRemoteSession() {
-    closeActiveReplay();
+    closeActiveReplay(false);
     stopRemoteKeepAlive(g_replayRemoteKeepAlive, g_replayRemotePingThread);
     if (g_replayRemote) {
         g_replayRemote->ShutdownConnection();
@@ -901,6 +1034,7 @@ static json handleSetReplayHost(int id, const json &params) {
 
     g_replayRemote = remote;
     g_replayRemoteUrl = url;
+    startRemoteKeepAlive(g_replayRemote, g_replayRemoteKeepAlive, g_replayRemotePingThread, "replay host");
     return makeResult(id, currentReplayHostJson());
 }
 
@@ -966,6 +1100,11 @@ static json handleTryReplay(int id) {
             if (watchdog.joinable()) watchdog.join();
             return makeError(id, -2, "No local capture path is loaded for remote replay.");
         }
+        if (!std::filesystem::exists(g_capturePath)) {
+            openCaptureDone.store(true, std::memory_order_release);
+            if (watchdog.joinable()) watchdog.join();
+            return makeError(id, -3, "Local capture path does not exist for remote replay: " + g_capturePath);
+        }
 
         auto copyProgress = [&](float p) {
             emitTryReplayProgress(std::max(0.0f, std::min(1.0f, p * 0.35f)));
@@ -973,6 +1112,36 @@ static json handleTryReplay(int id) {
         auto openProgress = [&](float p) {
             emitTryReplayProgress(std::max(0.35f, std::min(1.0f, 0.35f + p * 0.65f)));
         };
+        auto finishRemoteReplayAttempt = [&](bool resumeKeepAlive) {
+            openCaptureDone.store(true, std::memory_order_release);
+            if (watchdog.joinable()) watchdog.join();
+            if (resumeKeepAlive) {
+                ensureReplayRemoteKeepAlive();
+            }
+        };
+        auto failRemoteReplay = [&](const std::string &message) {
+            finishRemoteReplayAttempt(true);
+            return makeResult(id, {
+                {"replay", false},
+                {"replayRemote", true},
+                {"replayHost", g_replayRemoteUrl},
+                {"replayError", message},
+            });
+        };
+
+        stopRemoteKeepAlive(g_replayRemoteKeepAlive, g_replayRemotePingThread);
+
+        ResultDetails replayHostPing = g_replayRemote->Ping();
+        if (replayHostPing.code != ResultCode::Succeeded) {
+            fprintf(stderr,
+                    "[bridge] replay host ping before copy failed: %s; reconnecting\n",
+                    resultMessage(replayHostPing).c_str());
+            fflush(stderr);
+            std::string reconnectError;
+            if (!reconnectReplayRemote(reconnectError)) {
+                return failRemoteReplay("Replay host connection lost before capture transfer: " + reconnectError);
+            }
+        }
 
         fprintf(stderr, "[bridge] Copying capture to remote host: %s\n", g_replayRemoteUrl.c_str());
         fflush(stderr);
@@ -980,14 +1149,21 @@ static json handleTryReplay(int id) {
             g_replayRemote->CopyCaptureToRemote(rdcstr(g_capturePath.c_str()), copyProgress));
 
         if (g_replayRemoteCapturePath.empty()) {
-            openCaptureDone.store(true, std::memory_order_release);
-            if (watchdog.joinable()) watchdog.join();
-            return makeResult(id, {
-                {"replay", false},
-                {"replayRemote", true},
-                {"replayHost", g_replayRemoteUrl},
-                {"replayError", "CopyCaptureToRemote returned an empty path."},
-            });
+            fprintf(stderr,
+                    "[bridge] CopyCaptureToRemote returned an empty path; reconnecting replay host and retrying once\n");
+            fflush(stderr);
+            std::string reconnectError;
+            if (!reconnectReplayRemote(reconnectError)) {
+                return failRemoteReplay("CopyCaptureToRemote returned an empty path and replay host reconnect failed: " + reconnectError);
+            }
+
+            emitStatusNote("Retrying capture transfer to remote host...");
+            g_replayRemoteCapturePath = rdcToStr(
+                g_replayRemote->CopyCaptureToRemote(rdcstr(g_capturePath.c_str()), copyProgress));
+        }
+
+        if (g_replayRemoteCapturePath.empty()) {
+            return failRemoteReplay("CopyCaptureToRemote returned an empty path.");
         }
 
         fprintf(stderr, "[bridge] Opening capture remotely: %s\n", g_replayRemoteCapturePath.c_str());
@@ -998,12 +1174,12 @@ static json handleTryReplay(int id) {
                                         opts,
                                         openProgress);
 
-        openCaptureDone.store(true, std::memory_order_release);
-        if (watchdog.joinable()) watchdog.join();
+        finishRemoteReplayAttempt(false);
 
         fprintf(stderr, "[bridge] Remote OpenCapture() returned, code=%d\n", (int)replayResult.first.code);
         fflush(stderr);
         if (replayResult.first.code != ResultCode::Succeeded) {
+            ensureReplayRemoteKeepAlive();
             return makeResult(id, {
                 {"replay", false},
                 {"replayRemote", true},
@@ -1537,7 +1713,7 @@ static json handleLaunchCapture(int id, const json &params) {
         g_liveTargetName = rdcToStr(target->GetTarget());
         g_liveTargetAPI = rdcToStr(target->GetAPI());
         g_liveTargetPID = target->GetPID();
-        startRemoteKeepAlive(g_liveRemote, g_liveRemoteKeepAlive, g_liveRemotePingThread);
+        startRemoteKeepAlive(g_liveRemote, g_liveRemoteKeepAlive, g_liveRemotePingThread, "live target");
 
         remote = nullptr;
         target = nullptr;
@@ -1635,7 +1811,7 @@ static json handleAttachCapture(int id, const json &params) {
         }
         g_liveTargetAPI = rdcToStr(target->GetAPI());
         g_liveTargetPID = target->GetPID() ? target->GetPID() : pid;
-        startRemoteKeepAlive(g_liveRemote, g_liveRemoteKeepAlive, g_liveRemotePingThread);
+        startRemoteKeepAlive(g_liveRemote, g_liveRemoteKeepAlive, g_liveRemotePingThread, "live target");
 
         remote = nullptr;
         target = nullptr;
@@ -2567,6 +2743,17 @@ static json handleGetCurrentDrawPreview(int id, const json &params) {
 
     uint32_t eventId = params.value("eventId", (uint32_t)0);
     int channelExtract = params.value("channelExtract", -1);
+    const std::string requestedOverlayMode = params.value("overlayMode", std::string("none"));
+    uint64_t requestedPreviewRid = jsonToU64(params.contains("resourceId") ? params["resourceId"] : json());
+    uint64_t requestedOverlayRid = jsonToU64(params.contains("overlayResourceId") ? params["overlayResourceId"] : json());
+    std::string requestedLabel = params.value("label", std::string());
+    bool overlayModeValid = false;
+    std::string normalizedOverlayMode;
+    const DebugOverlay overlay = parseTextureOverlayMode(requestedOverlayMode, overlayModeValid, normalizedOverlayMode);
+    if (!overlayModeValid) {
+        return makeError(id, -10, "Unsupported overlay mode: " + requestedOverlayMode);
+    }
+
     if (eventId == 0) {
         const rdcarray<ActionDescription> &actions = g_replay->GetRootActions();
         eventId = findMaxEventId(actions);
@@ -2596,10 +2783,7 @@ static json handleGetCurrentDrawPreview(int id, const json &params) {
         return nullptr;
     };
     auto lowerString = [](std::string value) {
-        std::transform(value.begin(), value.end(), value.begin(), [](unsigned char ch) {
-            return static_cast<char>(std::tolower(ch));
-        });
-        return value;
+        return lowerAscii(value);
     };
     auto isBackbufferLike = [&](ResourceId resourceId) {
         if (resourceId == ResourceId()) {
@@ -2654,15 +2838,123 @@ static json handleGetCurrentDrawPreview(int id, const json &params) {
         }
         return best;
     };
+    auto isOverlayCapableResource = [&](ResourceId resourceId) {
+        const TextureDescription *tex = textureFor(resourceId);
+        if (!tex) {
+            return false;
+        }
+        return (tex->creationFlags & (TextureCategory::ColorTarget | TextureCategory::SwapBuffer)) != TextureCategory::NoFlags;
+    };
+    auto queryPreviewTextureInfo = [&](ResourceId resourceId,
+                                       uint32_t &outWidth,
+                                       uint32_t &outHeight,
+                                       uint32_t &outSamples,
+                                       ResourceFormatType &outFmtType,
+                                       CompType &outCompType,
+                                       std::string &outFormat) {
+        outWidth = 0;
+        outHeight = 0;
+        outSamples = 1;
+        outFmtType = ResourceFormatType::Undefined;
+        outCompType = CompType::Typeless;
+        outFormat.clear();
+        for (size_t i = 0; i < textures.size(); i++) {
+            if (textures[i].resourceId == resourceId) {
+                outWidth = textures[i].width;
+                outHeight = textures[i].height;
+                outSamples = textures[i].msSamp > 0 ? textures[i].msSamp : 1;
+                outFmtType = textures[i].format.type;
+                outCompType = textures[i].format.compType;
+                outFormat = formatToStr(textures[i].format);
+                return true;
+            }
+        }
+        return false;
+    };
+    auto ensurePreviewOutput = [&](uint32_t targetWidth, uint32_t targetHeight) {
+        if (!g_overlayOut) {
+            WindowingData win = createPreviewWindowingData((int32_t)targetWidth, (int32_t)targetHeight);
+            g_overlayOut = g_replay->CreateOutput(win, ReplayOutputType::Texture);
+            if (!g_overlayOut) {
+                return false;
+            }
+            syncReplayOutputsToCurrentEvent();
+            g_overlayW = (int32_t)targetWidth;
+            g_overlayH = (int32_t)targetHeight;
+        }
 
-    ResourceId previewId = ResourceId();
+        if (g_overlayW != (int32_t)targetWidth || g_overlayH != (int32_t)targetHeight) {
+            g_overlayOut->Shutdown();
+            WindowingData win = createPreviewWindowingData((int32_t)targetWidth, (int32_t)targetHeight);
+            g_overlayOut = g_replay->CreateOutput(win, ReplayOutputType::Texture);
+            if (!g_overlayOut) {
+                return false;
+            }
+            syncReplayOutputsToCurrentEvent();
+            g_overlayW = (int32_t)targetWidth;
+            g_overlayH = (int32_t)targetHeight;
+        }
+
+        return true;
+    };
+    auto configureTextureDisplay = [&](TextureDisplay &display,
+                                       ResourceId resourceId,
+                                       bool depthFormat,
+                                       uint32_t texWidth,
+                                       uint32_t texHeight,
+                                       uint32_t texSamples) {
+        display = {};
+        display.resourceId = resourceId;
+        display.typeCast = CompType::Typeless;
+        if (depthFormat) {
+            display.red = (channelExtract < 0 || channelExtract == 0);
+            display.green = (channelExtract == 1);
+            display.blue = false;
+            display.alpha = false;
+            if (!display.red && !display.green) {
+                display.red = true;
+            }
+        } else {
+            display.red = (channelExtract < 0 || channelExtract == 0);
+            display.green = (channelExtract < 0 || channelExtract == 1);
+            display.blue = (channelExtract < 0 || channelExtract == 2);
+            display.alpha = (channelExtract == 3);
+        }
+        display.flipY = false;
+        display.hdrMultiplier = -1.0f;
+        display.linearDisplayAsGamma = true;
+        display.rangeMin = 0.0f;
+        display.rangeMax = 1.0f;
+        display.subresource = {0, 0, (texSamples > 1 && !depthFormat) ? TextureDisplay::ResolveSamples : 0u};
+        display.overlay = overlay;
+        display.rawOutput = false;
+        display.backgroundColor = FloatVector(0, 0, 0, 0);
+        display.xOffset = 0.0f;
+        display.yOffset = 0.0f;
+
+        rdcpair<int32_t, int32_t> previewDims = g_overlayOut->GetDimensions();
+        int32_t outWidth = previewDims.first > 0 ? previewDims.first : (int32_t)texWidth;
+        int32_t outHeight = previewDims.second > 0 ? previewDims.second : (int32_t)texHeight;
+        const float xScale = texWidth > 0 ? (float)outWidth / (float)texWidth : 1.0f;
+        const float yScale = texHeight > 0 ? (float)outHeight / (float)texHeight : 1.0f;
+        display.scale = (xScale < yScale ? xScale : yScale) * 0.9f;
+        if (!(display.scale > 0.0f)) {
+            display.scale = 1.0f;
+        }
+        display.xOffset = ((float)outWidth - (float)texWidth * display.scale) * 0.5f;
+        display.yOffset = ((float)outHeight - (float)texHeight * display.scale) * 0.5f;
+    };
+
+    ResourceId previewId = requestedPreviewRid != 0 ? u64ToResId(requestedPreviewRid) : ResourceId();
     bool isDepthPreview = false;
-    std::string label = "Current Draw Preview";
-    for (size_t i = 0; i < action->outputs.size(); i++) {
-        if (action->outputs[i] != ResourceId()) {
-            previewId = action->outputs[i];
-            label = "Current Draw Output";
-            break;
+    std::string label = requestedLabel.empty() ? "Current Draw Preview" : requestedLabel;
+    if (previewId == ResourceId()) {
+        for (size_t i = 0; i < action->outputs.size(); i++) {
+            if (action->outputs[i] != ResourceId()) {
+                previewId = action->outputs[i];
+                label = "Current Draw Output";
+                break;
+            }
         }
     }
     if (previewId == ResourceId() && action->depthOut != ResourceId()) {
@@ -2692,24 +2984,131 @@ static json handleGetCurrentDrawPreview(int id, const json &params) {
         return makeError(id, -4, "No current draw output available");
     }
 
+    std::vector<std::pair<ResourceId, std::string>> overlayCandidates;
+
+    if (overlay != DebugOverlay::NoOverlay) {
+        const bool isDrawLikeEvent =
+            (action->flags & (ActionFlags::Drawcall | ActionFlags::MeshDispatch)) != ActionFlags::NoFlags;
+        if (!isDrawLikeEvent) {
+            return makeError(id, -11, "Overlay mode requires a draw event. Select a drawcall event.");
+        }
+
+        const ResourceId requestedOverlayId = requestedOverlayRid != 0 ? u64ToResId(requestedOverlayRid) : ResourceId();
+        const ResourceId liveOverlayTarget = getCurrentColorTargetId();
+
+        std::string firstActionOverlayTarget;
+        std::set<uint64_t> seenOverlayCandidates;
+        auto appendOverlayCandidate = [&](ResourceId resourceId, const std::string &source) {
+            if (resourceId == ResourceId() || !isOverlayCapableResource(resourceId)) {
+                return;
+            }
+            const uint64_t key = resIdToU64(resourceId);
+            if (!seenOverlayCandidates.insert(key).second) {
+                return;
+            }
+            overlayCandidates.push_back({resourceId, source});
+        };
+
+        appendOverlayCandidate(liveOverlayTarget, "live-pipeline");
+        for (size_t i = 0; i < action->outputs.size(); i++) {
+            if (action->outputs[i] == ResourceId()) {
+                continue;
+            }
+            if (firstActionOverlayTarget.empty()) {
+                firstActionOverlayTarget = resIdToString(action->outputs[i]);
+            }
+            appendOverlayCandidate(action->outputs[i], "action-output");
+        }
+        appendOverlayCandidate(requestedOverlayId, "requested");
+        appendOverlayCandidate(previewId, "preview");
+
+        const TextureDescription *preferredOverlayTex = textureFor(
+            requestedOverlayId != ResourceId() ? requestedOverlayId : previewId);
+        struct ScoredOverlayCandidate {
+            ResourceId resourceId;
+            int score;
+        };
+        std::vector<ScoredOverlayCandidate> scannedOverlayCandidates;
+        for (size_t i = 0; i < textures.size(); i++) {
+            const TextureDescription &tex = textures[i];
+            if (!isOverlayCapableResource(tex.resourceId)) {
+                continue;
+            }
+
+            int score = 0;
+            if ((tex.creationFlags & TextureCategory::SwapBuffer) != TextureCategory::NoFlags) score += 1000;
+            if (isBackbufferLike(tex.resourceId)) score += 500;
+            const std::string lowerName = lowerString(resNameLookup(tex.resourceId));
+            if (lowerName.find("display") != std::string::npos) score += 60;
+            if (lowerName.find("present") != std::string::npos) score += 40;
+            if (preferredOverlayTex) {
+                if (tex.width != preferredOverlayTex->width || tex.height != preferredOverlayTex->height) {
+                    continue;
+                }
+                score += 250;
+                if ((tex.msSamp > 0 ? tex.msSamp : 1) == (preferredOverlayTex->msSamp > 0 ? preferredOverlayTex->msSamp : 1)) {
+                    score += 50;
+                }
+            }
+            if (score <= 0) {
+                continue;
+            }
+
+            scannedOverlayCandidates.push_back({tex.resourceId, score});
+        }
+        std::sort(scannedOverlayCandidates.begin(), scannedOverlayCandidates.end(),
+                  [](const ScoredOverlayCandidate &lhs, const ScoredOverlayCandidate &rhs) {
+                      return lhs.score > rhs.score;
+                  });
+        for (size_t i = 0; i < scannedOverlayCandidates.size() && i < 8; i++) {
+            appendOverlayCandidate(scannedOverlayCandidates[i].resourceId, "scan");
+        }
+
+        if (!overlayCandidates.empty()) {
+            previewId = overlayCandidates.front().first;
+            isDepthPreview = false;
+            label = "Current Draw Output";
+        }
+
+        std::string overlayCandidateSummary;
+        for (size_t i = 0; i < overlayCandidates.size(); i++) {
+            if (!overlayCandidateSummary.empty()) {
+                overlayCandidateSummary += ",";
+            }
+            overlayCandidateSummary += resIdToString(overlayCandidates[i].first);
+            overlayCandidateSummary += "@";
+            overlayCandidateSummary += overlayCandidates[i].second;
+        }
+
+        fprintf(stderr,
+                "[bridge] overlay target candidates: requested=%s live=%s action=%s chosen=%s source=%s attempts=[%s]\n",
+                requestedOverlayId != ResourceId() ? resIdToString(requestedOverlayId).c_str() : "",
+                liveOverlayTarget != ResourceId() ? resIdToString(liveOverlayTarget).c_str() : "",
+                firstActionOverlayTarget.c_str(),
+                previewId != ResourceId() ? resIdToString(previewId).c_str() : "",
+                !overlayCandidates.empty() ? overlayCandidates.front().second.c_str() : "none",
+                overlayCandidateSummary.c_str());
+
+        if (overlayCandidates.empty()) {
+            return makeError(id, -11, "Overlay mode requires a color render target at the selected draw event.");
+        }
+    }
+
     uint32_t width = 0, height = 0, samples = 1;
     ResourceFormatType fmtType = ResourceFormatType::Undefined;
     CompType compType = CompType::Typeless;
     std::string format;
-    for (size_t i = 0; i < textures.size(); i++) {
-        if (textures[i].resourceId == previewId) {
-            width = textures[i].width;
-            height = textures[i].height;
-            samples = textures[i].msSamp > 0 ? textures[i].msSamp : 1;
-            fmtType = textures[i].format.type;
-            compType = textures[i].format.compType;
-            format = formatToStr(textures[i].format);
-            break;
-        }
-    }
-    if (width == 0 || height == 0) {
+    if (!queryPreviewTextureInfo(previewId, width, height, samples, fmtType, compType, format) || width == 0 || height == 0) {
         return makeError(id, -5, "Preview texture not found");
     }
+
+    fprintf(stderr,
+            "[bridge] getCurrentDrawPreview: eventId=%u overlay=%s resource=%s size=%ux%u\n",
+            eventId,
+            normalizedOverlayMode.c_str(),
+            resIdToString(previewId).c_str(),
+            width,
+            height);
 
     const bool isDepthFormat = isDepthPreview ||
                                (compType == CompType::Depth) ||
@@ -2719,67 +3118,91 @@ static json handleGetCurrentDrawPreview(int id, const json &params) {
                                (fmtType == ResourceFormatType::S8);
 
     std::vector<uint8_t> pngData;
-    if (!g_overlayOut) {
-        WindowingData win = createPreviewWindowingData((int32_t)width, (int32_t)height);
-        g_overlayOut = g_replay->CreateOutput(win, ReplayOutputType::Texture);
-        if (!g_overlayOut) return makeError(id, -6, "CreateOutput returned null");
-        syncReplayOutputsToCurrentEvent();
-        g_overlayW = (int32_t)width;
-        g_overlayH = (int32_t)height;
-    }
-
-    if (g_overlayW != (int32_t)width || g_overlayH != (int32_t)height) {
-        g_overlayOut->Shutdown();
-        WindowingData win = createPreviewWindowingData((int32_t)width, (int32_t)height);
-        g_overlayOut = g_replay->CreateOutput(win, ReplayOutputType::Texture);
-        if (!g_overlayOut) return makeError(id, -6, "CreateOutput returned null");
-        syncReplayOutputsToCurrentEvent();
-        g_overlayW = (int32_t)width;
-        g_overlayH = (int32_t)height;
-    }
+    if (!ensurePreviewOutput(width, height)) return makeError(id, -6, "CreateOutput returned null");
 
     TextureDisplay disp = {};
-    disp.resourceId = previewId;
-    disp.typeCast = CompType::Typeless;
-    if (isDepthFormat) {
-        disp.red = (channelExtract < 0 || channelExtract == 0);
-        disp.green = (channelExtract == 1);
-        disp.blue = false;
-        disp.alpha = false;
-        if (!disp.red && !disp.green) {
-            disp.red = true;
+    configureTextureDisplay(disp, previewId, isDepthFormat, width, height, samples);
+
+    ResourceId overlayTexId = ResourceId();
+    if (overlay != DebugOverlay::NoOverlay) {
+        for (size_t i = 0; i < overlayCandidates.size(); i++) {
+            const ResourceId candidateId = overlayCandidates[i].first;
+            const std::string &candidateSource = overlayCandidates[i].second;
+
+            uint32_t candidateWidth = 0, candidateHeight = 0, candidateSamples = 1;
+            ResourceFormatType candidateFmtType = ResourceFormatType::Undefined;
+            CompType candidateCompType = CompType::Typeless;
+            std::string candidateFormat;
+            if (!queryPreviewTextureInfo(candidateId, candidateWidth, candidateHeight, candidateSamples,
+                                         candidateFmtType, candidateCompType, candidateFormat) ||
+                candidateWidth == 0 || candidateHeight == 0) {
+                fprintf(stderr,
+                        "[bridge] overlay candidate skipped: resource=%s source=%s reason=missing-texture\n",
+                        resIdToString(candidateId).c_str(),
+                        candidateSource.c_str());
+                continue;
+            }
+
+            const bool candidateDepthFormat =
+                (candidateCompType == CompType::Depth) ||
+                (candidateFmtType == ResourceFormatType::D16S8) ||
+                (candidateFmtType == ResourceFormatType::D24S8) ||
+                (candidateFmtType == ResourceFormatType::D32S8) ||
+                (candidateFmtType == ResourceFormatType::S8);
+            if (candidateDepthFormat) {
+                fprintf(stderr,
+                        "[bridge] overlay candidate skipped: resource=%s source=%s reason=depth-format\n",
+                        resIdToString(candidateId).c_str(),
+                        candidateSource.c_str());
+                continue;
+            }
+
+            if (!ensurePreviewOutput(candidateWidth, candidateHeight)) {
+                return makeError(id, -6, "CreateOutput returned null");
+            }
+
+            configureTextureDisplay(disp, candidateId, false, candidateWidth, candidateHeight, candidateSamples);
+            g_overlayOut->SetTextureDisplay(disp);
+
+            overlayTexId = g_overlayOut->GetDebugOverlayTexID();
+            fprintf(stderr,
+                    "[bridge] overlay candidate attempt: resource=%s source=%s size=%ux%u overlay=%s result=%s\n",
+                    resIdToString(candidateId).c_str(),
+                    candidateSource.c_str(),
+                    candidateWidth,
+                    candidateHeight,
+                    normalizedOverlayMode.c_str(),
+                    overlayTexId != ResourceId() ? resIdToString(overlayTexId).c_str() : "");
+
+            if (overlayTexId != ResourceId()) {
+                previewId = candidateId;
+                width = candidateWidth;
+                height = candidateHeight;
+                samples = candidateSamples;
+                fmtType = candidateFmtType;
+                compType = candidateCompType;
+                format = candidateFormat;
+                break;
+            }
         }
+
+        if (overlayTexId == ResourceId()) {
+            return makeError(id, -12, "RenderDoc did not produce a debug overlay texture for any candidate resource at this event");
+        }
+
+        fprintf(stderr,
+                "[bridge] current draw overlay ready: mode=%s base=%s overlay=%s\n",
+                normalizedOverlayMode.c_str(),
+                resIdToString(previewId).c_str(),
+                resIdToString(overlayTexId).c_str());
     } else {
-        disp.red = (channelExtract < 0 || channelExtract == 0);
-        disp.green = (channelExtract < 0 || channelExtract == 1);
-        disp.blue = (channelExtract < 0 || channelExtract == 2);
-        disp.alpha = (channelExtract == 3);
+        g_overlayOut->SetTextureDisplay(disp);
     }
-    disp.flipY = false;
-    disp.hdrMultiplier = -1.0f;
-    disp.linearDisplayAsGamma = true;
-    disp.rangeMin = 0.0f;
-    disp.rangeMax = 1.0f;
-    disp.subresource = {0, 0, (samples > 1 && !isDepthFormat) ? TextureDisplay::ResolveSamples : 0u};
-    disp.overlay = DebugOverlay::NoOverlay;
-    disp.rawOutput = false;
-    disp.backgroundColor = FloatVector(0, 0, 0, 0);
-    disp.xOffset = 0.0f;
-    disp.yOffset = 0.0f;
 
-    rdcpair<int32_t, int32_t> previewDims = g_overlayOut->GetDimensions();
-    int32_t outWidth = previewDims.first > 0 ? previewDims.first : (int32_t)width;
-    int32_t outHeight = previewDims.second > 0 ? previewDims.second : (int32_t)height;
-    const float xScale = width > 0 ? (float)outWidth / (float)width : 1.0f;
-    const float yScale = height > 0 ? (float)outHeight / (float)height : 1.0f;
-    disp.scale = (xScale < yScale ? xScale : yScale) * 0.9f;
-    if (!(disp.scale > 0.0f)) {
-        disp.scale = 1.0f;
-    }
-    disp.xOffset = ((float)outWidth - (float)width * disp.scale) * 0.5f;
-    disp.yOffset = ((float)outHeight - (float)height * disp.scale) * 0.5f;
+    rdcpair<int32_t, int32_t> previewDims = {};
+    int32_t outWidth = 0;
+    int32_t outHeight = 0;
 
-    g_overlayOut->SetTextureDisplay(disp);
     g_overlayOut->Display();
     bytebuf pixels = g_overlayOut->ReadbackOutputTexture();
     if (pixels.empty()) {
@@ -2838,6 +3261,7 @@ static json handleGetCurrentDrawPreview(int id, const json &params) {
     result["texFormat"] = format;
     result["resourceId"] = resIdToString(previewId);
     result["label"] = label;
+    result["overlayMode"] = normalizedOverlayMode;
     return makeResult(id, result);
 }
 
@@ -3933,10 +4357,27 @@ static json handleGetDrawcallOverlay(int id, const json &params) {
     // Seek to the requested event so pipeline state reflects the draw.
     g_replay->SetFrameEvent(eventId, true);
 
-    // Locate the first bound color render target at this event.
+    const rdcarray<ActionDescription> &actions = g_replay->GetRootActions();
+    const ActionDescription *action = findReplayActionByEventId(actions, eventId);
+    if (!action)
+        return makeError(id, -3, "Action not found for event");
+
+    if ((action->flags & (ActionFlags::Drawcall | ActionFlags::MeshDispatch)) == ActionFlags::NoFlags)
+        return makeError(id, -4, "Highlight Drawcall requires a draw event.");
+
+    // Prefer the live pipeline target because RenderDoc overlay generation
+    // requires the resource to still be recognised as the current render output.
     ResourceId rtId = getCurrentColorTargetId();
+    if (rtId == ResourceId()) {
+        for (size_t i = 0; i < action->outputs.size(); i++) {
+            if (action->outputs[i] != ResourceId()) {
+                rtId = action->outputs[i];
+                break;
+            }
+        }
+    }
     if (rtId == ResourceId())
-        return makeError(id, -3, "No color render target bound at this event");
+        return makeError(id, -5, "No color render target bound at this event");
 
     // Look up dimensions/samples of the RT.
     const rdcarray<TextureDescription> &textures = g_replay->GetTextures();
@@ -3951,18 +4392,18 @@ static json handleGetDrawcallOverlay(int id, const json &params) {
         }
     }
     if (width == 0 || height == 0)
-        return makeError(id, -4, "Color render target has zero dimensions");
+        return makeError(id, -6, "Color render target has zero dimensions");
 
-    // (Re)create the headless output to match the RT dimensions.
+    // (Re)create the preview output to match the RT dimensions.
     if (!g_overlayOut || g_overlayW != (int32_t)width || g_overlayH != (int32_t)height) {
         if (g_overlayOut) {
             g_overlayOut->Shutdown();
             g_overlayOut = nullptr;
         }
-        WindowingData win = CreateHeadlessWindowingData((int32_t)width, (int32_t)height);
+        WindowingData win = createPreviewWindowingData((int32_t)width, (int32_t)height);
         g_overlayOut = g_replay->CreateOutput(win, ReplayOutputType::Texture);
         if (!g_overlayOut)
-            return makeError(id, -5, "CreateOutput(headless) returned null");
+            return makeError(id, -7, "CreateOutput(headless) returned null");
         syncReplayOutputsToCurrentEvent();
         g_overlayW = (int32_t)width;
         g_overlayH = (int32_t)height;
@@ -3984,11 +4425,20 @@ static json handleGetDrawcallOverlay(int id, const json &params) {
     disp.overlay              = DebugOverlay::Drawcall;
 
     g_overlayOut->SetTextureDisplay(disp);
+
+    ResourceId overlayTexId = g_overlayOut->GetDebugOverlayTexID();
+    if (overlayTexId == ResourceId())
+        return makeError(id, -8, "RenderDoc did not produce a drawcall overlay texture for this event");
+
+    fprintf(stderr, "[bridge] drawcall overlay ready: base=%s overlay=%s\n",
+            resIdToString(rtId).c_str(),
+            resIdToString(overlayTexId).c_str());
+
     g_overlayOut->Display();
 
     bytebuf pixels = g_overlayOut->ReadbackOutputTexture();
     if (pixels.empty())
-        return makeError(id, -6, "ReadbackOutputTexture returned empty buffer");
+        return makeError(id, -9, "ReadbackOutputTexture returned empty buffer");
 
     // ReadbackOutputTexture returns tightly packed RGB 3-byte data.
     const int comp = 3;
@@ -3996,14 +4446,14 @@ static json handleGetDrawcallOverlay(int id, const json &params) {
     if ((size_t)stride * height != pixels.size()) {
         fprintf(stderr, "[bridge] overlay readback size mismatch: got %zu, expected %d\n",
                 pixels.size(), stride * (int)height);
-        return makeError(id, -7, "Overlay readback size mismatch");
+        return makeError(id, -10, "Overlay readback size mismatch");
     }
 
     std::vector<uint8_t> pngData;
     if (!stbi_write_png_to_func(stbiWriteToVector, &pngData,
                                  (int)width, (int)height, comp,
                                  pixels.data(), stride)) {
-        return makeError(id, -8, "PNG encode of overlay failed");
+        return makeError(id, -11, "PNG encode of overlay failed");
     }
 
     fprintf(stderr, "[bridge] overlay ready: %zu PNG bytes, %ux%u\n",
@@ -4086,12 +4536,7 @@ static std::string sdLeafToStr(const SDObject *o) {
             // For enums, SDObject stores the stringized value in data.str
             return o->AsString().c_str();
         case SDBasic::Resource: {
-            ResourceId rid;
-            uint64_t raw = o->AsUInt64();
-            memcpy(&rid, &raw, sizeof(rid));
-            std::string nm = resNameLookup(rid);
-            if (!nm.empty()) return nm;
-            return std::string("Resource ") + std::to_string(raw);
+            return resIdToString(o->AsResourceId());
         }
         case SDBasic::Array:
             return std::string("[") + std::to_string(o->NumChildren()) + "]";

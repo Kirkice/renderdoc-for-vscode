@@ -7,15 +7,6 @@ export interface ApiChunk {
     params: string;
 }
 
-/**
- * Sidebar TreeView mirroring RenderDoc's "API Inspector" — when the user
- * clicks a draw call in the Event Browser, this pane lists the underlying
- * API calls (glBindBuffer, glDrawElements, vkCmdDraw, …) that make up that
- * event, rendered as a flat sequence sorted by their own EID.
- *
- * Data is fetched lazily via `RenderDocBridge.nativeGetEventChunks`; if the
- * native bridge isn't available we just show a welcome message.
- */
 export class ApiInspectorProvider implements vscode.TreeDataProvider<ApiCallItem> {
     private readonly _onDidChangeTreeData = new vscode.EventEmitter<ApiCallItem | undefined>();
     readonly onDidChangeTreeData = this._onDidChangeTreeData.event;
@@ -28,7 +19,6 @@ export class ApiInspectorProvider implements vscode.TreeDataProvider<ApiCallItem
 
     constructor(private readonly bridge: RenderDocBridge) {}
 
-    /** Called when the user selects a draw call in the Event Browser. */
     async setEvent(eventId: number, label?: string): Promise<void> {
         this.currentEventId = eventId;
         this.currentLabel = label;
@@ -46,9 +36,6 @@ export class ApiInspectorProvider implements vscode.TreeDataProvider<ApiCallItem
 
         try {
             const res = await this.bridge.nativeGetEventChunks(eventId);
-            // Sort by eventId to give a deterministic RenderDoc-style order
-            // (the native side already returns them in action-order but the
-            // user expects strict ascending EID).
             this.chunks = (res.chunks || []).slice().sort((a, b) => a.eventId - b.eventId);
         } catch (e: any) {
             this.errorText = e?.message || String(e);
@@ -58,7 +45,6 @@ export class ApiInspectorProvider implements vscode.TreeDataProvider<ApiCallItem
         }
     }
 
-    /** Forget the current selection (e.g. when a capture is closed). */
     clear(): void {
         this.currentEventId = undefined;
         this.currentLabel = undefined;

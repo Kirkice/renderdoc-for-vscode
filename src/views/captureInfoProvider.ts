@@ -8,6 +8,7 @@ interface ReplayDetails {
     hostUrl?: string;
     hint?: string;
     recommendRemote?: boolean;
+    allowReplayPromptReset?: boolean;
 }
 
 export class CaptureInfoProvider implements vscode.TreeDataProvider<CaptureInfoItem> {
@@ -58,7 +59,6 @@ export class CaptureInfoProvider implements vscode.TreeDataProvider<CaptureInfoI
             return [];
         }
 
-        // Root level
         if (!element) {
             const items: CaptureInfoItem[] = [
                 new CaptureInfoItem('File', this.captureInfo.filePath, vscode.TreeItemCollapsibleState.None, 'file'),
@@ -69,7 +69,6 @@ export class CaptureInfoProvider implements vscode.TreeDataProvider<CaptureInfoI
                 new CaptureInfoItem('Timestamp', this.captureInfo.timestamp, vscode.TreeItemCollapsibleState.None, 'calendar'),
             ];
 
-            // Replay status indicator
             if (this.replayStatus === 'active') {
                 items.push(new CaptureInfoItem(
                     'Replay',
@@ -114,6 +113,19 @@ export class CaptureInfoProvider implements vscode.TreeDataProvider<CaptureInfoI
                 ));
             }
 
+            if (this.replayDetails.allowReplayPromptReset) {
+                items.push(new CaptureInfoItem(
+                    'Preference',
+                    'Re-enable Remote Replay Prompts',
+                    vscode.TreeItemCollapsibleState.None,
+                    'settings-gear',
+                    {
+                        command: 'renderdoc.enableRemoteReplayPrompts',
+                        title: 'Re-enable Remote Replay Prompts',
+                    }
+                ));
+            }
+
             if (this.captureInfo.sections && this.captureInfo.sections.length > 0) {
                 items.push(new CaptureInfoItem(
                     'Sections',
@@ -125,7 +137,6 @@ export class CaptureInfoProvider implements vscode.TreeDataProvider<CaptureInfoI
             return items;
         }
 
-        // Sections children
         if (element.label === 'Sections' && this.captureInfo.sections) {
             return this.captureInfo.sections.map(s =>
                 new CaptureInfoItem(
