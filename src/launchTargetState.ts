@@ -39,10 +39,11 @@ export class LaunchTargetState {
     }
 
     getSelectedTarget(): CaptureLaunchTarget | undefined {
-        if (this.selected.kind !== 'device') {
+        const selected = this.selected;
+        if (selected.kind !== 'device') {
             return undefined;
         }
-        return this.devices.find((target) => target.url === this.selected.url);
+        return this.devices.find((target) => target.url === selected.url);
     }
 
     getLiveTarget(): LiveTargetInfo | undefined {
@@ -104,7 +105,8 @@ export class LaunchTargetState {
         }
 
         this.devices = nextDevices;
-        if (this.selected.kind === 'device' && !this.devices.some((target) => target.url === this.selected.url)) {
+        const selected = this.selected;
+        if (selected.kind === 'device' && !this.devices.some((target) => target.url === selected.url)) {
             this.selected = { kind: 'local' };
             await this.context.workspaceState.update(STATE_KEY, undefined);
         }

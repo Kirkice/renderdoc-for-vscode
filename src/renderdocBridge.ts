@@ -376,6 +376,9 @@ export class RenderDocBridge {
      * Checks: 1) user-configured path, 2) common install locations, 3) PATH
      */
     async checkAvailability(): Promise<boolean> {
+        this.renderdocPath = undefined;
+        this.renderdocCmd = undefined;
+
         // 1. Check user-configured path
         const config = vscode.workspace.getConfiguration('renderdoc');
         const configuredPath = config.get<string>('installPath');
@@ -767,6 +770,7 @@ export class RenderDocBridge {
     // ═══════════════════════════════════════════════════════════════════
 
     private nativeProcess: cp.ChildProcess | undefined;
+    private nativeBridgeRenderdocPath: string | undefined;
     private nativeRequestId = 0;
     private nativePendingRequests = new Map<number, { method: string; resolve: (v: unknown) => void; reject: (e: BridgeError) => void }>();
     private nativeOutputBuffer = '';
@@ -858,6 +862,7 @@ export class RenderDocBridge {
                 // requests queued against the new bridge.
                 if (this.nativeProcess !== child) { return; }
                 this.nativeProcess = undefined;
+                this.nativeBridgeRenderdocPath = undefined;
                 this.nativeFeatureSupport.clear();
                 // Reject all pending requests
                 for (const [, pending] of this.nativePendingRequests) {
@@ -870,6 +875,7 @@ export class RenderDocBridge {
                 console.error('[RenderDoc] Native bridge spawn error:', err.message);
                 if (this.nativeProcess !== child) { return; }
                 this.nativeProcess = undefined;
+                this.nativeBridgeRenderdocPath = undefined;
             });
 
             // Initialize with RenderDoc path
@@ -887,6 +893,7 @@ export class RenderDocBridge {
             try { this.nativeProcess.kill(); } catch { /* ignore */ }
             this.nativeProcess = undefined;
         }
+        this.nativeBridgeRenderdocPath = undefined;
         this.nativeFeatureSupport.clear();
         for (const [, pending] of this.nativePendingRequests) {
             pending.reject(new BridgeError('restarting', 'Native bridge restarting', { method: pending.method }));
@@ -1057,16 +1064,14 @@ export class RenderDocBridge {
     }
 
     async ensureNativeBridgeReady(): Promise<void> {
-        if (!this.renderdocPath) {
-            const available = await this.checkAvailability();
-            if (!available || !this.renderdocPath) {
-                throw new Error('RenderDoc not found. Please install RenderDoc or configure the path.');
-            }
+        const available = await this.checkAvailability();
+        if (!available || !this.renderdocPath) {
+            throw new Error('RenderDoc not found. Please install RenderDoc or configure the path.');
         }
 
         if (!this.hasNativeBridge()) {
             this.tryStartNativeBridge();
-        } else if (!(await this.nativePing())) {
+        } else if (this.nativeBridgeRenderdocPath !== this.renderdocPath || !(await this.nativePing())) {
             this.restartNativeBridge();
         }
 
@@ -1075,6 +1080,7 @@ export class RenderDocBridge {
         }
 
         await this.nativeCallT('init', InitResponse, { renderdocPath: this.renderdocPath });
+        this.nativeBridgeRenderdocPath = this.renderdocPath;
     }
 
     /** Open a capture in the native replay controller */

@@ -13,6 +13,7 @@ import {
     LaunchCaptureOptions,
     LaunchCaptureResult,
     ResourceInfo,
+    TriggerCaptureResult,
     TriggerCaptureOptions,
     LiveCaptureEntry,
 } from './types';
@@ -1122,7 +1123,8 @@ async function clearSavedCaptures(context: vscode.ExtensionContext) {
     }
     await forgetSavedCapturePaths(context, filePaths);
 
-    if (currentCapturePath && filePaths.some((filePath) => path.normalize(filePath) === path.normalize(currentCapturePath))) {
+    const activeCapturePath = currentCapturePath;
+    if (activeCapturePath && filePaths.some((filePath) => path.normalize(filePath) === path.normalize(activeCapturePath))) {
         closeCapture();
     }
 
@@ -1455,192 +1457,6 @@ async function promptForPositiveNumber(
     }
 
     return Number(value);
-}
-
-async function chooseLaunchTarget(deviceTargets: CaptureLaunchTarget[]): Promise<
-    | { kind: 'local' }
-    | { kind: 'device'; target: CaptureLaunchTarget }
-    | undefined
-> {
-    const items: Array<vscode.QuickPickItem & {
-        kindValue: 'local' | 'device';
-        target?: CaptureLaunchTarget;
-    }> = [];
-
-    if (process.platform === 'win32') {
-        items.push({
-            label: 'Windows Local',
-            description: 'Launch an executable on this machine and capture a frame',
-            kindValue: 'local',
-        });
-    }
-
-    for (const target of deviceTargets) {
-        const suffix = target.supported ? '' : 'unsupported by RenderDoc on this device';
-        items.push({
-            label: target.name || target.id,
-            description: target.url,
-            detail: suffix || `Protocol: ${target.protocol}`,
-            kindValue: 'device',
-            target,
-        });
-    }
-
-    if (items.length === 0) {
-        vscode.window.showWarningMessage('No launch targets are available.');
-        return undefined;
-    }
-
-    const choice = await vscode.window.showQuickPick(items, {
-        title: 'Launch And Capture',
-        placeHolder: 'Choose where to launch the target program',
-    });
-
-    if (!choice) {
-        return undefined;
-    }
-
-    if (choice.kindValue === 'local') {
-        return { kind: 'local' };
-    }
-
-    return choice.target ? { kind: 'device', target: choice.target } : undefined;
-}
-
-async function collectLaunchCaptureOptions(
-    context: vscode.ExtensionContext,
-): Promise<LaunchCaptureOptions | undefined> {
-    const stored = (context.workspaceState.get<StoredLaunchCaptureState>(LAST_LAUNCH_CAPTURE_STATE_KEY) || {});
-
-    await bridge.ensureNativeBridgeReady();
-
-    let deviceTargets: CaptureLaunchTarget[] = [];
-    try {
-        deviceTargets = await bridge.nativeListCaptureTargets();
-    } catch (err: any) {
-        console.warn('[RenderDoc] listCaptureTargets failed:', err?.message);
-    }
-
-    const selected = await chooseLaunchTarget(deviceTargets);
-    if (!selected) {
-        return undefined;
-    }
-
-    if (selected.kind === 'device' && !selected.target.supported) {
-        const action = await vscode.window.showWarningMessage(
-            `RenderDoc reports that ${selected.target.name} may not support capture/replay. Continue anyway?`,
-            'Continue',
-            'Cancel',
-        );
-        if (action !== 'Continue') {
-            return undefined;
-        }
-    }
-
-    let executable = '';
-    let workingDir = stored.workingDir || '';
-
-    if (selected.kind === 'local') {
-        const uris = await vscode.window.showOpenDialog({
-            canSelectFiles: true,
-            canSelectFolders: false,
-            canSelectMany: false,
-            title: 'Choose Windows Executable To Launch',
-            defaultUri: stored.executable ? vscode.Uri.file(stored.executable) : undefined,
-            filters: { Executable: ['exe'] },
-        });
-        if (!uris || uris.length === 0) {
-            return undefined;
-        }
-        executable = uris[0].fsPath;
-        const workingDirInput = await vscode.window.showInputBox({
-            title: 'Working Directory',
-            prompt: 'Working directory for the launched process',
-            value: stored.workingDir || path.dirname(executable),
-        });
-        if (workingDirInput === undefined) {
-            return undefined;
-        }
-        workingDir = workingDirInput;
-    } else {
-        const remoteTarget = isAndroidLikeTarget(selected.target)
-            ? await chooseAndroidPackageActivity(selected.target, stored.executable || '')
-            : await vscode.window.showInputBox({
-                title: 'Remote Target Identifier',
-                prompt: 'Package/activity or other launch identifier understood by the selected device protocol',
-                placeHolder: 'com.example.game/.MainActivity',
-                value: stored.executable || '',
-                validateInput: (input) => input.trim() ? undefined : 'Enter a remote target identifier.',
-            });
-        if (remoteTarget === undefined) {
-            return undefined;
-        }
-        executable = remoteTarget;
-        workingDir = '';
-    }
-
-    const cmdLine = await vscode.window.showInputBox({
-        title: 'Launch Arguments',
-        prompt: 'Command-line arguments passed to the target program',
-        placeHolder: '--scene test --width 1920 --height 1080',
-        value: stored.cmdLine || '',
-    });
-
-    if (cmdLine === undefined) {
-        return undefined;
-    }
-
-    const outputDir = await promptForCaptureOutputDir(executable, stored.outputDir);
-    if (!outputDir) {
-        return undefined;
-    }
-
-    const triggerOptions = await promptForCaptureTrigger(stored);
-    if (!triggerOptions) {
-        return undefined;
-    }
-
-    const captureStem = buildCaptureStem(executable);
-    const captureOptions: LaunchCaptureOptions = {
-        url: selected.kind === 'device' ? selected.target.url : '',
-        executable,
-        workingDir,
-        cmdLine,
-        captureFileTemplate: path.join(outputDir, captureStem),
-        localCopyPath: path.join(outputDir, `${captureStem}_${Date.now()}.rdc`),
-        ...triggerOptions,
-    };
-
-    await context.workspaceState.update(LAST_LAUNCH_CAPTURE_STATE_KEY, {
-        targetKind: selected.kind,
-        targetUrl: selected.kind === 'device' ? selected.target.url : '',
-        executable,
-        workingDir,
-        cmdLine,
-        outputDir,
-        trigger: triggerOptions.trigger,
-        frameNumber: triggerOptions.frameNumber,
-        delaySeconds: triggerOptions.delaySeconds,
-    } satisfies StoredLaunchCaptureState);
-
-    return captureOptions;
-}
-
-async function launchProgramAndCapture(context: vscode.ExtensionContext) {
-    try {
-        const options = await collectLaunchCaptureOptions(context);
-        if (!options) {
-            return;
-        }
-        const result = await runCaptureWithProgress('RenderDoc — Launch And Capture', () => bridge.nativeLaunchCapture(options));
-        await loadCapture(context, result.capturePath);
-        const targetLabel = options.url ? options.url : 'local machine';
-        vscode.window.showInformationMessage(
-            `RenderDoc: captured frame ${result.frameNumber ?? '?'} from ${result.target || targetLabel}.`
-        );
-    } catch (err: any) {
-        vscode.window.showErrorMessage(`RenderDoc: launch and capture failed - ${err?.message || err}`);
-    }
 }
 
 function getLaunchFormState(context: vscode.ExtensionContext): LaunchFormState {
