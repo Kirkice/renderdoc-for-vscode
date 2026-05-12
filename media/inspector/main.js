@@ -2397,6 +2397,9 @@
             case 'wireframe': return 'Wireframe Mesh';
             case 'depth': return 'Depth Test';
             case 'stencil': return 'Stencil Test';
+            case 'backfacecull': return 'Backface Cull';
+            case 'viewportscissor': return 'Viewport/Scissor Region';
+            case 'nan': return 'NaN/INF/-ve Display';
             default: return 'None';
         }
     }
@@ -2596,6 +2599,9 @@
             { value: 'wireframe', label: 'Wireframe Mesh' },
             { value: 'depth', label: 'Depth Test' },
             { value: 'stencil', label: 'Stencil Test' },
+            { value: 'backfacecull', label: 'Backface Cull' },
+            { value: 'viewportscissor', label: 'Viewport/Scissor Region' },
+            { value: 'nan', label: 'NaN/INF/-ve Display' },
         ].map(opt =>
             '<option value="' + opt.value + '"' + (overlayMode === opt.value ? ' selected' : '') + '>' + esc(opt.label) + '</option>'
         ).join('');

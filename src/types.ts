@@ -183,4 +183,12 @@ export interface ThumbnailData {
     format: string;     // "jpg" | "png" | "bmp"
 }
 
-export type TextureOverlayMode = 'none' | 'drawcall' | 'wireframe' | 'depth' | 'stencil';
+export type TextureOverlayMode =
+    | 'none'
+    | 'drawcall'
+    | 'wireframe'
+    | 'depth'
+    | 'stencil'
+    | 'backfacecull'
+    | 'viewportscissor'
+    | 'nan';

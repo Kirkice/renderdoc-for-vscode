@@ -102,6 +102,18 @@ static DebugOverlay parseTextureOverlayMode(const std::string &mode, bool &ok, s
         ok = true;
         return DebugOverlay::Stencil;
     }
+    if (normalizedMode == "backfacecull") {
+        ok = true;
+        return DebugOverlay::BackfaceCull;
+    }
+    if (normalizedMode == "viewportscissor") {
+        ok = true;
+        return DebugOverlay::ViewportScissor;
+    }
+    if (normalizedMode == "nan") {
+        ok = true;
+        return DebugOverlay::NaN;
+    }
 
     ok = false;
     return DebugOverlay::NoOverlay;
@@ -2821,6 +2833,9 @@ static json handleGetCurrentDrawPreview(int id, const json &params) {
     if (!overlayModeValid) {
         return makeError(id, -10, "Unsupported overlay mode: " + requestedOverlayMode);
     }
+    const bool overlayUsesInlineDisplay = overlay == DebugOverlay::NaN;
+    const bool overlayNeedsOutputRegionRemap =
+        !overlayUsesInlineDisplay && overlay != DebugOverlay::ViewportScissor;
 
     if (eventId == 0) {
         const rdcarray<ActionDescription> &actions = g_replay->GetRootActions();
@@ -3360,6 +3375,27 @@ static json handleGetCurrentDrawPreview(int id, const json &params) {
                 return makeError(id, -6, "CreateOutput returned null");
             }
 
+            if (overlayUsesInlineDisplay) {
+                overlaySourceId = candidateId;
+                displayPreviewId = candidateId;
+                displayWidth = candidateWidth;
+                displayHeight = candidateHeight;
+                displaySamples = candidateSamples;
+                displayFmtType = candidateFmtType;
+                displayCompType = candidateCompType;
+                displayFormat = candidateFormat;
+                displayIsDepthFormat = false;
+
+                fprintf(stderr,
+                        "[bridge] inline overlay candidate selected: resource=%s source=%s size=%ux%u overlay=%s\n",
+                        resIdToString(candidateId).c_str(),
+                        candidateSource.c_str(),
+                        candidateWidth,
+                        candidateHeight,
+                        normalizedOverlayMode.c_str());
+                break;
+            }
+
             configureTextureDisplay(disp, candidateId, false, candidateWidth, candidateHeight, candidateSamples);
             g_overlayOut->SetTextureDisplay(disp);
 
@@ -3387,16 +3423,24 @@ static json handleGetCurrentDrawPreview(int id, const json &params) {
             }
         }
 
-        if (overlayTexId == ResourceId()) {
+        if (!overlayUsesInlineDisplay && overlayTexId == ResourceId()) {
             return makeError(id, -12, "RenderDoc did not produce a debug overlay texture for any candidate resource at this event");
         }
 
-        fprintf(stderr,
-                "[bridge] current draw overlay ready: mode=%s preview=%s base=%s overlay=%s\n",
-                normalizedOverlayMode.c_str(),
-                resIdToString(previewId).c_str(),
-                resIdToString(displayPreviewId).c_str(),
-                resIdToString(overlayTexId).c_str());
+        if (overlayUsesInlineDisplay) {
+            fprintf(stderr,
+                    "[bridge] current draw inline overlay ready: mode=%s preview=%s base=%s\n",
+                    normalizedOverlayMode.c_str(),
+                    resIdToString(previewId).c_str(),
+                    resIdToString(displayPreviewId).c_str());
+        } else {
+            fprintf(stderr,
+                    "[bridge] current draw overlay ready: mode=%s preview=%s base=%s overlay=%s\n",
+                    normalizedOverlayMode.c_str(),
+                    resIdToString(previewId).c_str(),
+                    resIdToString(displayPreviewId).c_str(),
+                    resIdToString(overlayTexId).c_str());
+        }
 
         if (displayPreviewId != previewId) {
             width = displayWidth;
@@ -3457,141 +3501,169 @@ static json handleGetCurrentDrawPreview(int id, const json &params) {
     if (overlay != DebugOverlay::NoOverlay) {
         TextureDisplay baseDisp = {};
         configureTextureDisplay(baseDisp, displayPreviewId, displayIsDepthFormat, width, height, samples);
-        baseDisp.overlay = DebugOverlay::NoOverlay;
-        g_overlayOut->SetTextureDisplay(baseDisp);
-
-        std::vector<uint8_t> baseRGBA;
-        int32_t baseOutWidth = 0;
-        int32_t baseOutHeight = 0;
-        if (!readCurrentPreviewToRGBA(width,
-                                      height,
-                                      displayIsDepthFormat,
-                                      channelExtract,
-                                      false,
-                                      baseRGBA,
-                                      baseOutWidth,
-                                      baseOutHeight,
-                                      readbackError)) {
-            return makeError(id, -7, readbackError);
-        }
-
-        uint32_t overlayWidth = width;
-        uint32_t overlayHeight = height;
-        uint32_t overlaySamples = samples;
-        ResourceFormatType overlayFmtType = ResourceFormatType::Undefined;
-        CompType overlayCompType = CompType::Typeless;
-        std::string overlayFormat;
-        if (queryPreviewTextureInfo(overlayTexId, overlayWidth, overlayHeight, overlaySamples,
-                        overlayFmtType, overlayCompType, overlayFormat) &&
-            overlayWidth > 0 && overlayHeight > 0 &&
-            (overlayWidth != width || overlayHeight != height)) {
+        if (overlayUsesInlineDisplay) {
             fprintf(stderr,
-                "[bridge] overlay texture dimensions differ, but reusing base display transform: base=%ux%u overlay=%ux%u\n",
+                    "[bridge] rendering inline overlay directly: mode=%s resource=%s size=%ux%u\n",
+                    normalizedOverlayMode.c_str(),
+                    resIdToString(displayPreviewId).c_str(),
+                    width,
+                    height);
+            g_overlayOut->SetTextureDisplay(baseDisp);
+            if (!readCurrentPreviewToRGBA(width,
+                                          height,
+                                          displayIsDepthFormat,
+                                          channelExtract,
+                                          false,
+                                          rgba,
+                                          outWidth,
+                                          outHeight,
+                                          readbackError)) {
+                return makeError(id, -7, readbackError);
+            }
+        } else {
+            baseDisp.overlay = DebugOverlay::NoOverlay;
+            g_overlayOut->SetTextureDisplay(baseDisp);
+
+            std::vector<uint8_t> baseRGBA;
+            int32_t baseOutWidth = 0;
+            int32_t baseOutHeight = 0;
+            if (!readCurrentPreviewToRGBA(width,
+                                          height,
+                                          displayIsDepthFormat,
+                                          channelExtract,
+                                          false,
+                                          baseRGBA,
+                                          baseOutWidth,
+                                          baseOutHeight,
+                                          readbackError)) {
+                return makeError(id, -7, readbackError);
+            }
+
+            uint32_t overlayWidth = width;
+            uint32_t overlayHeight = height;
+            uint32_t overlaySamples = samples;
+            ResourceFormatType overlayFmtType = ResourceFormatType::Undefined;
+            CompType overlayCompType = CompType::Typeless;
+            std::string overlayFormat;
+            if (queryPreviewTextureInfo(overlayTexId, overlayWidth, overlayHeight, overlaySamples,
+                            overlayFmtType, overlayCompType, overlayFormat) &&
+                overlayWidth > 0 && overlayHeight > 0 &&
+                (overlayWidth != width || overlayHeight != height)) {
+                fprintf(stderr,
+                    "[bridge] overlay texture dimensions differ, but reusing base display transform: base=%ux%u overlay=%ux%u\n",
+                    width,
+                    height,
+                    overlayWidth,
+                    overlayHeight);
+            }
+
+            TextureDisplay overlayDisp = baseDisp;
+            overlayDisp.resourceId = overlayTexId;
+            overlayDisp.typeCast = CompType::Typeless;
+            overlayDisp.subresource = baseDisp.subresource;
+            overlayDisp.red = true;
+            overlayDisp.green = true;
+            overlayDisp.blue = true;
+            overlayDisp.alpha = true;
+            overlayDisp.overlay = DebugOverlay::NoOverlay;
+            overlayDisp.customShaderId = ResourceId();
+            overlayDisp.flipY = baseDisp.flipY;
+            float regionX = 0.0f;
+            float regionY = 0.0f;
+            float regionWidth = (float)width;
+            float regionHeight = (float)height;
+            bool usedViewport = false;
+            bool usedScissor = false;
+            if (overlayNeedsOutputRegionRemap) {
+                queryCurrentOutputRegion(width, height, regionX, regionY, regionWidth, regionHeight, usedViewport, usedScissor);
+                const float autoScaleX = overlayWidth > 0 ? regionWidth / (float)overlayWidth : 1.0f;
+                const float autoScaleY = overlayHeight > 0 ? regionHeight / (float)overlayHeight : 1.0f;
+                const float autoScale = (autoScaleX > 0.0f && autoScaleY > 0.0f)
+                    ? std::min(autoScaleX, autoScaleY)
+                    : 1.0f;
+                overlayDisp.scale = baseDisp.scale * autoScale;
+                overlayDisp.xOffset = baseDisp.xOffset + regionX * baseDisp.scale;
+                overlayDisp.yOffset = baseDisp.yOffset + regionY * baseDisp.scale;
+            } else {
+                overlayDisp.scale = baseDisp.scale;
+                overlayDisp.xOffset = baseDisp.xOffset;
+                overlayDisp.yOffset = baseDisp.yOffset;
+            }
+            overlayDisp.hdrMultiplier = -1.0f;
+            overlayDisp.rangeMin = 0.0f;
+            overlayDisp.rangeMax = 1.0f;
+            overlayDisp.linearDisplayAsGamma = false;
+            overlayDisp.backgroundColor = FloatVector(0, 0, 0, 1);
+
+            fprintf(stderr,
+                "[bridge] overlay compositing transform: baseScale=%.4f overlayScale=%.4f baseOffset=(%.2f, %.2f) overlayOffset=(%.2f, %.2f) region=(%.2f, %.2f, %.2f, %.2f) viewport=%d scissor=%d remap=%d base=%ux%u overlay=%ux%u\n",
+                baseDisp.scale,
+                overlayDisp.scale,
+                baseDisp.xOffset,
+                baseDisp.yOffset,
+                overlayDisp.xOffset,
+                overlayDisp.yOffset,
+                regionX,
+                regionY,
+                regionWidth,
+                regionHeight,
+                usedViewport ? 1 : 0,
+                usedScissor ? 1 : 0,
+                overlayNeedsOutputRegionRemap ? 1 : 0,
                 width,
                 height,
                 overlayWidth,
                 overlayHeight);
+
+            g_overlayOut->SetTextureDisplay(overlayDisp);
+
+            std::vector<uint8_t> overlayRGBA;
+            int32_t overlayOutWidth = 0;
+            int32_t overlayOutHeight = 0;
+            if (!readCurrentPreviewToRGBA(width,
+                                          height,
+                                          false,
+                                          -1,
+                                          true,
+                                          overlayRGBA,
+                                          overlayOutWidth,
+                                          overlayOutHeight,
+                                          readbackError)) {
+                return makeError(id, -7, readbackError);
+            }
+
+            TextureDisplay overlayAlphaDisp = overlayDisp;
+            overlayAlphaDisp.red = false;
+            overlayAlphaDisp.green = false;
+            overlayAlphaDisp.blue = false;
+            overlayAlphaDisp.alpha = true;
+            g_overlayOut->SetTextureDisplay(overlayAlphaDisp);
+
+            std::vector<uint8_t> overlayAlphaRGBA;
+            int32_t overlayAlphaOutWidth = 0;
+            int32_t overlayAlphaOutHeight = 0;
+            if (!readCurrentPreviewToRGBA(width,
+                                          height,
+                                          false,
+                                          -1,
+                                          false,
+                                          overlayAlphaRGBA,
+                                          overlayAlphaOutWidth,
+                                          overlayAlphaOutHeight,
+                                          readbackError)) {
+                return makeError(id, -7, readbackError);
+            }
+
+            if (overlayOutWidth != baseOutWidth || overlayOutHeight != baseOutHeight ||
+                overlayAlphaOutWidth != baseOutWidth || overlayAlphaOutHeight != baseOutHeight) {
+                return makeError(id, -8, "Overlay preview dimensions did not match the base preview");
+            }
+
+            compositeRGBAOver(baseRGBA, overlayRGBA, overlayAlphaRGBA);
+            rgba = std::move(baseRGBA);
+            outWidth = baseOutWidth;
+            outHeight = baseOutHeight;
         }
-
-        TextureDisplay overlayDisp = baseDisp;
-        overlayDisp.resourceId = overlayTexId;
-        overlayDisp.typeCast = CompType::Typeless;
-        overlayDisp.subresource = baseDisp.subresource;
-        overlayDisp.red = true;
-        overlayDisp.green = true;
-        overlayDisp.blue = true;
-        overlayDisp.alpha = true;
-        overlayDisp.overlay = DebugOverlay::NoOverlay;
-        overlayDisp.customShaderId = ResourceId();
-        overlayDisp.flipY = baseDisp.flipY;
-        float regionX = 0.0f;
-        float regionY = 0.0f;
-        float regionWidth = (float)width;
-        float regionHeight = (float)height;
-        bool usedViewport = false;
-        bool usedScissor = false;
-        queryCurrentOutputRegion(width, height, regionX, regionY, regionWidth, regionHeight, usedViewport, usedScissor);
-        const float autoScaleX = overlayWidth > 0 ? regionWidth / (float)overlayWidth : 1.0f;
-        const float autoScaleY = overlayHeight > 0 ? regionHeight / (float)overlayHeight : 1.0f;
-        const float autoScale = (autoScaleX > 0.0f && autoScaleY > 0.0f)
-            ? std::min(autoScaleX, autoScaleY)
-            : 1.0f;
-        overlayDisp.scale = baseDisp.scale * autoScale;
-        overlayDisp.xOffset = baseDisp.xOffset + regionX * baseDisp.scale;
-        overlayDisp.yOffset = baseDisp.yOffset + regionY * baseDisp.scale;
-        overlayDisp.hdrMultiplier = -1.0f;
-        overlayDisp.rangeMin = 0.0f;
-        overlayDisp.rangeMax = 1.0f;
-        overlayDisp.linearDisplayAsGamma = false;
-        overlayDisp.backgroundColor = FloatVector(0, 0, 0, 1);
-
-        fprintf(stderr,
-            "[bridge] overlay compositing transform: baseScale=%.4f overlayScale=%.4f baseOffset=(%.2f, %.2f) overlayOffset=(%.2f, %.2f) region=(%.2f, %.2f, %.2f, %.2f) viewport=%d scissor=%d base=%ux%u overlay=%ux%u\n",
-            baseDisp.scale,
-            overlayDisp.scale,
-            baseDisp.xOffset,
-            baseDisp.yOffset,
-            overlayDisp.xOffset,
-            overlayDisp.yOffset,
-            regionX,
-            regionY,
-            regionWidth,
-            regionHeight,
-            usedViewport ? 1 : 0,
-            usedScissor ? 1 : 0,
-            width,
-            height,
-            overlayWidth,
-            overlayHeight);
-
-        g_overlayOut->SetTextureDisplay(overlayDisp);
-
-        std::vector<uint8_t> overlayRGBA;
-        int32_t overlayOutWidth = 0;
-        int32_t overlayOutHeight = 0;
-        if (!readCurrentPreviewToRGBA(width,
-                                      height,
-                                      false,
-                                      -1,
-                                      true,
-                                      overlayRGBA,
-                                      overlayOutWidth,
-                                      overlayOutHeight,
-                                      readbackError)) {
-            return makeError(id, -7, readbackError);
-        }
-
-        TextureDisplay overlayAlphaDisp = overlayDisp;
-        overlayAlphaDisp.red = false;
-        overlayAlphaDisp.green = false;
-        overlayAlphaDisp.blue = false;
-        overlayAlphaDisp.alpha = true;
-        g_overlayOut->SetTextureDisplay(overlayAlphaDisp);
-
-        std::vector<uint8_t> overlayAlphaRGBA;
-        int32_t overlayAlphaOutWidth = 0;
-        int32_t overlayAlphaOutHeight = 0;
-        if (!readCurrentPreviewToRGBA(width,
-                                      height,
-                                      false,
-                                      -1,
-                                      false,
-                                      overlayAlphaRGBA,
-                                      overlayAlphaOutWidth,
-                                      overlayAlphaOutHeight,
-                                      readbackError)) {
-            return makeError(id, -7, readbackError);
-        }
-
-        if (overlayOutWidth != baseOutWidth || overlayOutHeight != baseOutHeight ||
-            overlayAlphaOutWidth != baseOutWidth || overlayAlphaOutHeight != baseOutHeight) {
-            return makeError(id, -8, "Overlay preview dimensions did not match the base preview");
-        }
-
-        compositeRGBAOver(baseRGBA, overlayRGBA, overlayAlphaRGBA);
-        rgba = std::move(baseRGBA);
-        outWidth = baseOutWidth;
-        outHeight = baseOutHeight;
     } else {
         g_overlayOut->SetTextureDisplay(disp);
         if (!readCurrentPreviewToRGBA(width,
