@@ -6,7 +6,9 @@ out/
 dist/
 
 # Native build
-native/build/
+native/build/**
+!native/build/Release/
+!native/build/Release/renderdoc_bridge.exe
 
 # VS Code test
 .vscode-test/

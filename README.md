@@ -197,7 +197,7 @@ Analyze any shader directly from the Inspector's Shaders tab using the **Mali Of
 6. Chat with @renderdoc for deep frame analysis
 ```
 
-> **Requires:** A local RenderDoc installation (for the replay runtime DLL). The extension auto-discovers the default install path; override via **`RenderDoc: Configure RenderDoc Path`** if needed.
+> **Requires:** Either a bundled RenderDoc runtime inside the VSIX or a local RenderDoc installation. The extension first honors **`RenderDoc: Configure RenderDoc Path`**, then tries the bundled `.renderdoc-runtime`, then falls back to the default system install path.
 
 ---
 
@@ -207,7 +207,7 @@ Analyze any shader directly from the Inspector's Shaders tab using the **Mali Of
 
 **Option A — from VSIX (recommended):**
 ```powershell
-code --install-extension renderdoc-for-vscode-0.0.1.vsix
+code --install-extension renderdoc-for-vscode-0.0.5.vsix
 ```
 Or: `Extensions` panel → `···` menu → **Install from VSIX…**
 
@@ -217,7 +217,7 @@ Or: `Extensions` panel → `···` menu → **Install from VSIX…**
 
 ### 2 · Installing RenderDoc (runtime dependency)
 
-The extension loads RenderDoc's replay library (`renderdoc.dll` / `librenderdoc.so`) at runtime. Install the official build — no patched fork needed.
+The extension loads RenderDoc's replay library (`renderdoc.dll` / `librenderdoc.so`) at runtime. If your VSIX already bundles a `.renderdoc-runtime` directory, that runtime is used automatically. Otherwise install RenderDoc locally.
 
 **[renderdoc.org/builds](https://renderdoc.org/builds)** — any stable version **v1.30 or newer**.
 

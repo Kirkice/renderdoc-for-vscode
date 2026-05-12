@@ -371,9 +371,19 @@ export class RenderDocBridge {
         this.downloadedBridgeDir = dir;
     }
 
+    private getExtensionDir(): string {
+        return path.dirname(path.dirname(__filename));
+    }
+
+    private getBundledRenderdocDir(): string | undefined {
+        const bundledDir = path.join(this.getExtensionDir(), '.renderdoc-runtime');
+        return fs.existsSync(bundledDir) ? bundledDir : undefined;
+    }
+
     /**
      * Detects if RenderDoc is available on the system.
-     * Checks: 1) user-configured path, 2) common install locations, 3) PATH
+     * Checks: 1) user-configured path, 2) VSIX-bundled runtime,
+     * 3) common install locations, 4) PATH
      */
     async checkAvailability(): Promise<boolean> {
         this.renderdocPath = undefined;
@@ -387,7 +397,14 @@ export class RenderDocBridge {
             return true;
         }
 
-        // 2. Windows: check common install locations
+        // 2. Check the self-contained runtime bundled with the extension.
+        const bundledPath = this.getBundledRenderdocDir();
+        if (bundledPath && await this.validateRenderdocDir(bundledPath)) {
+            this.renderdocPath = bundledPath;
+            return true;
+        }
+
+        // 3. Windows: check common install locations
         if (process.platform === 'win32') {
             const commonPaths = [
                 path.join(process.env['ProgramFiles'] || 'C:\\Program Files', 'RenderDoc'),
@@ -402,7 +419,7 @@ export class RenderDocBridge {
             }
         }
 
-        // 3. Linux/macOS: check PATH for renderdoccmd
+        // 4. Linux/macOS: check PATH for renderdoccmd
         if (process.platform !== 'win32') {
             try {
                 const result = await this.exec('which renderdoccmd');
@@ -912,7 +929,7 @@ export class RenderDocBridge {
         if (override && fs.existsSync(override)) { return override; }
 
         // 2. Next to the extension (dev build or VSIX-bundled)
-        const extensionDir = path.dirname(path.dirname(__filename));
+        const extensionDir = this.getExtensionDir();
         const candidates = [
             path.join(extensionDir, 'native', 'build', 'Release', exeName),
             path.join(extensionDir, 'native', 'build', exeName),

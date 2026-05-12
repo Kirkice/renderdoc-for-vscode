@@ -2,7 +2,7 @@
   "name": "renderdoc-for-vscode",
   "displayName": "RenderDoc for VS Code",
   "description": "View and analyze RenderDoc capture (.rdc) files in VS Code",
-  "version": "0.0.4",
+  "version": "0.0.5",
   "publisher": "Kirkice",
   "icon": "logo.png",
   "galleryBanner": {
@@ -650,17 +650,17 @@
         "renderdoc.installPath": {
           "type": "string",
           "default": "",
-          "description": "Path to the RenderDoc installation directory. If empty, the extension will attempt to auto-detect."
+          "description": "Optional override for the RenderDoc runtime directory. Leave empty to use the bundled runtime or auto-detected system install."
         },
-        "renderdoc.pythonScriptTimeout": {
+        "renderdoc.commandTimeout": {
           "type": "number",
-          "default": 30000,
-          "description": "Timeout in milliseconds for Python script execution."
+          "default": 60000,
+          "description": "Timeout in milliseconds for renderdoccmd execution, such as thumbnail fallback commands."
         },
         "renderdoc.nativeBridge.path": {
           "type": "string",
           "default": "",
-          "description": "Override the path to renderdoc_bridge(.exe). If empty, the extension looks next to itself, in its download cache, or prompts you to download the prebuilt binary on first run."
+          "description": "Optional override for renderdoc_bridge(.exe). Leave empty to use the bundled bridge or the downloaded cache copy."
         },
         "renderdoc.alwaysReplayLocally": {
           "type": "boolean",
@@ -670,7 +670,7 @@
         "renderdoc.maliOfflineCompilerPath": {
           "type": "string",
           "default": "",
-          "description": "Path to the Mali Offline Compiler executable (malioc.exe). Used for analyzing shader performance."
+          "description": "Optional path to the Mali Offline Compiler executable (malioc.exe). Configure only if you want Mali shader analysis."
         }
       }
     }
