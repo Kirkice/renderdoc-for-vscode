@@ -719,11 +719,12 @@ export class InspectorPanel {
         eventId: number,
         channelExtract: number = -1,
         overlayMode: TextureOverlayMode = 'none',
+        baseGammaEnabled: boolean = true,
         resourceId?: string,
         overlayResourceId?: string,
         label?: string,
     ) {
-        const key = `current-draw:${eventId}:${channelExtract}:${overlayMode}:${resourceId ?? ''}:${overlayResourceId ?? ''}`;
+        const key = `current-draw:${eventId}:${channelExtract}:${overlayMode}:${baseGammaEnabled ? 1 : 0}:${resourceId ?? ''}:${overlayResourceId ?? ''}`;
         if (this.currentDrawPreviewCache.has(key)) {
             const cached = this.currentDrawPreviewCache.get(key)!;
             this.panel.webview.postMessage({ type: 'currentDrawPreview', key, ...cached });
@@ -742,6 +743,7 @@ export class InspectorPanel {
                     eventId,
                     channelExtract,
                     overlayMode,
+                    baseGammaEnabled,
                     resourceId,
                     overlayResourceId,
                     label,
@@ -758,6 +760,8 @@ export class InspectorPanel {
                     resourceId: result.resourceId,
                     label: result.label,
                     overlayMode: result.overlayMode,
+                    baseGammaEnabled: result.baseGammaEnabled,
+                    baseGammaAvailable: result.baseGammaAvailable,
                 };
                 this.currentDrawPreviewCache.set(key, data);
                 this.panel.webview.postMessage({ type: 'currentDrawPreview', key, ...data });
@@ -772,6 +776,7 @@ export class InspectorPanel {
                             eventId,
                             channelExtract,
                             overlayMode,
+                            baseGammaEnabled,
                             resourceId,
                             overlayResourceId,
                             label,
@@ -788,6 +793,8 @@ export class InspectorPanel {
                             resourceId: retried.resourceId,
                             label: retried.label,
                             overlayMode: retried.overlayMode,
+                            baseGammaEnabled: retried.baseGammaEnabled,
+                            baseGammaAvailable: retried.baseGammaAvailable,
                         };
                         this.currentDrawPreviewCache.set(key, data);
                         this.panel.webview.postMessage({ type: 'currentDrawPreview', key, ...data });
@@ -869,6 +876,7 @@ export class InspectorPanel {
                     msg.eventId ?? this.currentEventId ?? 0,
                     msg.channelExtract ?? -1,
                     msg.overlayMode ?? 'none',
+                    msg.baseGammaEnabled ?? true,
                     msg.resourceId,
                     msg.overlayResourceId,
                     msg.label,

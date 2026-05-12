@@ -2364,6 +2364,7 @@ static void normalizeColorPreviewRGBA(std::vector<uint8_t> &rgba, int channelExt
         forceOpaqueAlpha(rgba);
     }
 }
+
 static bool convertReadbackToRGBA(const bytebuf &pixels,
                                   uint32_t width,
                                   uint32_t height,
@@ -2824,6 +2825,7 @@ static json handleGetCurrentDrawPreview(int id, const json &params) {
     uint32_t eventId = params.value("eventId", (uint32_t)0);
     int channelExtract = params.value("channelExtract", -1);
     const std::string requestedOverlayMode = params.value("overlayMode", std::string("none"));
+    const bool requestedBaseGammaEnabled = params.value("baseGammaEnabled", true);
     uint64_t requestedPreviewRid = jsonToU64(params.contains("resourceId") ? params["resourceId"] : json());
     uint64_t requestedOverlayRid = jsonToU64(params.contains("overlayResourceId") ? params["overlayResourceId"] : json());
     std::string requestedLabel = params.value("label", std::string());
@@ -3308,9 +3310,10 @@ static json handleGetCurrentDrawPreview(int id, const json &params) {
     }
 
     fprintf(stderr,
-            "[bridge] getCurrentDrawPreview: eventId=%u overlay=%s resource=%s size=%ux%u\n",
+            "[bridge] getCurrentDrawPreview: eventId=%u overlay=%s gammaRequest=%d resource=%s size=%ux%u\n",
             eventId,
             normalizedOverlayMode.c_str(),
+            requestedBaseGammaEnabled ? 1 : 0,
             resIdToString(previewId).c_str(),
             width,
             height);
@@ -3336,6 +3339,7 @@ static json handleGetCurrentDrawPreview(int id, const json &params) {
     CompType displayCompType = compType;
     std::string displayFormat = format;
     bool displayIsDepthFormat = isDepthFormat;
+    bool displaySRGBFormat = compType == CompType::UNormSRGB;
 
     ResourceId overlayTexId = ResourceId();
     if (overlay != DebugOverlay::NoOverlay) {
@@ -3385,6 +3389,7 @@ static json handleGetCurrentDrawPreview(int id, const json &params) {
                 displayCompType = candidateCompType;
                 displayFormat = candidateFormat;
                 displayIsDepthFormat = false;
+                displaySRGBFormat = candidateCompType == CompType::UNormSRGB;
 
                 fprintf(stderr,
                         "[bridge] inline overlay candidate selected: resource=%s source=%s size=%ux%u overlay=%s\n",
@@ -3419,6 +3424,7 @@ static json handleGetCurrentDrawPreview(int id, const json &params) {
                 displayCompType = candidateCompType;
                 displayFormat = candidateFormat;
                 displayIsDepthFormat = false;
+                displaySRGBFormat = candidateCompType == CompType::UNormSRGB;
                 break;
             }
         }
@@ -3456,6 +3462,31 @@ static json handleGetCurrentDrawPreview(int id, const json &params) {
     } else {
         g_overlayOut->SetTextureDisplay(disp);
     }
+
+    const TextureDescription *displayTex = textureFor(displayPreviewId);
+    bool baseGammaAvailable = true;
+    bool baseGammaEnabled = requestedBaseGammaEnabled;
+    if (displayTex && (displayTex->creationFlags & TextureCategory::SwapBuffer) != TextureCategory::NoFlags) {
+        baseGammaAvailable = false;
+        if (displayTex->format.compByteWidth == 2 && displayTex->format.type == ResourceFormatType::Regular) {
+            baseGammaEnabled = false;
+        } else {
+            baseGammaEnabled = true;
+        }
+    } else if (displayTex && displayTex->format.SRGBCorrected()) {
+        baseGammaAvailable = false;
+        baseGammaEnabled = false;
+    } else if (displaySRGBFormat) {
+        baseGammaAvailable = false;
+        baseGammaEnabled = false;
+    }
+
+    fprintf(stderr,
+            "[bridge] current draw gamma state: enabled=%d available=%d display=%s format=%s\n",
+            baseGammaEnabled ? 1 : 0,
+            baseGammaAvailable ? 1 : 0,
+            resIdToString(displayPreviewId).c_str(),
+            displayFormat.c_str());
 
     auto readCurrentPreviewToRGBA = [&](uint32_t fallbackWidth,
                                         uint32_t fallbackHeight,
@@ -3501,10 +3532,12 @@ static json handleGetCurrentDrawPreview(int id, const json &params) {
     if (overlay != DebugOverlay::NoOverlay) {
         TextureDisplay baseDisp = {};
         configureTextureDisplay(baseDisp, displayPreviewId, displayIsDepthFormat, width, height, samples);
+        baseDisp.linearDisplayAsGamma = baseGammaEnabled;
         if (overlayUsesInlineDisplay) {
             fprintf(stderr,
-                    "[bridge] rendering inline overlay directly: mode=%s resource=%s size=%ux%u\n",
+                    "[bridge] rendering inline overlay directly: mode=%s gamma=%d resource=%s size=%ux%u\n",
                     normalizedOverlayMode.c_str(),
+                    baseGammaEnabled ? 1 : 0,
                     resIdToString(displayPreviewId).c_str(),
                     width,
                     height);
@@ -3665,6 +3698,7 @@ static json handleGetCurrentDrawPreview(int id, const json &params) {
             outHeight = baseOutHeight;
         }
     } else {
+        disp.linearDisplayAsGamma = baseGammaEnabled;
         g_overlayOut->SetTextureDisplay(disp);
         if (!readCurrentPreviewToRGBA(width,
                                       height,
@@ -3691,6 +3725,8 @@ static json handleGetCurrentDrawPreview(int id, const json &params) {
     result["resourceId"] = resIdToString(displayPreviewId);
     result["label"] = label;
     result["overlayMode"] = normalizedOverlayMode;
+    result["baseGammaEnabled"] = baseGammaEnabled;
+    result["baseGammaAvailable"] = baseGammaAvailable;
     return makeResult(id, result);
 }
 

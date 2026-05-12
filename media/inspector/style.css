@@ -992,6 +992,25 @@
             padding: 3px 8px;
             font: inherit;
         }
+        .tex-current-gamma-toggle {
+            min-width: 30px;
+            padding: 4px 8px;
+            font-weight: 700;
+            text-align: center;
+        }
+        .tex-current-gamma-toggle.active {
+            background: var(--vscode-button-background, var(--vscode-textLink-foreground));
+            border-color: color-mix(in srgb, var(--vscode-button-background, var(--vscode-textLink-foreground)) 78%, black);
+            color: var(--vscode-button-foreground, white);
+            box-shadow: inset 0 0 0 1px color-mix(in srgb, white 26%, transparent);
+        }
+        .tex-current-gamma-toggle.active:hover {
+            background: color-mix(in srgb, var(--vscode-button-background, var(--vscode-textLink-foreground)) 88%, white);
+        }
+        .tex-current-gamma-toggle:disabled {
+            opacity: 0.6;
+            cursor: default;
+        }
         .tex-current.overlay-active {
             box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--vscode-focusBorder, var(--vscode-textLink-foreground)) 70%, transparent);
         }

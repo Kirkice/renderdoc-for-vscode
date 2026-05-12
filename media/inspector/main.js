@@ -24,6 +24,7 @@
         modalChannel: -1,
         currentPreviewChannel: -1,
         currentPreviewOverlay: 'none',
+        currentPreviewBaseGammaEnabled: true,
         eventScope: 'all',   // 'all' | 'group'
         texScope: 'output',  // 'output' | 'input'
         meshStage: 'vsin',   // 'vsin' | 'vsout'
@@ -2403,11 +2404,12 @@
             default: return 'None';
         }
     }
-    function rtKeyFor(eventId, channelExtract, overlayMode, resourceId, overlayResourceId) {
+    function rtKeyFor(eventId, channelExtract, overlayMode, baseGammaEnabled, resourceId, overlayResourceId) {
         return 'current-draw:' +
             (eventId || 0) + ':' +
             channelExtract + ':' +
             (overlayMode || 'none') + ':' +
+            (baseGammaEnabled ? '1' : '0') + ':' +
             (resourceId || '') + ':' +
             (overlayResourceId || '');
     }
@@ -2537,6 +2539,10 @@
         state.currentPreviewOverlay = typeof mode === 'string' && mode ? mode : 'none';
         renderCurrentRTPreview();
     }
+    function toggleCurrentRTPreviewBaseGamma() {
+        state.currentPreviewBaseGammaEnabled = !state.currentPreviewBaseGammaEnabled;
+        renderCurrentRTPreview();
+    }
     window.addEventListener('resize', () => {
         if (state.activeTab === 'textures') {
             applyTexturesPreviewHeight(loadTexturesPreviewHeight());
@@ -2561,6 +2567,7 @@
             return;
         }
         const overlayMode = state.currentPreviewOverlay || 'none';
+        const baseGammaEnabled = state.currentPreviewBaseGammaEnabled !== false;
         const requestedOutput = currentOutputInfo(pipe);
         const requestedOverlayTarget = currentOverlayTargetInfo(pipe);
         const requestedResourceId = requestedOutput && requestedOutput.resourceId ? String(requestedOutput.resourceId) : '';
@@ -2571,11 +2578,18 @@
             state.eventId || 0,
             state.currentPreviewChannel,
             overlayMode,
+            baseGammaEnabled,
             requestedResourceId,
             requestedOverlayResourceId,
         );
         const cached = rtPreviewCache.get(key);
         const errMsg = rtPreviewErrors.get(key);
+        const gammaAvailable = cached && cached.baseGammaAvailable !== undefined
+            ? !!cached.baseGammaAvailable
+            : true;
+        const gammaEnabled = cached && cached.baseGammaEnabled !== undefined
+            ? !!cached.baseGammaEnabled
+            : baseGammaEnabled;
         const rtId = cached && cached.resourceId ? String(cached.resourceId) : null;
         const output = requestedOutput;
         const label = (cached && cached.label) || (output && output.label) || 'Current Draw';
@@ -2607,6 +2621,7 @@
         ).join('');
         badges.push('<span class="tex-current-meta">replay preview</span>');
         if (overlayMode !== 'none') badges.push('<span class="tex-current-meta">overlay: ' + esc(currentPreviewOverlayLabel(overlayMode)) + '</span>');
+        if (gammaAvailable && !gammaEnabled) badges.push('<span class="tex-current-meta">gamma off</span>');
         if (output && output.framebuffer && output.framebuffer.usesActionFallback) badges.push('<span class="tex-current-meta">action fallback</span>');
         if (output && output.framebuffer && output.framebuffer.usesPresentationFallback) badges.push('<span class="tex-current-meta">backbuffer fallback</span>');
 
@@ -2634,6 +2649,7 @@
                     '<span class="tex-current-meta tex-current-hint">Wheel: zoom · Drag: pan</span>' +
                     '<div class="channel-toggle tex-current-channel-toggle">' + channelButtons + '</div>' +
                     '<label class="tex-current-overlay-control"><span class="tex-current-meta">Overlay</span><select class="tex-current-overlay-select">' + overlayOptions + '</select></label>' +
+                    '<button class="icon-btn tex-current-gamma-toggle' + (gammaEnabled ? ' active' : '') + '" type="button" title="' + esc(gammaAvailable ? 'Override display of linear data in gamma space' : 'Gamma override unavailable for this resource') + '" aria-pressed="' + (gammaEnabled ? 'true' : 'false') + '"' + (gammaAvailable ? '' : ' disabled') + '>y</button>' +
                     '<button class="icon-btn tex-current-zoom-reset" title="Reset zoom and pan">' + Math.round(currentRTPreviewZoom * 100) + '%</button>' +
                     (rtId ? ('<button class="icon-btn tex-current-open" data-resid="' + esc(rtId) + '">Open</button>') : '') +
                 '</div>' +
@@ -2656,6 +2672,10 @@
         const overlaySelect = area.querySelector('.tex-current-overlay-select');
         if (overlaySelect) {
             overlaySelect.addEventListener('change', () => setCurrentRTPreviewOverlay(overlaySelect.value));
+        }
+        const gammaBtn = area.querySelector('.tex-current-gamma-toggle');
+        if (gammaBtn) {
+            gammaBtn.addEventListener('click', toggleCurrentRTPreviewBaseGamma);
         }
         const resetBtn = area.querySelector('.tex-current-zoom-reset');
         if (resetBtn) resetBtn.addEventListener('click', resetCurrentRTPreviewView);
@@ -2687,6 +2707,7 @@
                 eventId: state.eventId || 0,
                 channelExtract: state.currentPreviewChannel,
                 overlayMode: overlayMode,
+                baseGammaEnabled: baseGammaEnabled,
                 resourceId: requestedResourceId || undefined,
                 overlayResourceId: requestedOverlayResourceId || undefined,
                 label: overlayMode !== 'none'

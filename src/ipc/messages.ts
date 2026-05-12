@@ -36,6 +36,7 @@ export interface MsgRequestCurrentDrawPreview {
     eventId?: number;
     channelExtract?: number;
     overlayMode?: TextureOverlayMode;
+    baseGammaEnabled?: boolean;
     resourceId?: string;
     overlayResourceId?: string;
     label?: string;
@@ -163,6 +164,8 @@ export interface MsgCurrentDrawPreview {
     resourceId?: string;
     label?: string;
     overlayMode?: TextureOverlayMode;
+    baseGammaEnabled?: boolean;
+    baseGammaAvailable?: boolean;
     error?: string;
 }
 
