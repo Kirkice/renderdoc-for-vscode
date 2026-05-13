@@ -408,6 +408,40 @@
         "icon": "$(close)"
       }
     ],
+    "languages": [
+      {
+        "id": "renderdoc-glsl",
+        "aliases": [
+          "RenderDoc GLSL",
+          "GLSL"
+        ],
+        "extensions": [
+          ".glsl",
+          ".glslinc",
+          ".vert",
+          ".frag",
+          ".geom",
+          ".tesc",
+          ".tese",
+          ".comp",
+          ".mesh",
+          ".task",
+          ".rgen",
+          ".rahit",
+          ".rchit",
+          ".rmiss",
+          ".rcall"
+        ],
+        "configuration": "./syntaxes/renderdoc-glsl.language-configuration.json"
+      }
+    ],
+    "grammars": [
+      {
+        "language": "renderdoc-glsl",
+        "scopeName": "source.renderdoc.glsl",
+        "path": "./syntaxes/renderdoc-glsl.tmLanguage.json"
+      }
+    ],
     "viewsContainers": {
       "activitybar": [
         {

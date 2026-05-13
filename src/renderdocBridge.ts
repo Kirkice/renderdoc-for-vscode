@@ -37,6 +37,9 @@ import {
     GetShaderEntryPointsResponse,
     GetShaderSourceResponse,
     GetShaderSourceForEventResponse,
+    ApplyShaderEditResponse,
+    CompileShaderEditResponse,
+    RevertShaderEditResponse,
     GetPipelineStateResponse,
     GetTexturePreviewResponse,
     OpenCaptureResponse,
@@ -56,6 +59,9 @@ import {
     type TGetShaderEntryPointsResponse,
     type TGetShaderSourceResponse,
     type TGetShaderSourceForEventResponse,
+    type TApplyShaderEditResponse,
+    type TCompileShaderEditResponse,
+    type TRevertShaderEditResponse,
     type TGetPipelineStateResponse,
     type TGetTexturePreviewResponse,
     type TOpenCaptureResponse,
@@ -1156,6 +1162,37 @@ export class RenderDocBridge {
     /** Get shader source at a specific event via native bridge */
     async nativeGetShaderSource(eventId: number, stage?: string): Promise<any> {
         return this.nativeCall('getShaderSourceForEvent', { eventId, stage });
+    }
+
+    async nativeApplyShaderEdit(params: {
+        resourceId: string;
+        shaderStage: number;
+        sourceEncoding: number;
+        entryPoint: string;
+        entryFileIndex: number;
+        compileFlags: Array<{ name: string; value: string }>;
+        files: Array<{ filename: string; contents: string }>;
+    }): Promise<TApplyShaderEditResponse> {
+        await this.ensureNativeBridgeReady();
+        return this.nativeCallT('applyShaderEdit', ApplyShaderEditResponse, params, 0);
+    }
+
+    async nativeCompileShaderEdit(params: {
+        resourceId: string;
+        shaderStage: number;
+        sourceEncoding: number;
+        entryPoint: string;
+        entryFileIndex: number;
+        compileFlags: Array<{ name: string; value: string }>;
+        files: Array<{ filename: string; contents: string }>;
+    }): Promise<TCompileShaderEditResponse> {
+        await this.ensureNativeBridgeReady();
+        return this.nativeCallT('compileShaderEdit', CompileShaderEditResponse, params, 0);
+    }
+
+    async nativeRevertShaderEdit(resourceId: string): Promise<TRevertShaderEditResponse> {
+        await this.ensureNativeBridgeReady();
+        return this.nativeCallT('revertShaderEdit', RevertShaderEditResponse, { resourceId }, 0);
     }
 
     /** Get texture data via native bridge (saves to temp PNG, returns base64) */

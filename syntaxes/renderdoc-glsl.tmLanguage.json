@@ -1,0 +1,139 @@
+{
+  "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+  "name": "RenderDoc GLSL",
+  "scopeName": "source.renderdoc.glsl",
+  "patterns": [
+    {
+      "include": "#comments"
+    },
+    {
+      "include": "#preprocessor"
+    },
+    {
+      "include": "#strings"
+    },
+    {
+      "include": "#numbers"
+    },
+    {
+      "include": "#types"
+    },
+    {
+      "include": "#qualifiers"
+    },
+    {
+      "include": "#keywords"
+    },
+    {
+      "include": "#builtins"
+    },
+    {
+      "include": "#functions"
+    }
+  ],
+  "repository": {
+    "comments": {
+      "patterns": [
+        {
+          "name": "comment.line.double-slash.glsl",
+          "begin": "//",
+          "end": "$"
+        },
+        {
+          "name": "comment.block.glsl",
+          "begin": "/\\*",
+          "end": "\\*/"
+        }
+      ]
+    },
+    "preprocessor": {
+      "patterns": [
+        {
+          "name": "meta.preprocessor.glsl",
+          "begin": "^\\s*#\\s*(?:include|define|undef|if|ifdef|ifndef|elif|else|endif|line|error|pragma|extension|version)\\b",
+          "end": "$",
+          "patterns": [
+            {
+              "match": "#\\s*(?:include|define|undef|if|ifdef|ifndef|elif|else|endif|line|error|pragma|extension|version)\\b",
+              "name": "keyword.control.directive.glsl"
+            },
+            {
+              "include": "#strings"
+            }
+          ]
+        }
+      ]
+    },
+    "strings": {
+      "patterns": [
+        {
+          "name": "string.quoted.double.glsl",
+          "begin": "\"",
+          "end": "\"",
+          "patterns": [
+            {
+              "match": "\\\\.",
+              "name": "constant.character.escape.glsl"
+            }
+          ]
+        }
+      ]
+    },
+    "numbers": {
+      "patterns": [
+        {
+          "match": "\\b0[xX][0-9A-Fa-f]+(?:[uU]|[lL]{1,2})?\\b",
+          "name": "constant.numeric.hex.glsl"
+        },
+        {
+          "match": "\\b(?:\\d+\\.\\d*|\\.\\d+|\\d+)(?:[eE][+-]?\\d+)?(?:[fFuU]|lf|LF)?\\b",
+          "name": "constant.numeric.decimal.glsl"
+        }
+      ]
+    },
+    "types": {
+      "patterns": [
+        {
+          "match": "\\b(?:void|bool|int|uint|float|double|atomic_uint|bvec[234]|ivec[234]|uvec[234]|vec[234]|dvec[234]|mat[234](?:x[234])?|dmat[234](?:x[234])?|sampler(?:1D|2D|3D|Cube|2DRect|1DArray|2DArray|CubeArray|Buffer|2DMS|2DMSArray)(?:Shadow)?|isampler(?:1D|2D|3D|Cube|2DRect|1DArray|2DArray|CubeArray|Buffer|2DMS|2DMSArray)|usampler(?:1D|2D|3D|Cube|2DRect|1DArray|2DArray|CubeArray|Buffer|2DMS|2DMSArray)|image(?:1D|2D|3D|Cube|2DRect|1DArray|2DArray|CubeArray|Buffer|2DMS|2DMSArray)|iimage(?:1D|2D|3D|Cube|2DRect|1DArray|2DArray|CubeArray|Buffer|2DMS|2DMSArray)|uimage(?:1D|2D|3D|Cube|2DRect|1DArray|2DArray|CubeArray|Buffer|2DMS|2DMSArray)|subpassInput(?:MS)?|isubpassInput(?:MS)?|usubpassInput(?:MS)?)\\b",
+          "name": "storage.type.glsl"
+        }
+      ]
+    },
+    "qualifiers": {
+      "patterns": [
+        {
+          "match": "\\b(?:const|in|out|inout|uniform|buffer|shared|attribute|varying|layout|centroid|flat|smooth|noperspective|patch|sample|coherent|volatile|restrict|readonly|writeonly|precision|highp|mediump|lowp|invariant|struct)\\b",
+          "name": "storage.modifier.glsl"
+        }
+      ]
+    },
+    "keywords": {
+      "patterns": [
+        {
+          "match": "\\b(?:if|else|switch|case|default|for|while|do|break|continue|return|discard|subroutine)\\b",
+          "name": "keyword.control.glsl"
+        }
+      ]
+    },
+    "builtins": {
+      "patterns": [
+        {
+          "match": "\\bgl_[A-Za-z0-9_]*\\b",
+          "name": "support.variable.builtin.glsl"
+        }
+      ]
+    },
+    "functions": {
+      "patterns": [
+        {
+          "match": "\\b([A-Za-z_][A-Za-z0-9_]*)\\s*(?=\\()",
+          "captures": {
+            "1": {
+              "name": "entity.name.function.glsl"
+            }
+          }
+        }
+      ]
+    }
+  }
+}

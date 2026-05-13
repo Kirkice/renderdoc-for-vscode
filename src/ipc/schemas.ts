@@ -27,6 +27,21 @@ const EntryPoint = z.object({
     stage: z.number(),
 });
 
+const ShaderCompileFlag = z.object({
+    name: z.string(),
+    value: z.string(),
+});
+
+const ShaderCompileDiagnostic = z.object({
+    severity: z.enum(['error', 'warning', 'note']),
+    message: z.string(),
+    raw: z.string(),
+    fileIndex: z.number().optional(),
+    filename: z.string().optional(),
+    line: z.number().optional(),
+    column: z.number().optional(),
+});
+
 const ShaderSourceFile = z.object({
     filename: z.string(),
     contents: z.string(),
@@ -255,6 +270,35 @@ export const GetShaderSourceResponse = z.object({
     hasRawBytes: z.boolean().optional(),
     rawBytesSize: z.number().optional(),
     sourceFiles: z.array(ShaderSourceFile).optional(),
+    entryFileIndex: z.number().optional(),
+    entrySourceName: z.string().optional(),
+    sourceEncoding: z.number().optional(),
+    compiler: z.number().optional(),
+    shaderStage: z.number().optional(),
+    editable: z.boolean().optional(),
+    hasReplacement: z.boolean().optional(),
+    compileFlags: z.array(ShaderCompileFlag).optional(),
+});
+
+export const ApplyShaderEditResponse = z.object({
+    originalResourceId: ResourceId,
+    replacementResourceId: ResourceId.optional(),
+    applied: z.boolean(),
+    errors: z.string().optional(),
+    diagnostics: z.array(ShaderCompileDiagnostic).optional(),
+});
+
+export const CompileShaderEditResponse = z.object({
+    originalResourceId: ResourceId,
+    compiled: z.boolean(),
+    errors: z.string().optional(),
+    diagnostics: z.array(ShaderCompileDiagnostic).optional(),
+});
+
+export const RevertShaderEditResponse = z.object({
+    originalResourceId: ResourceId,
+    reverted: z.boolean(),
+    errors: z.string().optional(),
 });
 
 /** Variable-shape: one key per bound stage ("vertex", "fragment", …). */
@@ -303,6 +347,9 @@ export type TGetDisassemblyTargetsResponse = z.infer<typeof GetDisassemblyTarget
 export type TGetShaderEntryPointsResponse  = z.infer<typeof GetShaderEntryPointsResponse>;
 export type TGetShaderSourceResponse     = z.infer<typeof GetShaderSourceResponse>;
 export type TGetShaderSourceForEventResponse = z.infer<typeof GetShaderSourceForEventResponse>;
+export type TApplyShaderEditResponse    = z.infer<typeof ApplyShaderEditResponse>;
+export type TCompileShaderEditResponse  = z.infer<typeof CompileShaderEditResponse>;
+export type TRevertShaderEditResponse   = z.infer<typeof RevertShaderEditResponse>;
 export type TGetTexturePreviewResponse   = z.infer<typeof GetTexturePreviewResponse>;
 export type TSaveTextureResponse         = z.infer<typeof SaveTextureResponse>;
 export type TGetPipelineStateResponse    = z.infer<typeof GetPipelineStateResponse>;

@@ -46,12 +46,76 @@ export interface MsgOpenShaderInEditor {
     type: 'openShaderInEditor';
     source?: string;
     language?: string;
+    eventId?: number;
+    resourceId?: string;
+    stage?: string;
+    filename?: string;
+    files?: WebviewShaderSourceFile[];
+    selectedFileIndex?: number;
+    preserveFocus?: boolean;
+    openToSide?: boolean;
+    preview?: boolean;
+    line?: number;
+    column?: number;
 }
 
 export interface MsgAnalyzeMaliOffline {
     type: 'analyzeMaliOffline';
     source: string;
     stage: string;
+}
+
+export interface WebviewShaderCompileFlag {
+    name: string;
+    value: string;
+}
+
+export interface WebviewShaderSourceFile {
+    filename: string;
+    contents: string;
+}
+
+export interface WebviewShaderDiagnostic {
+    severity: 'error' | 'warning' | 'note';
+    message: string;
+    raw: string;
+    fileIndex?: number;
+    filename?: string;
+    line?: number;
+    column?: number;
+}
+
+export interface MsgCompileShaderEdit {
+    type: 'compileShaderEdit';
+    eventId: number;
+    stage: string;
+    resourceId: string;
+    shaderStage: number;
+    sourceEncoding: number;
+    entryPoint: string;
+    entryFileIndex: number;
+    compileFlags: WebviewShaderCompileFlag[];
+    files: WebviewShaderSourceFile[];
+}
+
+export interface MsgApplyShaderEdit {
+    type: 'applyShaderEdit';
+    eventId: number;
+    stage: string;
+    resourceId: string;
+    shaderStage: number;
+    sourceEncoding: number;
+    entryPoint: string;
+    entryFileIndex: number;
+    compileFlags: WebviewShaderCompileFlag[];
+    files: WebviewShaderSourceFile[];
+}
+
+export interface MsgRevertShaderEdit {
+    type: 'revertShaderEdit';
+    eventId: number;
+    stage: string;
+    resourceId: string;
 }
 
 export interface MsgCopyToClipboard {
@@ -96,6 +160,9 @@ export type WebviewToExtensionMessage =
     | MsgRequestCurrentDrawPreview
     | MsgOpenShaderInEditor
     | MsgAnalyzeMaliOffline
+    | MsgCompileShaderEdit
+    | MsgApplyShaderEdit
+    | MsgRevertShaderEdit
     | MsgCopyToClipboard
     | MsgExportTexture
     | MsgShowResourceDetails
@@ -182,6 +249,24 @@ export interface MsgMaliAnalysisResult {
     error?: string;
 }
 
+export interface MsgShaderEditResult {
+    type: 'shaderEditResult';
+    eventId: number;
+    stage: string;
+    action: 'apply' | 'compile' | 'revert';
+    ok: boolean;
+    message?: string;
+    refresh?: boolean;
+    diagnostics?: WebviewShaderDiagnostic[];
+}
+
+export interface MsgSyncShaderSelection {
+    type: 'syncShaderSelection';
+    eventId: number;
+    stage: string;
+    fileIndex: number;
+}
+
 export interface MsgTimingsLoaded {
     type: 'timingsLoaded';
     timings: Record<string, number>;
@@ -207,5 +292,7 @@ export type ExtensionToWebviewMessage =
     | MsgCurrentDrawPreview
     | MsgMeshLoaded
     | MsgMaliAnalysisResult
+    | MsgShaderEditResult
+    | MsgSyncShaderSelection
     | MsgTimingsLoaded
     | MsgReplayStatus;

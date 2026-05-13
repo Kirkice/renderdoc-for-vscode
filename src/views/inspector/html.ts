@@ -117,11 +117,11 @@ export function buildInspectorHtml(
                     <div id="shaders-container" class="shader-pane shader-source-pane">
                         <div class="shader-pane-header">
                             <div>
-                                <div class="shader-pane-title">Shader Source</div>
+                                <div class="shader-pane-title">Shader Status</div>
                                 <div id="shader-pane-meta" class="shader-pane-meta">Select an event to inspect bound shader stages.</div>
                             </div>
                         </div>
-                        <pre id="shaders-body" class="code-view empty-state shader-code-view">Select an event to view its shaders.</pre>
+                        <div id="shaders-body" class="shader-editor-panel empty-state">Select an event to view shader status.</div>
                     </div>
                     <div id="mali-offline-splitter" class="vertical-splitter" style="display:none;"></div>
                     <div id="mali-offline-result-container" class="shader-pane shader-analysis-pane" style="display:none;">
@@ -134,6 +134,7 @@ export function buildInspectorHtml(
                         <div id="mali-offline-result" class="shader-analysis-result"></div>
                     </div>
                 </div>
+                <div id="shader-diagnostics" class="shader-diagnostics" hidden></div>
             </section>
 
             <section id="tab-mesh" class="tab-panel">

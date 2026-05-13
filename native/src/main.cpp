@@ -23,9 +23,11 @@
 #include <set>
 #include <algorithm>
 #include <chrono>
+#include <cctype>
 #include <cmath>
 #include <thread>
 #include <atomic>
+#include <regex>
 
 // Third-party: ASTC LDR software decoder (BSD/Apache from ANGLE via basis_universal)
 #include "astc_dec/astc_decomp.h"
@@ -53,6 +55,50 @@ static bool              g_replayInit = false;
 static bool              g_replayIsRemote = false;
 static std::string       g_capturePath;
 
+struct ShaderEditFile
+{
+    std::string filename;
+    std::string contents;
+};
+
+struct ShaderReplacementState
+{
+    ResourceId replacementId = ResourceId();
+    ShaderStage stage = ShaderStage::Vertex;
+    ShaderEncoding encoding = ShaderEncoding::Unknown;
+    ShaderCompileFlags compileFlags;
+    std::string entryPoint;
+    int32_t entryFileIndex = 0;
+    std::vector<ShaderEditFile> files;
+};
+
+struct ShaderSourceLineMapping
+{
+    int32_t fileIndex = -1;
+    int32_t lineNumber = 0;
+};
+
+struct ShaderCompileRequest
+{
+    uint64_t originalIdValue = 0;
+    ResourceId originalId = ResourceId();
+    ShaderStage shaderStage = ShaderStage::Vertex;
+    ShaderEncoding sourceEncoding = ShaderEncoding::Unknown;
+    int32_t entryFileIndex = 0;
+    std::string entryPoint;
+    std::vector<ShaderEditFile> files;
+    ShaderCompileFlags compileFlags;
+};
+
+struct ShaderCompileOperationResult
+{
+    ResourceId compiledId = ResourceId();
+    std::string compileOutput;
+    std::vector<ShaderSourceLineMapping> lineMappings;
+};
+
+static std::map<uint64_t, ShaderReplacementState> g_shaderReplacementStates;
+
 // Guards all writes to stdout. The replay worker thread can emit progress
 // notifications while the main thread is also writing responses/logs, so
 // every `std::cout` write must hold this lock to avoid interleaved JSON
@@ -71,6 +117,8 @@ static const ActionDescription *findStructuredActionByEventId(
     const rdcarray<ActionDescription> &actions, uint32_t eventId);
 static ResourceId getCurrentColorTargetId();
 static std::string resultMessage(const ResultDetails &r);
+static uint64_t resIdToU64(const ResourceId &r);
+static ResourceId u64ToResId(uint64_t v);
 
 static std::string lowerAscii(std::string value) {
     std::transform(value.begin(), value.end(), value.begin(), [](unsigned char ch) {
@@ -243,10 +291,42 @@ static void stopRemoteKeepAlive(std::atomic<bool> &keepRemoteAlive,
                                 std::thread &remotePingThread);
 static void ensureReplayRemoteKeepAlive();
 
+static void clearShaderReplacement(ResourceId originalId) {
+    const uint64_t key = resIdToU64(originalId);
+    auto it = g_shaderReplacementStates.find(key);
+    if (it == g_shaderReplacementStates.end()) {
+        return;
+    }
+
+    if (g_replay) {
+        g_replay->RemoveReplacement(originalId);
+        if (it->second.replacementId != ResourceId()) {
+            g_replay->FreeTargetResource(it->second.replacementId);
+        }
+    }
+
+    g_shaderReplacementStates.erase(it);
+}
+
+static void clearAllShaderReplacements() {
+    if (g_replay) {
+        for (const auto &entry : g_shaderReplacementStates) {
+            const ResourceId originalId = u64ToResId(entry.first);
+            g_replay->RemoveReplacement(originalId);
+            if (entry.second.replacementId != ResourceId()) {
+                g_replay->FreeTargetResource(entry.second.replacementId);
+            }
+        }
+    }
+
+    g_shaderReplacementStates.clear();
+}
+
 static void closeActiveReplay(bool resumeReplayHostKeepAlive = true) {
     shutdownCachedReplayOutputs();
     resetEventCache();
     if (g_replay) {
+        clearAllShaderReplacements();
         if (g_replayIsRemote && g_replayRemote) {
             stopRemoteKeepAlive(g_replayRemoteKeepAlive, g_replayRemotePingThread);
             g_replayRemote->CloseCapture(g_replay);
@@ -700,6 +780,582 @@ static uint64_t jsonToU64(const json &value) {
     if (value.is_number_integer()) return static_cast<uint64_t>(value.get<int64_t>());
     if (value.is_number_float()) return static_cast<uint64_t>(value.get<double>());
     return 0ULL;
+}
+
+static json shaderCompileFlagsToJson(const ShaderCompileFlags &flags) {
+    json arr = json::array();
+    for (size_t i = 0; i < flags.flags.size(); i++) {
+        arr.push_back({
+            {"name", rdcToStr(flags.flags[i].name)},
+            {"value", rdcToStr(flags.flags[i].value)},
+        });
+    }
+    return arr;
+}
+
+static ShaderCompileFlags jsonToShaderCompileFlags(const json &value) {
+    ShaderCompileFlags flags;
+    if (!value.is_array()) {
+        return flags;
+    }
+
+    for (size_t i = 0; i < value.size(); i++) {
+        if (!value[i].is_object()) {
+            continue;
+        }
+
+        ShaderCompileFlag flag;
+        flag.name = value[i].value("name", "").c_str();
+        flag.value = value[i].value("value", "").c_str();
+        flags.flags.push_back(flag);
+    }
+
+    return flags;
+}
+
+static std::vector<ShaderEditFile> jsonToShaderEditFiles(const json &value) {
+    std::vector<ShaderEditFile> files;
+    if (!value.is_array()) {
+        return files;
+    }
+
+    files.reserve(value.size());
+    for (size_t i = 0; i < value.size(); i++) {
+        if (!value[i].is_object()) {
+            continue;
+        }
+
+        ShaderEditFile file;
+        file.filename = value[i].value("filename", std::string());
+        file.contents = value[i].value("contents", std::string());
+        files.push_back(file);
+    }
+
+    return files;
+}
+
+static std::string normalizeShaderPath(std::string value) {
+    std::replace(value.begin(), value.end(), '\\', '/');
+    return lowerAscii(value);
+}
+
+static std::string shaderPathDir(const std::string &path) {
+    const std::string normalized = normalizeShaderPath(path);
+    const size_t slash = normalized.find_last_of('/');
+    return slash == std::string::npos ? std::string() : normalized.substr(0, slash);
+}
+
+static std::string shaderPathLeaf(const std::string &path) {
+    const std::string normalized = normalizeShaderPath(path);
+    const size_t slash = normalized.find_last_of('/');
+    return slash == std::string::npos ? normalized : normalized.substr(slash + 1);
+}
+
+static bool shaderPathEndsWith(const std::string &candidate, const std::string &suffix) {
+    if (candidate == suffix) {
+        return true;
+    }
+    if (candidate.size() <= suffix.size()) {
+        return false;
+    }
+    const size_t offset = candidate.size() - suffix.size();
+    return candidate.compare(offset, suffix.size(), suffix) == 0 && candidate[offset - 1] == '/';
+}
+
+static bool findShaderEditFileIndex(const std::vector<ShaderEditFile> &files,
+                                    const std::string &requestedPath,
+                                    const std::string &includingFile,
+                                    size_t &outIndex) {
+    const std::string normalizedRequested = normalizeShaderPath(requestedPath);
+    const std::string includingDir = shaderPathDir(includingFile);
+    std::vector<std::string> exactCandidates;
+
+    if (!includingDir.empty()) {
+        exactCandidates.push_back(includingDir + "/" + normalizedRequested);
+    }
+    exactCandidates.push_back(normalizedRequested);
+
+    for (const std::string &candidate : exactCandidates) {
+        for (size_t i = 0; i < files.size(); i++) {
+            if (normalizeShaderPath(files[i].filename) == candidate) {
+                outIndex = i;
+                return true;
+            }
+        }
+    }
+
+    for (size_t i = 0; i < files.size(); i++) {
+        const std::string filePath = normalizeShaderPath(files[i].filename);
+        if (shaderPathEndsWith(filePath, normalizedRequested)) {
+            outIndex = i;
+            return true;
+        }
+    }
+
+    const std::string requestedLeaf = shaderPathLeaf(normalizedRequested);
+    for (size_t i = 0; i < files.size(); i++) {
+        if (shaderPathLeaf(files[i].filename) == requestedLeaf) {
+            outIndex = i;
+            return true;
+        }
+    }
+
+    return false;
+}
+
+static std::string trimAscii(std::string value) {
+    auto isWhitespace = [](unsigned char ch) { return std::isspace(ch) != 0; };
+
+    size_t start = 0;
+    while (start < value.size() && isWhitespace((unsigned char)value[start])) {
+        start++;
+    }
+
+    size_t end = value.size();
+    while (end > start && isWhitespace((unsigned char)value[end - 1])) {
+        end--;
+    }
+
+    return value.substr(start, end - start);
+}
+
+static std::string normalizeShaderDiagnosticSeverity(std::string value) {
+    value = trimAscii(lowerAscii(value));
+    if (value == "warning" || value == "note") {
+        return value;
+    }
+    return "error";
+}
+
+static void appendShaderSourceLine(const std::string &line,
+                                   size_t fileIndex,
+                                   int32_t lineNumber,
+                                   std::string &expanded,
+                                   std::vector<ShaderSourceLineMapping> *lineMappings) {
+    expanded += line;
+    expanded.push_back('\n');
+
+    if (lineMappings) {
+        ShaderSourceLineMapping mapping;
+        mapping.fileIndex = (int32_t)fileIndex;
+        mapping.lineNumber = lineNumber;
+        lineMappings->push_back(mapping);
+    }
+}
+
+static bool expandShaderIncludesRecursive(const std::vector<ShaderEditFile> &files,
+                                          size_t fileIndex,
+                                          std::vector<std::string> &includeStack,
+                                          std::string &expanded,
+                                          std::string &error,
+                                          std::vector<ShaderSourceLineMapping> *lineMappings) {
+    if (fileIndex >= files.size()) {
+        error = "Shader include index is out of range.";
+        return false;
+    }
+
+    const ShaderEditFile &file = files[fileIndex];
+    const std::string normalizedPath = normalizeShaderPath(file.filename);
+    if (std::find(includeStack.begin(), includeStack.end(), normalizedPath) != includeStack.end()) {
+        error = "Recursive shader include detected for: " + file.filename;
+        return false;
+    }
+
+    includeStack.push_back(normalizedPath);
+
+    static const std::regex includePattern(R"(^\s*#\s*include\s*[<"]([^">]+)[">].*$)");
+
+    std::istringstream input(file.contents);
+    std::string line;
+    int32_t sourceLineNumber = 1;
+    while (std::getline(input, line)) {
+        if (!line.empty() && line.back() == '\r') {
+            line.pop_back();
+        }
+
+        std::smatch match;
+        if (std::regex_match(line, match, includePattern)) {
+            size_t includeIndex = 0;
+            const std::string includePath = match[1].str();
+            if (!findShaderEditFileIndex(files, includePath, file.filename, includeIndex)) {
+                includeStack.pop_back();
+                error = "Shader include not found: " + includePath;
+                return false;
+            }
+
+            if (!expandShaderIncludesRecursive(files, includeIndex, includeStack, expanded, error, lineMappings)) {
+                includeStack.pop_back();
+                return false;
+            }
+            sourceLineNumber += 1;
+            continue;
+        }
+
+        appendShaderSourceLine(line, fileIndex, sourceLineNumber, expanded, lineMappings);
+        sourceLineNumber += 1;
+    }
+
+    includeStack.pop_back();
+    return true;
+}
+
+static bool buildShaderEditSource(const std::vector<ShaderEditFile> &files,
+                                  int32_t entryFileIndex,
+                                  ShaderEncoding sourceEncoding,
+                                  std::string &source,
+                                  std::string &error,
+                                  std::vector<ShaderSourceLineMapping> *lineMappings) {
+    source.clear();
+    if (lineMappings) {
+        lineMappings->clear();
+    }
+
+    if (files.empty()) {
+        error = "No shader source files were provided.";
+        return false;
+    }
+
+    if (entryFileIndex < 0 || (size_t)entryFileIndex >= files.size()) {
+        entryFileIndex = 0;
+    }
+
+    if (sourceEncoding == ShaderEncoding::GLSL ||
+        sourceEncoding == ShaderEncoding::HLSL ||
+        sourceEncoding == ShaderEncoding::Slang) {
+        std::vector<std::string> includeStack;
+        return expandShaderIncludesRecursive(files, (size_t)entryFileIndex, includeStack, source, error, lineMappings);
+    }
+
+    std::istringstream input(files[(size_t)entryFileIndex].contents);
+    std::string line;
+    int32_t sourceLineNumber = 1;
+    while (std::getline(input, line)) {
+        if (!line.empty() && line.back() == '\r') {
+            line.pop_back();
+        }
+
+        appendShaderSourceLine(line, (size_t)entryFileIndex, sourceLineNumber, source, lineMappings);
+        sourceLineNumber += 1;
+    }
+
+    if (files[(size_t)entryFileIndex].contents.empty()) {
+        source.clear();
+    }
+
+    return true;
+}
+
+static bool lookupShaderSourceLineMapping(const std::vector<ShaderSourceLineMapping> &lineMappings,
+                                          int32_t compiledLine,
+                                          int32_t &fileIndex,
+                                          int32_t &lineNumber) {
+    if (compiledLine <= 0 || (size_t)compiledLine > lineMappings.size()) {
+        return false;
+    }
+
+    const ShaderSourceLineMapping &mapping = lineMappings[(size_t)compiledLine - 1];
+    if (mapping.fileIndex < 0 || mapping.lineNumber <= 0) {
+        return false;
+    }
+
+    fileIndex = mapping.fileIndex;
+    lineNumber = mapping.lineNumber;
+    return true;
+}
+
+static bool resolveShaderDiagnosticFileIndex(const std::vector<ShaderEditFile> &files,
+                                             const std::string &token,
+                                             size_t &outIndex) {
+    const std::string trimmed = trimAscii(token);
+    if (trimmed.empty()) {
+        return false;
+    }
+
+    const bool numericOnly = std::all_of(trimmed.begin(), trimmed.end(), [](unsigned char ch) {
+        return std::isdigit(ch) != 0;
+    });
+
+    if (numericOnly) {
+        return false;
+    }
+
+    return findShaderEditFileIndex(files, trimmed, std::string(), outIndex);
+}
+
+static void appendShaderCompileDiagnostic(json &diagnostics,
+                                          const std::vector<ShaderEditFile> &files,
+                                          const std::string &severity,
+                                          const std::string &message,
+                                          const std::string &rawLine,
+                                          int32_t fileIndex = -1,
+                                          const std::string &filename = std::string(),
+                                          int32_t line = 0,
+                                          int32_t column = 0) {
+    json diagnostic;
+    diagnostic["severity"] = severity;
+    diagnostic["message"] = message.empty() ? rawLine : message;
+    diagnostic["raw"] = rawLine;
+
+    if (fileIndex >= 0 && (size_t)fileIndex < files.size()) {
+        diagnostic["fileIndex"] = fileIndex;
+        diagnostic["filename"] = files[(size_t)fileIndex].filename;
+    } else if (!filename.empty()) {
+        diagnostic["filename"] = filename;
+    }
+
+    if (line > 0) {
+        diagnostic["line"] = line;
+    }
+    if (column > 0) {
+        diagnostic["column"] = column;
+    }
+
+    diagnostics.push_back(diagnostic);
+}
+
+static json parseShaderCompileDiagnostics(const std::string &compileOutput,
+                                          const std::vector<ShaderEditFile> &files,
+                                          const std::vector<ShaderSourceLineMapping> &lineMappings,
+                                          int32_t entryFileIndex) {
+    json diagnostics = json::array();
+    if (compileOutput.empty()) {
+        return diagnostics;
+    }
+
+    static const std::regex msvcPattern(
+        R"(^(.*?)\((\d+)(?:,(\d+))?\)\s*:\s*(error|warning|note)\b\s*:?\s*(.*)$)",
+        std::regex_constants::icase);
+    static const std::regex colonPattern(
+        R"(^(.*):(\d+)(?::(\d+))?\s*:\s*(error|warning|note)\b\s*:?\s*(.*)$)",
+        std::regex_constants::icase);
+    static const std::regex sourceStringPattern(
+        R"(^(error|warning|note)\s*:\s*([^:]+):(\d+)(?::(\d+))?\s*:\s*(.*)$)",
+        std::regex_constants::icase);
+    static const std::regex genericPattern(
+        R"(^(error|warning|note)\b\s*:?\s*(.*)$)",
+        std::regex_constants::icase);
+
+    std::istringstream input(compileOutput);
+    std::string rawLine;
+    while (std::getline(input, rawLine)) {
+        if (!rawLine.empty() && rawLine.back() == '\r') {
+            rawLine.pop_back();
+        }
+
+        const std::string trimmed = trimAscii(rawLine);
+        if (trimmed.empty()) {
+            continue;
+        }
+
+        std::smatch match;
+        if (std::regex_match(trimmed, match, msvcPattern)) {
+            const std::string fileToken = trimAscii(match[1].str());
+            const int32_t line = (int32_t)std::strtol(match[2].str().c_str(), nullptr, 10);
+            const int32_t column = match[3].matched
+                ? (int32_t)std::strtol(match[3].str().c_str(), nullptr, 10)
+                : 1;
+            const std::string severity = normalizeShaderDiagnosticSeverity(match[4].str());
+            const std::string message = trimAscii(match[5].str());
+
+            size_t fileIndex = 0;
+            if (resolveShaderDiagnosticFileIndex(files, fileToken, fileIndex)) {
+                appendShaderCompileDiagnostic(diagnostics, files, severity, message, trimmed,
+                                              (int32_t)fileIndex, std::string(), line, column);
+            } else {
+                appendShaderCompileDiagnostic(diagnostics, files, severity, message, trimmed,
+                                              -1, fileToken, line, column);
+            }
+            continue;
+        }
+
+        if (std::regex_match(trimmed, match, colonPattern)) {
+            const std::string fileToken = trimAscii(match[1].str());
+            const int32_t line = (int32_t)std::strtol(match[2].str().c_str(), nullptr, 10);
+            const int32_t column = match[3].matched
+                ? (int32_t)std::strtol(match[3].str().c_str(), nullptr, 10)
+                : 1;
+            const std::string severity = normalizeShaderDiagnosticSeverity(match[4].str());
+            const std::string message = trimAscii(match[5].str());
+
+            size_t fileIndex = 0;
+            if (resolveShaderDiagnosticFileIndex(files, fileToken, fileIndex)) {
+                appendShaderCompileDiagnostic(diagnostics, files, severity, message, trimmed,
+                                              (int32_t)fileIndex, std::string(), line, column);
+            } else {
+                appendShaderCompileDiagnostic(diagnostics, files, severity, message, trimmed,
+                                              -1, fileToken, line, column);
+            }
+            continue;
+        }
+
+        if (std::regex_match(trimmed, match, sourceStringPattern)) {
+            const std::string severity = normalizeShaderDiagnosticSeverity(match[1].str());
+            const std::string token = trimAscii(match[2].str());
+            const int32_t compiledLine = (int32_t)std::strtol(match[3].str().c_str(), nullptr, 10);
+            const int32_t column = match[4].matched
+                ? (int32_t)std::strtol(match[4].str().c_str(), nullptr, 10)
+                : 1;
+            const std::string message = trimAscii(match[5].str());
+
+            int32_t mappedFileIndex = -1;
+            int32_t mappedLine = 0;
+            if (lookupShaderSourceLineMapping(lineMappings, compiledLine, mappedFileIndex, mappedLine)) {
+                appendShaderCompileDiagnostic(diagnostics, files, severity, message, trimmed,
+                                              mappedFileIndex, std::string(), mappedLine, column);
+                continue;
+            }
+
+            size_t fileIndex = 0;
+            if (resolveShaderDiagnosticFileIndex(files, token, fileIndex)) {
+                appendShaderCompileDiagnostic(diagnostics, files, severity, message, trimmed,
+                                              (int32_t)fileIndex, std::string(), compiledLine, column);
+                continue;
+            }
+
+            const int32_t fallbackFileIndex =
+                entryFileIndex >= 0 && (size_t)entryFileIndex < files.size() ? entryFileIndex : -1;
+            appendShaderCompileDiagnostic(diagnostics, files, severity, message, trimmed,
+                                          fallbackFileIndex, std::string(), compiledLine, column);
+            continue;
+        }
+
+        if (std::regex_match(trimmed, match, genericPattern)) {
+            appendShaderCompileDiagnostic(
+                diagnostics,
+                files,
+                normalizeShaderDiagnosticSeverity(match[1].str()),
+                trimAscii(match[2].str()),
+                trimmed);
+        }
+    }
+
+    return diagnostics;
+}
+
+static bool parseShaderCompileRequest(const json &params,
+                                      ShaderCompileRequest &request,
+                                      std::string &error) {
+    request.originalIdValue = jsonToU64(params.contains("resourceId") ? params["resourceId"] : json());
+    if (request.originalIdValue == 0) {
+        error = "resourceId is required";
+        return false;
+    }
+
+    const uint32_t shaderStageValue = params.value("shaderStage", (uint32_t)0);
+    if (shaderStageValue >= (uint32_t)ShaderStage::Count) {
+        error = "shaderStage is invalid";
+        return false;
+    }
+
+    request.originalId = u64ToResId(request.originalIdValue);
+    request.shaderStage = (ShaderStage)shaderStageValue;
+    request.sourceEncoding =
+        (ShaderEncoding)params.value("sourceEncoding", (uint32_t)ShaderEncoding::Unknown);
+    request.entryFileIndex = params.value("entryFileIndex", 0);
+    request.entryPoint = params.value("entryPoint", std::string());
+    if (request.entryPoint.empty()) {
+        request.entryPoint = "main";
+    }
+
+    request.files = jsonToShaderEditFiles(params.contains("files") ? params["files"] : json());
+    request.compileFlags =
+        jsonToShaderCompileFlags(params.contains("compileFlags") ? params["compileFlags"] : json());
+
+    if (request.files.empty()) {
+        error = "No shader source files were provided.";
+        return false;
+    }
+
+    if (!IsTextRepresentation(request.sourceEncoding)) {
+        error = "Shader editing is only supported for text source encodings.";
+        return false;
+    }
+
+    return true;
+}
+
+static bool compileShaderEditRequest(const ShaderCompileRequest &request,
+                                     ShaderCompileOperationResult &result,
+                                     std::string &error) {
+    std::string flattenedSource;
+    if (!buildShaderEditSource(request.files, request.entryFileIndex, request.sourceEncoding,
+                               flattenedSource, error, &result.lineMappings)) {
+        return false;
+    }
+
+    bytebuf shaderBytes;
+    shaderBytes.resize(flattenedSource.size());
+    if (!flattenedSource.empty()) {
+        memcpy(shaderBytes.data(), flattenedSource.data(), flattenedSource.size());
+    }
+
+    rdcpair<ResourceId, rdcstr> compiled = g_replay->BuildTargetShader(
+        rdcstr(request.entryPoint.c_str()),
+        request.sourceEncoding,
+        shaderBytes,
+        request.compileFlags,
+        request.shaderStage);
+
+    result.compiledId = compiled.first;
+    result.compileOutput = rdcToStr(compiled.second);
+    return true;
+}
+
+static void appendShaderDebugInfo(json &target, const ShaderDebugInfo &dbg) {
+    int32_t entryFile = -1;
+    if (!dbg.files.empty()) {
+        if (dbg.editBaseFile >= 0 && (size_t)dbg.editBaseFile < dbg.files.size())
+            entryFile = dbg.editBaseFile;
+        else if (dbg.entryLocation.fileIndex >= 0 &&
+                 (size_t)dbg.entryLocation.fileIndex < dbg.files.size())
+            entryFile = dbg.entryLocation.fileIndex;
+        else
+            entryFile = 0;
+
+        json files = json::array();
+        for (size_t i = 0; i < dbg.files.size(); i++) {
+            files.push_back({
+                {"filename", rdcToStr(dbg.files[i].filename)},
+                {"contents", rdcToStr(dbg.files[i].contents)},
+            });
+        }
+        target["sourceFiles"] = files;
+        target["entryFileIndex"] = entryFile;
+        target["source"] = rdcToStr(dbg.files[(size_t)entryFile].contents);
+    }
+
+    target["entrySourceName"] = rdcToStr(dbg.entrySourceName);
+    target["sourceEncoding"] = (uint32_t)dbg.encoding;
+    target["compiler"] = (uint32_t)dbg.compiler;
+    target["compileFlags"] = shaderCompileFlagsToJson(dbg.compileFlags);
+    target["editable"] = !dbg.files.empty() && IsTextRepresentation(dbg.encoding);
+}
+
+static void appendShaderReplacementInfo(json &target, const ShaderReplacementState &replacement) {
+    json files = json::array();
+    for (size_t i = 0; i < replacement.files.size(); i++) {
+        files.push_back({
+            {"filename", replacement.files[i].filename},
+            {"contents", replacement.files[i].contents},
+        });
+    }
+
+    target["sourceFiles"] = files;
+    target["entryFileIndex"] = replacement.entryFileIndex;
+    if (!replacement.files.empty()) {
+        const size_t entryIndex = replacement.entryFileIndex >= 0 &&
+                                  (size_t)replacement.entryFileIndex < replacement.files.size()
+            ? (size_t)replacement.entryFileIndex
+            : 0;
+        target["source"] = replacement.files[entryIndex].contents;
+    }
+    target["entryPoint"] = replacement.entryPoint;
+    target["entrySourceName"] = replacement.entryPoint;
+    target["sourceEncoding"] = (uint32_t)replacement.encoding;
+    target["compileFlags"] = shaderCompileFlagsToJson(replacement.compileFlags);
+    target["editable"] = !replacement.files.empty() && IsTextRepresentation(replacement.encoding);
+    target["hasReplacement"] = true;
+    target["replacementResourceId"] = resIdToString(replacement.replacementId);
 }
 
 // ResultDetails::Message() is implemented in the DLL — provide our own
@@ -1980,6 +2636,8 @@ static json handleGetShaderSource(int id, const json &params) {
     json result;
     result["entryPoint"] = rdcToStr(refl->entryPoint);
     result["stage"]      = (uint32_t)refl->stage;
+    result["shaderStage"] = (uint32_t)refl->stage;
+    result["hasReplacement"] = false;
 
     // If a disassembly target was specified, get the disassembly
     if (!target.empty()) {
@@ -1994,16 +2652,11 @@ static json handleGetShaderSource(int id, const json &params) {
         result["rawBytesSize"] = (uint64_t)refl->rawBytes.size();
     }
 
-    // Include debug info
-    if (!refl->debugInfo.files.empty()) {
-        json files = json::array();
-        for (size_t i = 0; i < refl->debugInfo.files.size(); i++) {
-            files.push_back({
-                {"filename", rdcToStr(refl->debugInfo.files[i].filename)},
-                {"contents", rdcToStr(refl->debugInfo.files[i].contents)}
-            });
-        }
-        result["sourceFiles"] = files;
+    appendShaderDebugInfo(result, refl->debugInfo);
+
+    auto replacementIt = g_shaderReplacementStates.find(rid);
+    if (replacementIt != g_shaderReplacementStates.end()) {
+        appendShaderReplacementInfo(result, replacementIt->second);
     }
 
     return makeResult(id, result);
@@ -2124,6 +2777,8 @@ static json handleGetShaderSourceForEvent(int id, const json &params) {
         stageResult["resourceId"] = resIdToString(si.resourceId);
         stageResult["name"] = resNameLookup(si.resourceId);
         stageResult["entryPoint"] = rdcToStr(refl->entryPoint);
+        stageResult["shaderStage"] = (uint32_t)si.stage;
+        stageResult["hasReplacement"] = false;
 
         // Mirror RenderDoc desktop: expose every source file as its own tab
         // instead of concatenating, and mark which file is the entry point.
@@ -2139,21 +2794,9 @@ static json handleGetShaderSourceForEvent(int id, const json &params) {
                 entryFile = dbg.entryLocation.fileIndex;
             else
                 entryFile = 0;
-
-            json files = json::array();
-            for (size_t i = 0; i < dbg.files.size(); i++) {
-                files.push_back({
-                    {"filename", rdcToStr(dbg.files[i].filename)},
-                    {"contents", rdcToStr(dbg.files[i].contents)}
-                });
-            }
-            stageResult["sourceFiles"] = files;
-            stageResult["entryFileIndex"] = entryFile;
-            // Back-compat `source` field: return ONLY the entry file (matches
-            // RenderDoc's default tab) instead of a concat of everything.
-            stageResult["source"] = rdcToStr(dbg.files[entryFile].contents);
-            stageResult["sourceEncoding"] = (uint32_t)dbg.encoding;
         }
+
+        appendShaderDebugInfo(stageResult, dbg);
 
         // Disassembly: pick a target that matches what RenderDoc's UI shows
         // by default for this API, instead of blindly taking targets[0].
@@ -2206,11 +2849,143 @@ static json handleGetShaderSourceForEvent(int id, const json &params) {
             }
         }
 
+        const uint64_t shaderKey = resIdToU64(si.resourceId);
+        auto replacementIt = g_shaderReplacementStates.find(shaderKey);
+        if (replacementIt != g_shaderReplacementStates.end()) {
+            appendShaderReplacementInfo(stageResult, replacementIt->second);
+        }
+
         shaderSources[si.name] = stageResult;
     }
 
     result["eventId"] = eventId;
     result["shaders"] = shaderSources;
+    return makeResult(id, result);
+}
+
+static json handleApplyShaderEdit(int id, const json &params) {
+    if (!g_replay)
+        return makeError(id, -1, "No replay active");
+
+    ShaderCompileRequest request;
+    std::string requestError;
+    if (!parseShaderCompileRequest(params, request, requestError)) {
+        return makeError(id, -2, requestError);
+    }
+
+    json result = {
+        {"originalResourceId", resIdToString(request.originalId)},
+        {"applied", false},
+    };
+
+    ShaderCompileOperationResult compileResult;
+    std::string compileError;
+    if (!compileShaderEditRequest(request, compileResult, compileError)) {
+        clearShaderReplacement(request.originalId);
+        result["errors"] = compileError;
+        return makeResult(id, result);
+    }
+
+    if (!compileResult.compileOutput.empty()) {
+        result["errors"] = compileResult.compileOutput;
+    }
+
+    json diagnostics = parseShaderCompileDiagnostics(
+        compileResult.compileOutput,
+        request.files,
+        compileResult.lineMappings,
+        request.entryFileIndex);
+    if (!diagnostics.empty()) {
+        result["diagnostics"] = diagnostics;
+    }
+
+    // Match RenderDoc desktop semantics: a failed compile clears any
+    // previously active replacement for this shader resource.
+    clearShaderReplacement(request.originalId);
+
+    if (compileResult.compiledId == ResourceId()) {
+        return makeResult(id, result);
+    }
+
+    g_replay->ReplaceResource(request.originalId, compileResult.compiledId);
+
+    ShaderReplacementState replacement;
+    replacement.replacementId = compileResult.compiledId;
+    replacement.stage = request.shaderStage;
+    replacement.encoding = request.sourceEncoding;
+    replacement.compileFlags = request.compileFlags;
+    replacement.entryPoint = request.entryPoint;
+    replacement.entryFileIndex = request.entryFileIndex;
+    replacement.files = request.files;
+    g_shaderReplacementStates[request.originalIdValue] = replacement;
+
+    result["applied"] = true;
+    result["replacementResourceId"] = resIdToString(compileResult.compiledId);
+    return makeResult(id, result);
+}
+
+static json handleCompileShaderEdit(int id, const json &params) {
+    if (!g_replay)
+        return makeError(id, -1, "No replay active");
+
+    ShaderCompileRequest request;
+    std::string requestError;
+    if (!parseShaderCompileRequest(params, request, requestError)) {
+        return makeError(id, -2, requestError);
+    }
+
+    json result = {
+        {"originalResourceId", resIdToString(request.originalId)},
+        {"compiled", false},
+    };
+
+    ShaderCompileOperationResult compileResult;
+    std::string compileError;
+    if (!compileShaderEditRequest(request, compileResult, compileError)) {
+        result["errors"] = compileError;
+        return makeResult(id, result);
+    }
+
+    if (!compileResult.compileOutput.empty()) {
+        result["errors"] = compileResult.compileOutput;
+    }
+
+    json diagnostics = parseShaderCompileDiagnostics(
+        compileResult.compileOutput,
+        request.files,
+        compileResult.lineMappings,
+        request.entryFileIndex);
+    if (!diagnostics.empty()) {
+        result["diagnostics"] = diagnostics;
+    }
+
+    if (compileResult.compiledId != ResourceId()) {
+        result["compiled"] = true;
+        g_replay->FreeTargetResource(compileResult.compiledId);
+    }
+
+    return makeResult(id, result);
+}
+
+static json handleRevertShaderEdit(int id, const json &params) {
+    if (!g_replay)
+        return makeError(id, -1, "No replay active");
+
+    const uint64_t originalIdValue = jsonToU64(params.contains("resourceId") ? params["resourceId"] : json());
+    if (originalIdValue == 0)
+        return makeError(id, -2, "resourceId is required");
+
+    ResourceId originalId = u64ToResId(originalIdValue);
+    const bool hadReplacement = g_shaderReplacementStates.find(originalIdValue) != g_shaderReplacementStates.end();
+    clearShaderReplacement(originalId);
+
+    json result = {
+        {"originalResourceId", resIdToString(originalId)},
+        {"reverted", hadReplacement},
+    };
+    if (!hadReplacement) {
+        result["errors"] = "No applied shader replacement was active for this resource.";
+    }
     return makeResult(id, result);
 }
 
@@ -5772,6 +6547,9 @@ static json dispatch(const json &req) {
         if (method == "getShaderEntryPoints") return handleGetShaderEntryPoints(id, params);
         if (method == "getShaderSource")    return handleGetShaderSource(id, params);
         if (method == "getShaderSourceForEvent") return handleGetShaderSourceForEvent(id, params);
+        if (method == "compileShaderEdit")  return handleCompileShaderEdit(id, params);
+        if (method == "applyShaderEdit")    return handleApplyShaderEdit(id, params);
+        if (method == "revertShaderEdit")   return handleRevertShaderEdit(id, params);
         if (method == "getTexturePreview") return handleGetTexturePreview(id, params);
         if (method == "getCurrentDrawPreview") return handleGetCurrentDrawPreview(id, params);
         if (method == "getTextureThumbBatch") return handleGetTextureThumbBatch(id, params);

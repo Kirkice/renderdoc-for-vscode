@@ -4,6 +4,18 @@
     const TEXTURES_SPLIT_STORAGE_KEY = 'renderdoc.texturesPreviewHeight';
     const TEXTURES_PREVIEW_MIN_HEIGHT = 140;
     const TEXTURES_LIST_MIN_HEIGHT = 140;
+    const SHADER_ENCODING = {
+        Unknown: 0,
+        DXBC: 1,
+        GLSL: 2,
+        SPIRV: 3,
+        SPIRVAsm: 4,
+        HLSL: 5,
+        DXIL: 6,
+        OpenGLSPIRV: 7,
+        OpenGLSPIRVAsm: 8,
+        Slang: 9,
+    };
     const state = {
         captureInfo: null,
         drawCalls: [],
@@ -13,6 +25,15 @@
         drawCall: null,
         shaders: null,
         pipeline: null,
+        shaderDrafts: {},
+        shaderEditBusy: false,
+        shaderEditStatus: null,
+        shaderDiagnostics: [],
+        shaderDiagnosticsStage: null,
+        shaderDiagnosticJump: null,
+        shaderEditorSyncKey: null,
+        shaderEditorContext: null,
+        pendingShaderSelection: null,
         activeTab: 'textures',
         activeShaderStage: null,
         activeShaderFile: {}, // map: stage -> file index (or -1 for disassembly)
@@ -63,6 +84,298 @@
         const r = resById().get(String(rid));
         return r ? resourceDisplayName(r) : ('Resource ' + rid);
     };
+
+    function shaderDraftBucket(stage, create) {
+        if (!state.shaderDrafts[stage] && create) {
+            state.shaderDrafts[stage] = {};
+        }
+        return state.shaderDrafts[stage] || null;
+    }
+
+    function getShaderDraft(stage, fileIndex, fallback) {
+        const bucket = shaderDraftBucket(stage, false);
+        const key = String(fileIndex);
+        return bucket && Object.prototype.hasOwnProperty.call(bucket, key) ? bucket[key] : fallback;
+    }
+
+    function setShaderDraft(stage, fileIndex, value, originalValue) {
+        const key = String(fileIndex);
+        const bucket = shaderDraftBucket(stage, true);
+        if (value === originalValue) {
+            delete bucket[key];
+            if (Object.keys(bucket).length === 0) {
+                delete state.shaderDrafts[stage];
+            }
+            return;
+        }
+        bucket[key] = value;
+    }
+
+    function clearShaderDraftsForStage(stage) {
+        delete state.shaderDrafts[stage];
+    }
+
+    function clearAllShaderDrafts() {
+        state.shaderDrafts = {};
+    }
+
+    function hasShaderDrafts(stage) {
+        if (stage) {
+            const bucket = shaderDraftBucket(stage, false);
+            return !!(bucket && Object.keys(bucket).length > 0);
+        }
+        return Object.keys(state.shaderDrafts).length > 0;
+    }
+
+    function buildEditedShaderFiles(stage, files) {
+        return files.map((file, index) => ({
+            filename: file && file.filename ? file.filename : ('file ' + index),
+            contents: getShaderDraft(stage, index, (file && file.contents) || ''),
+        }));
+    }
+
+    function shaderLanguageForEncoding(encoding) {
+        switch (encoding) {
+            case SHADER_ENCODING.GLSL:
+                return 'glsl';
+            case SHADER_ENCODING.HLSL:
+                return 'hlsl';
+            case SHADER_ENCODING.Slang:
+                return 'plaintext';
+            case SHADER_ENCODING.SPIRVAsm:
+            case SHADER_ENCODING.OpenGLSPIRVAsm:
+                return 'plaintext';
+            default:
+                return 'plaintext';
+        }
+    }
+
+    function renderShaderEditStatus() {
+        return;
+    }
+
+    function clearShaderDiagnostics() {
+        state.shaderDiagnostics = [];
+        state.shaderDiagnosticsStage = null;
+        state.shaderDiagnosticJump = null;
+    }
+
+    function clearShaderEditorSync() {
+        state.shaderEditorSyncKey = null;
+        state.shaderEditorContext = null;
+        state.pendingShaderSelection = null;
+    }
+
+    function shaderEditorSyncKeyForPayload(payload) {
+        return [
+            String(payload.eventId ?? ''),
+            String(payload.resourceId ?? ''),
+            String(payload.stage ?? ''),
+            String(payload.selectedFileIndex ?? ''),
+            String(payload.filename ?? ''),
+        ].join('|');
+    }
+
+    function postOpenShaderInEditor(payload) {
+        if (!payload || !payload.source) {
+            return;
+        }
+
+        vscode.postMessage({
+            type: 'openShaderInEditor',
+            source: payload.source,
+            language: payload.language,
+            eventId: payload.eventId,
+            resourceId: payload.resourceId,
+            stage: payload.stage,
+            filename: payload.filename,
+            files: payload.files,
+            selectedFileIndex: payload.selectedFileIndex,
+            preserveFocus: payload.preserveFocus,
+            openToSide: payload.openToSide,
+            preview: payload.preview,
+            line: payload.line,
+            column: payload.column,
+        });
+    }
+
+    function syncLinkedShaderEditor(payload) {
+        if (!payload || !payload.source) {
+            return;
+        }
+
+        const syncKey = shaderEditorSyncKeyForPayload(payload);
+
+        if (state.shaderEditorSyncKey === syncKey) {
+            return;
+        }
+
+        state.shaderEditorSyncKey = syncKey;
+        postOpenShaderInEditor({
+            ...payload,
+            preserveFocus: true,
+            openToSide: true,
+            preview: true,
+        });
+    }
+
+    function jumpToShaderDiagnostic(diagnostic) {
+        if (!diagnostic || typeof diagnostic.line !== 'number') return;
+
+        const context = state.shaderEditorContext;
+        if (!context) {
+            return;
+        }
+
+        const activeStage = state.activeShaderStage;
+        const fileIndex = typeof diagnostic.fileIndex === 'number'
+            ? diagnostic.fileIndex
+            : state.activeShaderFile[activeStage];
+
+        const targetFileIndex = typeof fileIndex === 'number' ? fileIndex : context.selectedFileIndex;
+        let targetSource = context.currentCode;
+        let targetFilename = context.currentFileName || (activeStage + '-shader');
+        let targetLanguage = context.language;
+
+        if (typeof targetFileIndex === 'number' &&
+            targetFileIndex >= 0 &&
+            Array.isArray(context.files) &&
+            targetFileIndex < context.files.length) {
+            targetSource = context.files[targetFileIndex].contents;
+            targetFilename = context.files[targetFileIndex].filename;
+            targetLanguage = context.language;
+        } else if (targetFileIndex === -1) {
+            targetLanguage = 'plaintext';
+        }
+
+        const openPayload = {
+            source: targetSource,
+            language: targetLanguage,
+            eventId: context.eventId,
+            resourceId: context.resourceId,
+            stage: context.stage,
+            filename: targetFilename,
+            files: context.files,
+            selectedFileIndex: targetFileIndex,
+            preserveFocus: false,
+            openToSide: true,
+            preview: false,
+            line: diagnostic.line,
+            column: diagnostic.column || 1,
+        };
+
+        state.shaderEditorSyncKey = shaderEditorSyncKeyForPayload(openPayload);
+
+        if (typeof targetFileIndex === 'number' && state.activeShaderFile[activeStage] !== targetFileIndex) {
+            state.shaderDiagnosticJump = {
+                stage: activeStage,
+                fileIndex: targetFileIndex,
+                line: diagnostic.line,
+                column: diagnostic.column || 1,
+            };
+            state.activeShaderFile[activeStage] = targetFileIndex;
+            renderShaders();
+        }
+
+        postOpenShaderInEditor(openPayload);
+    }
+
+    function applyPendingShaderSelection() {
+        const pending = state.pendingShaderSelection;
+        if (!pending || pending.eventId !== state.eventId || !state.shaders || !state.shaders.shaders) {
+            return false;
+        }
+
+        const shaders = state.shaders.shaders || {};
+        if (!shaders[pending.stage]) {
+            return false;
+        }
+
+        state.activeShaderStage = pending.stage;
+        state.activeShaderFile[pending.stage] = pending.fileIndex;
+        state.pendingShaderSelection = null;
+
+        if (state.activeTab !== 'shaders') {
+            switchTab('shaders');
+        } else {
+            renderShaders();
+        }
+        return true;
+    }
+
+    function renderShaderDiagnostics() {
+        const diagnosticsEl = document.getElementById('shader-diagnostics');
+        if (!diagnosticsEl) return;
+
+        const diagnostics = state.shaderDiagnosticsStage === state.activeShaderStage
+            ? state.shaderDiagnostics
+            : [];
+
+        diagnosticsEl.innerHTML = '';
+        if (!diagnostics || diagnostics.length === 0) {
+            diagnosticsEl.hidden = true;
+            return;
+        }
+
+        diagnosticsEl.hidden = false;
+        for (const diagnostic of diagnostics) {
+            const clickable = typeof diagnostic.line === 'number';
+            const item = document.createElement(clickable ? 'button' : 'div');
+            if (clickable) {
+                item.type = 'button';
+                item.addEventListener('click', () => jumpToShaderDiagnostic(diagnostic));
+            }
+            item.className = 'shader-diagnostic ' + (diagnostic.severity || 'note');
+
+            const header = document.createElement('div');
+            header.className = 'shader-diagnostic-head';
+
+            const severity = document.createElement('span');
+            severity.className = 'shader-diagnostic-severity';
+            severity.textContent = String(diagnostic.severity || 'note');
+            header.appendChild(severity);
+
+            const location = document.createElement('span');
+            location.className = 'shader-diagnostic-location';
+            const locationParts = [];
+            if (diagnostic.filename) {
+                locationParts.push(diagnostic.filename);
+            } else if (typeof diagnostic.fileIndex === 'number') {
+                locationParts.push('file ' + diagnostic.fileIndex);
+            }
+            if (typeof diagnostic.line === 'number') {
+                let lineText = String(diagnostic.line);
+                if (typeof diagnostic.column === 'number') {
+                    lineText += ':' + diagnostic.column;
+                }
+                locationParts.push(lineText);
+            }
+            location.textContent = locationParts.join(' · ') || 'Compile log';
+            header.appendChild(location);
+
+            const message = document.createElement('div');
+            message.className = 'shader-diagnostic-message';
+            message.textContent = diagnostic.message || diagnostic.raw || '';
+
+            item.appendChild(header);
+            item.appendChild(message);
+            diagnosticsEl.appendChild(item);
+        }
+    }
+
+    function clearShaderReplayViews() {
+        state.shaders = null;
+        state.pipeline = null;
+        state.meshCache = {};
+        state.meshPending = {};
+        thumbCache.clear();
+        thumbErrors.clear();
+        thumbPending.clear();
+        rtPreviewCache.clear();
+        rtPreviewErrors.clear();
+        rtPreviewPending.clear();
+        resetCurrentRTPreviewView();
+    }
 
     function updateShaderAliasesFromPipeline(pipeline) {
         const shaders = pipeline && pipeline.shaders;
@@ -263,7 +576,6 @@
             if (dc.children?.length) {
                 const found = findParentGroup(dc.children, eventId, dc);
                 if (found !== null) return found;
-                // Also consider this node as a candidate if a descendant matches
                 const contains = flattenEvents(dc.children).some(c => c.eventId === eventId);
                 if (contains) return dc;
             }
@@ -328,6 +640,11 @@
                         state.drawCall = null;
                         state.shaders = null;
                         state.pipeline = null;
+                        clearAllShaderDrafts();
+                        clearShaderDiagnostics();
+                        clearShaderEditorSync();
+                        state.shaderEditBusy = false;
+                        state.shaderEditStatus = null;
                         state.meshCache = {};
                         state.meshPending = {};
                     }
@@ -367,6 +684,11 @@
                     if (!sameEvent) {
                         state.shaders = null;
                         state.pipeline = null;
+                        clearAllShaderDrafts();
+                        clearShaderDiagnostics();
+                        clearShaderEditorSync();
+                        state.shaderEditBusy = false;
+                        state.shaderEditStatus = null;
                         state.meshCache = {};
                         state.meshPending = {};
                         state.meshCam.auto = true;
@@ -389,8 +711,39 @@
             case 'shadersLoaded':
                 if (m.eventId === state.eventId) {
                     state.shaders = m.data;
+                    applyPendingShaderSelection();
                     if (state.activeTab === 'shaders') renderShaders();
                 }
+                break;
+            case 'shaderEditResult':
+                state.shaderEditBusy = false;
+                state.shaderDiagnostics = Array.isArray(m.diagnostics) ? m.diagnostics : [];
+                state.shaderDiagnosticsStage = m.stage || null;
+                state.shaderDiagnosticJump = null;
+                clearShaderEditorSync();
+                state.shaderEditStatus = {
+                    kind: m.ok ? 'success' : 'error',
+                    message: m.message || (m.ok ? 'Shader update complete.' : 'Shader update failed.'),
+                };
+                if (m.ok && m.refresh) {
+                    clearShaderDraftsForStage(m.stage);
+                    clearShaderReplayViews();
+                    render();
+                    if (state.modalResource) {
+                        textureModalPreviewEl.innerHTML = '<div class="muted">Loading…</div>';
+                        requestTexture();
+                    }
+                } else if (state.activeTab === 'shaders') {
+                    renderShaders();
+                }
+                break;
+            case 'syncShaderSelection':
+                state.pendingShaderSelection = {
+                    eventId: m.eventId,
+                    stage: m.stage,
+                    fileIndex: m.fileIndex,
+                };
+                applyPendingShaderSelection();
                 break;
             case 'pipelineLoaded':
                 if (m.eventId === state.eventId) {
@@ -2132,67 +2485,158 @@
         const body = document.getElementById('shaders-body');
         const toolbar = document.getElementById('shaders-toolbar');
         const shaderPaneMeta = document.getElementById('shader-pane-meta');
-        if (state.eventId == null) {
-            body.textContent = 'Select an event.';
-            body.className = 'code-view empty-state';
-            if (shaderPaneMeta) shaderPaneMeta.textContent = 'Select an event to inspect bound shader stages.';
+        const stageTabs = document.getElementById('shader-stage-tabs');
+        const fileBar = document.getElementById('shader-file-tabs');
+        if (!body || !toolbar || !stageTabs || !fileBar) return;
+
+        const setReadOnlyState = (message, metaText) => {
+            body.textContent = message;
+            body.className = 'shader-editor-panel empty-state';
             toolbar.hidden = true;
+            stageTabs.innerHTML = '';
+            fileBar.innerHTML = '';
+            fileBar.hidden = true;
+            if (shaderPaneMeta) shaderPaneMeta.textContent = metaText;
+            renderShaderEditStatus();
+            renderShaderDiagnostics();
+        };
+
+        if (state.eventId == null) {
+            setReadOnlyState('Select an event.', 'Select an event to inspect bound shader stages.');
             return;
         }
         if (!state.shaders) {
-            body.textContent = 'Loading shaders…';
-            body.className = 'code-view empty-state';
-            if (shaderPaneMeta) shaderPaneMeta.textContent = 'Collecting shader source and stage metadata from the current event.';
-            toolbar.hidden = true;
+            setReadOnlyState('Loading shaders…', 'Collecting shader source and stage metadata from the current event.');
             return;
         }
         if (state.shaders.error) {
-            body.textContent = 'Shader sources unavailable: ' + state.shaders.error + '\\n\\n(Local replay required.)';
-            body.className = 'code-view empty-state';
-            if (shaderPaneMeta) shaderPaneMeta.textContent = 'Shader extraction needs an active local replay for this capture.';
-            toolbar.hidden = true;
+            setReadOnlyState(
+                'Shader sources unavailable: ' + state.shaders.error + '\n\n(Local replay required.)',
+                'Shader extraction needs an active local replay for this capture.',
+            );
             return;
         }
+
         const shaders = state.shaders.shaders || {};
         const stages = Object.keys(shaders);
+        const vertexStageIndex = stages.indexOf('vertex');
+        const fragmentStageIndex = stages.indexOf('fragment');
+        if (vertexStageIndex !== -1 && fragmentStageIndex !== -1 && vertexStageIndex > fragmentStageIndex) {
+            stages.splice(vertexStageIndex, 1);
+            stages.splice(fragmentStageIndex, 0, 'vertex');
+        }
         if (stages.length === 0) {
-            body.textContent = 'No bound shaders at this event.';
-            body.className = 'code-view empty-state';
-            if (shaderPaneMeta) shaderPaneMeta.textContent = 'No shader stages are bound at the selected event.';
-            toolbar.hidden = true;
+            setReadOnlyState('No bound shaders at this event.', 'No shader stages are bound at the selected event.');
             return;
         }
 
         toolbar.hidden = false;
-        const tabs = document.getElementById('shader-stage-tabs');
-        tabs.innerHTML = '';
+        stageTabs.innerHTML = '';
         if (!state.activeShaderStage || !stages.includes(state.activeShaderStage)) {
             state.activeShaderStage = stages[0];
         }
-        for (const s of stages) {
+
+        for (const stage of stages) {
             const btn = document.createElement('button');
-            btn.className = 'stage-tab' + (s === state.activeShaderStage ? ' active' : '');
-            btn.textContent = s;
-            btn.addEventListener('click', () => { state.activeShaderStage = s; renderShaders(); });
-            tabs.appendChild(btn);
+            btn.className = 'stage-tab' + (stage === state.activeShaderStage ? ' active' : '');
+            btn.textContent = stage;
+            btn.addEventListener('click', () => {
+                state.activeShaderStage = stage;
+                renderShaders();
+            });
+            stageTabs.appendChild(btn);
         }
 
-        const openBtn = document.createElement('button');
-        openBtn.className = 'icon-btn';
-        openBtn.style.marginLeft = 'auto';
-        openBtn.textContent = 'Open in Editor';
-        openBtn.addEventListener('click', () => {
-            const info = shaders[state.activeShaderStage];
-            vscode.postMessage({ type: 'openShaderInEditor', source: info.source || info.disassembly || '', language: 'glsl' });
+        const activeStage = state.activeShaderStage;
+        const info = shaders[activeStage] || {};
+        const sourceFiles = Array.isArray(info.sourceFiles) ? info.sourceFiles : [];
+        const currentFiles = buildEditedShaderFiles(activeStage, sourceFiles);
+        const hasDisasm = typeof info.disassembly === 'string' && info.disassembly.length > 0;
+        const entryFileIndex = (typeof info.entryFileIndex === 'number' && info.entryFileIndex >= 0)
+            ? info.entryFileIndex
+            : 0;
+        const linkedSourceFiles = buildEditedShaderFiles(activeStage, sourceFiles);
+
+        let cur = state.activeShaderFile[activeStage];
+        const maxIdx = currentFiles.length - 1;
+        if (cur === undefined || cur === null || (cur >= 0 && cur > maxIdx) || (cur === -1 && !hasDisasm)) {
+            cur = currentFiles.length > 0 ? entryFileIndex : (hasDisasm ? -1 : 0);
+            state.activeShaderFile[activeStage] = cur;
+        }
+        const currentLanguage = cur === -1 && hasDisasm ? 'plaintext' : shaderLanguageForEncoding(info.sourceEncoding);
+
+        const editableStage = !!info.editable && currentFiles.length > 0;
+        const currentFile = cur >= 0 && cur < currentFiles.length ? currentFiles[cur] : null;
+        const currentFileName = currentFile
+            ? (currentFile.filename || ('file ' + cur))
+            : (cur === -1 && hasDisasm ? (info.disassemblyTarget || 'Disassembly') : '');
+        const currentCode = cur === -1 && hasDisasm
+            ? info.disassembly
+            : currentFile
+                ? (currentFile.contents || '')
+                : (info.source || info.disassembly || ('// No source available for ' + activeStage));
+
+        const applyBtn = document.createElement('button');
+        applyBtn.className = 'icon-btn';
+        applyBtn.style.marginLeft = 'auto';
+        applyBtn.textContent = 'Apply';
+        applyBtn.disabled = !editableStage || state.shaderEditBusy;
+        applyBtn.title = editableStage
+            ? 'Compile this shader source and apply it only if compilation succeeds'
+            : 'This shader stage is not editable';
+        applyBtn.addEventListener('click', () => {
+            if (!editableStage || state.shaderEditBusy) return;
+            state.shaderEditBusy = true;
+            state.shaderEditStatus = { kind: 'info', message: 'Compiling and applying shader…' };
+            renderShaders();
+            vscode.postMessage({
+                type: 'applyShaderEdit',
+                eventId: state.eventId,
+                stage: activeStage,
+                resourceId: String(info.resourceId || ''),
+                shaderStage: typeof info.shaderStage === 'number' ? info.shaderStage : 0,
+                sourceEncoding: typeof info.sourceEncoding === 'number' ? info.sourceEncoding : SHADER_ENCODING.Unknown,
+                entryPoint: info.entryPoint || 'main',
+                entryFileIndex,
+                compileFlags: Array.isArray(info.compileFlags) ? info.compileFlags : [],
+                files: linkedSourceFiles,
+            });
         });
-        tabs.appendChild(openBtn);
+        stageTabs.appendChild(applyBtn);
+
+        const revertBtn = document.createElement('button');
+        revertBtn.className = 'icon-btn';
+        revertBtn.textContent = 'Revert';
+        revertBtn.disabled = state.shaderEditBusy || !info.hasReplacement;
+        revertBtn.title = info.hasReplacement
+            ? 'Remove the applied replacement shader from the current replay session'
+            : 'No applied shader replacement is active for this stage';
+        revertBtn.addEventListener('click', () => {
+            if (state.shaderEditBusy) return;
+            if (info.hasReplacement) {
+                state.shaderEditBusy = true;
+                state.shaderEditStatus = { kind: 'info', message: 'Reverting shader replacement…' };
+                renderShaders();
+                vscode.postMessage({
+                    type: 'revertShaderEdit',
+                    eventId: state.eventId,
+                    stage: activeStage,
+                    resourceId: String(info.resourceId || ''),
+                });
+                return;
+            }
+        });
+        stageTabs.appendChild(revertBtn);
 
         const analyzeBtn = document.createElement('button');
         analyzeBtn.className = 'icon-btn';
         analyzeBtn.textContent = 'Mali Analyze';
-        analyzeBtn.title = 'Analyze performance with Mali Offline Compiler';
+        analyzeBtn.title = cur === -1
+            ? 'Switch to a source file tab to analyze source code'
+            : 'Analyze performance with Mali Offline Compiler';
+        analyzeBtn.disabled = cur === -1 || !currentCode.trim();
         analyzeBtn.addEventListener('click', () => {
-            const info = shaders[state.activeShaderStage];
+            if (analyzeBtn.disabled) return;
             const container = document.getElementById('mali-offline-result-container');
             const splitter = document.getElementById('mali-offline-splitter');
             if (container) container.style.display = 'flex';
@@ -2201,87 +2645,108 @@
             if (outDom) outDom.innerText = 'Analyzing...';
             vscode.postMessage({
                 type: 'analyzeMaliOffline',
-                source: info.source || '',
-                stage: state.activeShaderStage
+                source: currentCode,
+                stage: activeStage,
             });
         });
-        tabs.appendChild(analyzeBtn);
+        stageTabs.appendChild(analyzeBtn);
 
-        const info = shaders[state.activeShaderStage];
-        body.className = 'code-view';
-        // Header shows shader resource name + id.
-        const pipeStage = state.pipeline && state.pipeline.shaders && state.pipeline.shaders[state.activeShaderStage];
-        const rid = (info && info.resourceId) || (pipeStage && pipeStage.resourceId);
-        const shaderName = (info && info.name) || (pipeStage && pipeStage.name) || (rid ? resName(rid) : '');
+        fileBar.innerHTML = '';
+        const makeTab = (label, idx, isDirty) => {
+            const tab = document.createElement('button');
+            tab.className = 'stage-tab shader-file-tab' + (idx === cur ? ' active' : '');
+            if (isDirty) tab.classList.add('dirty');
+            tab.textContent = label;
+            tab.title = label;
+            tab.addEventListener('click', () => {
+                state.activeShaderFile[activeStage] = idx;
+                renderShaders();
+            });
+            fileBar.appendChild(tab);
+            return tab;
+        };
 
-        // File sub-tabs — mirror RenderDoc desktop's file switcher inside a
-        // shader stage. Each source file is a distinct tab; disassembly (if
-        // available) is appended as a virtual last tab.
-        const fileBar = document.getElementById('shader-file-tabs');
-        if (fileBar) {
-            fileBar.innerHTML = '';
-            const files = Array.isArray(info.sourceFiles) ? info.sourceFiles : [];
-            const hasDisasm = typeof info.disassembly === 'string' && info.disassembly.length > 0;
-            const defaultIdx = (typeof info.entryFileIndex === 'number' && info.entryFileIndex >= 0) ? info.entryFileIndex : 0;
-
-            // Resolve current selection (stored per-stage).
-            let cur = state.activeShaderFile[state.activeShaderStage];
-            const maxIdx = files.length - 1;
-            if (cur === undefined || cur === null || (cur >= 0 && cur > maxIdx) || (cur === -1 && !hasDisasm)) {
-                cur = files.length > 0 ? defaultIdx : (hasDisasm ? -1 : 0);
-                state.activeShaderFile[state.activeShaderStage] = cur;
-            }
-
-            const makeTab = (label, idx) => {
-                const b = document.createElement('button');
-                b.className = 'stage-tab shader-file-tab' + (idx === cur ? ' active' : '');
-                b.textContent = label;
-                b.title = label;
-                b.addEventListener('click', () => {
-                    state.activeShaderFile[state.activeShaderStage] = idx;
-                    renderShaders();
-                });
-                fileBar.appendChild(b);
-            };
-            for (let i = 0; i < files.length; i++) {
-                const fn = (files[i] && files[i].filename) || ('file ' + i);
-                const label = fn + (i === defaultIdx ? ' *' : '');
-                makeTab(label, i);
-            }
-            if (hasDisasm) {
-                const tgt = info.disassemblyTarget || 'Disassembly';
-                makeTab(tgt, -1);
-            }
-            fileBar.hidden = (files.length + (hasDisasm ? 1 : 0)) <= 0;
+        for (let i = 0; i < currentFiles.length; i++) {
+            const fn = (currentFiles[i] && currentFiles[i].filename) || ('file ' + i);
+            const label = fn + (i === entryFileIndex ? ' *' : '');
+            const originalContents = (sourceFiles[i] && sourceFiles[i].contents) || '';
+            const currentContents = getShaderDraft(activeStage, i, originalContents);
+            makeTab(label, i, currentContents !== originalContents);
         }
+        if (hasDisasm) {
+            makeTab(info.disassemblyTarget || 'Disassembly', -1, false);
+        }
+        fileBar.hidden = (currentFiles.length + (hasDisasm ? 1 : 0)) <= 0;
 
-        let header;
-        if (rid) {
-            const nameStr = shaderName && shaderName !== ('Resource ' + rid) ? shaderName : ('Shader ' + rid);
-            header = '// ' + state.activeShaderStage + ' shader — ' + nameStr + ' (id ' + rid + ')\\n';
-        } else {
-            header = '// ' + state.activeShaderStage + ' shader\\n';
-        }
+        const pipeStage = state.pipeline && state.pipeline.shaders && state.pipeline.shaders[activeStage];
+        const shaderResourceId = info.resourceId || (pipeStage && pipeStage.resourceId) || '';
+        const shaderLabel = info.name
+            || (pipeStage && (pipeStage.programName || pipeStage.shaderName || pipeStage.name))
+            || (shaderResourceId ? resName(shaderResourceId) : '');
+        const resourceText = shaderLabel
+            ? (' · ' + shaderLabel)
+            : (shaderResourceId ? (' · Resource ' + shaderResourceId) : '');
+        const fileCount = currentFiles.length;
+        const fileText = currentFileName ? (' · ' + currentFileName) : '';
+        const modeText = cur === -1 && hasDisasm
+            ? ' · disassembly preview'
+            : (editableStage ? ' · linked editor preview' : ' · read-only preview');
+        const replacementText = info.hasReplacement ? ' · replacement active' : '';
+        const updateShaderPaneMeta = () => {
+            if (!shaderPaneMeta) return;
+            shaderPaneMeta.textContent = activeStage + ' stage' + resourceText + fileText + ' · ' + fileCount + ' source file' + (fileCount === 1 ? '' : 's') + (hasDisasm ? ' · disassembly available' : '') + modeText + replacementText;
+        };
+        updateShaderPaneMeta();
 
-        const files = Array.isArray(info.sourceFiles) ? info.sourceFiles : [];
-        const hasDisasm = typeof info.disassembly === 'string' && info.disassembly.length > 0;
-        const cur = state.activeShaderFile[state.activeShaderStage];
-        if (shaderPaneMeta) {
-            const fileCount = files.length;
-            const resourceText = rid ? (' · Resource ' + rid) : '';
-            shaderPaneMeta.textContent = state.activeShaderStage + ' stage' + resourceText + ' · ' + fileCount + ' source file' + (fileCount === 1 ? '' : 's') + (hasDisasm ? ' · disassembly available' : '');
+        state.shaderEditorContext = {
+            eventId: state.eventId,
+            resourceId: String(info.resourceId || ''),
+            stage: activeStage,
+            language: currentLanguage,
+            currentCode,
+            currentFileName: currentFileName || (activeStage + '-shader'),
+            selectedFileIndex: cur,
+            files: linkedSourceFiles,
+        };
+
+        body.className = 'shader-editor-panel';
+        const statusKind = state.shaderEditStatus && state.shaderEditStatus.message
+            ? (state.shaderEditStatus.kind || 'info')
+            : 'neutral';
+        const statusTitle = state.shaderEditStatus && state.shaderEditStatus.message
+            ? (state.shaderEditStatus.kind === 'success'
+                ? 'Shader compiled and applied.'
+                : (state.shaderEditStatus.kind === 'error' ? 'Shader compile failed.' : 'Shader compile in progress.'))
+            : 'Shader editor is linked.';
+        const statusMessage = state.shaderEditStatus && state.shaderEditStatus.message
+            ? state.shaderEditStatus.message
+            : 'Edit the shader in the real VS Code editor on the right, then use Apply here. This panel will later host shader performance data.';
+        body.innerHTML = '<div class="shader-editor-card ' + esc(statusKind) + '">'
+            + '<div class="shader-editor-eyebrow">Shader Status</div>'
+            + '<div class="shader-editor-title">' + esc(statusTitle) + '</div>'
+            + '<div class="shader-editor-copy">' + esc(statusMessage)
+                .replace(/\n/g, '<br>')
+            + '</div>'
+            + '</div>';
+
+        syncLinkedShaderEditor({
+            source: currentCode,
+            language: currentLanguage,
+            eventId: state.eventId,
+            resourceId: String(info.resourceId || ''),
+            stage: activeStage,
+            filename: currentFileName || (activeStage + '-shader'),
+            files: linkedSourceFiles,
+            selectedFileIndex: cur,
+        });
+
+        renderShaderEditStatus();
+        renderShaderDiagnostics();
+
+        const pendingJump = state.shaderDiagnosticJump;
+        if (pendingJump && pendingJump.stage === activeStage && pendingJump.fileIndex === cur) {
+            state.shaderDiagnosticJump = null;
         }
-        let code;
-        if (cur === -1 && hasDisasm) {
-            code = info.disassembly;
-            header += '// [disassembly: ' + (info.disassemblyTarget || '?') + ']\\n';
-        } else if (cur >= 0 && cur < files.length) {
-            code = files[cur].contents || '';
-            header += '// [' + (files[cur].filename || ('file ' + cur)) + ']\\n';
-        } else {
-            code = info.source || info.disassembly || '// No source available for ' + state.activeShaderStage;
-        }
-        body.textContent = header + '\\n' + code;
     }
 
     // ── Textures ───────────────────────────────────────────────────

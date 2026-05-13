@@ -31,9 +31,9 @@ import { DrawOverlayPanel } from './views/drawOverlayPanel';
 import { initTools, registerAllTools } from './copilot/tools';
 import { initChatParticipant, registerChatParticipant } from './copilot/chatParticipant';
 import { ensureNativeBridge } from './bridgeInstaller';
+import { openShaderSourceDocument } from './shaderEditor';
 import { CaptureCache, formatBytes } from './util/captureCache';
 import {
-    getShaderPanelHtml,
     getPipelineStateHtml,
     getTexturePreviewHtml,
     getResourceDetailHtml,
@@ -2421,7 +2421,29 @@ async function viewShaderSource(context: vscode.ExtensionContext, item: any) {
             try {
                 if (resourceId && eventId === undefined) {
                     const result = await bridge.getShaderSourceByResource(resourceId);
-                    showShaderPanel(context, result.panelData, parseInt(resourceId, 10) || 0);
+                    const entries = Object.entries(result.panelData).map(([label, source]) => ({
+                        label,
+                        source,
+                        description: `${String(source).length} chars`,
+                    }));
+                    const selection = entries.length === 1
+                        ? entries[0]
+                        : await vscode.window.showQuickPick(entries, {
+                            placeHolder: 'Select a shader source to open in the editor',
+                        });
+                    if (!selection) {
+                        return;
+                    }
+                    await openShaderSourceDocument({
+                        context,
+                        source: String(selection.source),
+                        capturePath: currentCapturePath,
+                        resourceId,
+                        stage: selection.label.split(/\s+/)[0].replace(/shader$/i, '').toLowerCase(),
+                        filename: selection.label,
+                        language: 'glsl',
+                        viewColumn: vscode.ViewColumn.Active,
+                    });
                     return;
                 }
 
@@ -2430,15 +2452,53 @@ async function viewShaderSource(context: vscode.ExtensionContext, item: any) {
                     vscode.window.showInformationMessage('No shader sources returned by the native bridge for this event.');
                     return;
                 }
-                const panelData: Record<string, string> = {};
+                const entries: Array<{
+                    label: string;
+                    source: string;
+                    stage: string;
+                    filename: string;
+                    language: string;
+                    description: string;
+                }> = [];
                 for (const [stage, info] of Object.entries(result.shaders) as [string, any][]) {
-                    // Build a human-readable tab label: "VertexShader  myVS.hlsl (main)"
                     const shaderName: string = info.name || '';
                     const entry: string = info.entryPoint && info.entryPoint !== 'main' ? ` (${info.entryPoint})` : '';
-                    const tabLabel = shaderName ? `${stage}  ${shaderName}${entry}` : `${stage}${entry}`;
-                    panelData[tabLabel] = info.source || info.disassembly || '// No source available';
+                    const label = shaderName ? `${stage}  ${shaderName}${entry}` : `${stage}${entry}`;
+                    const source = String(info.source || info.disassembly || '// No source available');
+                    const fileIndex = typeof info.entryFileIndex === 'number' ? info.entryFileIndex : 0;
+                    const filename = Array.isArray(info.sourceFiles) && info.sourceFiles[fileIndex]?.filename
+                        ? String(info.sourceFiles[fileIndex].filename)
+                        : label;
+                    const sourceEncoding = Number(info.sourceEncoding ?? 0);
+                    const language = sourceEncoding === 2 ? 'glsl' : (sourceEncoding === 5 ? 'hlsl' : 'plaintext');
+                    entries.push({
+                        label,
+                        source,
+                        stage,
+                        filename,
+                        language,
+                        description: `${source.length} chars`,
+                    });
                 }
-                showShaderPanel(context, panelData, eventId);
+                const selection = entries.length === 1
+                    ? entries[0]
+                    : await vscode.window.showQuickPick(entries, {
+                        placeHolder: 'Select a shader stage to open in the editor',
+                    });
+                if (!selection) {
+                    return;
+                }
+                await openShaderSourceDocument({
+                    context,
+                    source: selection.source,
+                    capturePath: currentCapturePath,
+                    eventId,
+                    resourceId,
+                    stage: selection.stage,
+                    filename: selection.filename,
+                    language: selection.language,
+                    viewColumn: vscode.ViewColumn.Active,
+                });
             } catch (err: any) {
                 vscode.window.showErrorMessage(`Failed to get shader source: ${err.message}`);
             }
@@ -2472,8 +2532,15 @@ async function viewAllShaders(context: vscode.ExtensionContext) {
                     { placeHolder: `Found ${shaders.length} shader(s) — select one to view` }
                 );
                 if (pick) {
-                    const doc = await vscode.workspace.openTextDocument({ content: shaders[pick.index].source, language: 'glsl' });
-                    await vscode.window.showTextDocument(doc);
+                    await openShaderSourceDocument({
+                        context,
+                        source: shaders[pick.index].source,
+                        capturePath: currentCapturePath,
+                        stage: 'shader',
+                        filename: shaders[pick.index].name,
+                        language: 'glsl',
+                        viewColumn: vscode.ViewColumn.Active,
+                    });
                 }
             } catch (err: any) {
                 vscode.window.showErrorMessage(`Failed to extract shaders: ${err.message}`);
@@ -2681,16 +2748,6 @@ async function clearCaptureCache() {
     vscode.window.showInformationMessage(
         `RenderDoc: cleared ${removed.files} cached capture${removed.files === 1 ? '' : 's'} (${formatBytes(removed.bytes)}).`
     );
-}
-
-function showShaderPanel(_context: vscode.ExtensionContext, result: any, eventId: number) {
-    const panel = vscode.window.createWebviewPanel(
-        'renderdoc-shader',
-        `Shader @ EID ${eventId}`,
-        vscode.ViewColumn.One,
-        { enableScripts: true }
-    );
-    panel.webview.html = getShaderPanelHtml(result);
 }
 
 async function viewPipelineState(context: vscode.ExtensionContext, item: any) {

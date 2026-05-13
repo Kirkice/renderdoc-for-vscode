@@ -6,8 +6,16 @@ import { LruCache } from '../util/lruCache';
 import type {
     ExtensionToWebviewMessage,
     MsgReplayStatus,
+    WebviewShaderDiagnostic,
     WebviewToExtensionMessage,
 } from '../ipc/messages';
+import {
+    findLinkedShaderDocumentInfos,
+    getLinkedShaderDocumentInfo,
+    getShaderSourceDocumentUri,
+    loadShaderSourceFilesFromDocuments,
+    openShaderSourceDocument,
+} from '../shaderEditor';
 import { buildInspectorHtml } from './inspector/html';
 
 /**
@@ -80,6 +88,8 @@ export class InspectorPanel {
         mode: 'none',
     };
 
+    private readonly shaderDiagnosticCollection = vscode.languages.createDiagnosticCollection('renderdoc-shaders');
+
     private disposables: vscode.Disposable[] = [];
 
     private static readonly replayableDrawFlags = new Set([
@@ -150,6 +160,16 @@ export class InspectorPanel {
             null,
             this.disposables
         );
+
+        this.disposables.push(this.shaderDiagnosticCollection);
+        this.disposables.push(vscode.window.onDidChangeActiveTextEditor((editor) => {
+            void this.handleActiveTextEditorChanged(editor);
+        }));
+        this.disposables.push(vscode.workspace.onDidChangeTextDocument((event) => {
+            if (getLinkedShaderDocumentInfo(event.document.uri)) {
+                this.shaderDiagnosticCollection.delete(event.document.uri);
+            }
+        }));
     }
 
     /** Called from extension.ts when a new capture has been loaded/refreshed. */
@@ -174,6 +194,7 @@ export class InspectorPanel {
             this.pipelineCache.clear();
             this.texturePreviewCache.clear();
             this.currentDrawPreviewCache.clear();
+            this.shaderDiagnosticCollection.clear();
             this.captureTimings = {};
             this.captureTimingsAvailable = false;
             this.captureTimingsError = undefined;
@@ -225,6 +246,30 @@ export class InspectorPanel {
 
     private postReplayStatus() {
         this.panel.webview.postMessage(this.replayStatus satisfies ExtensionToWebviewMessage);
+    }
+
+    private postShaderEditResult(result: {
+        eventId: number;
+        stage: string;
+        action: 'apply' | 'compile' | 'revert';
+        ok: boolean;
+        message?: string;
+        refresh?: boolean;
+        diagnostics?: WebviewShaderDiagnostic[];
+    }) {
+        this.panel.webview.postMessage({
+            type: 'shaderEditResult',
+            ...result,
+        } satisfies ExtensionToWebviewMessage);
+    }
+
+    private postShaderSelectionSync(eventId: number, stage: string, fileIndex: number) {
+        this.panel.webview.postMessage({
+            type: 'syncShaderSelection',
+            eventId,
+            stage,
+            fileIndex,
+        } satisfies ExtensionToWebviewMessage);
     }
 
     private postCaptureTimings() {
@@ -389,6 +434,31 @@ export class InspectorPanel {
     /** File path of the currently loaded capture, or undefined if none. */
     public getCaptureFilePath(): string | undefined {
         return this.captureInfo?.filePath;
+    }
+
+    private async handleActiveTextEditorChanged(editor: vscode.TextEditor | undefined) {
+        if (!editor) {
+            return;
+        }
+
+        const linkedInfo = getLinkedShaderDocumentInfo(editor.document.uri);
+        if (!linkedInfo) {
+            return;
+        }
+
+        if (this.captureInfo?.filePath && linkedInfo.capturePath && this.captureInfo.filePath !== linkedInfo.capturePath) {
+            return;
+        }
+
+        if (typeof linkedInfo.eventId !== 'number' || !linkedInfo.stage) {
+            return;
+        }
+
+        if (this.currentEventId !== linkedInfo.eventId) {
+            await this.setEvent(linkedInfo.eventId);
+        }
+
+        this.postShaderSelectionSync(linkedInfo.eventId, linkedInfo.stage, linkedInfo.fileIndex);
     }
 
     // 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
@@ -891,15 +961,22 @@ export class InspectorPanel {
                 );
                 break;
             case 'openShaderInEditor': {
-                const source = msg.source ?? '';
-                vscode.workspace.openTextDocument({ content: source, language: msg.language ?? 'glsl' })
-                    .then(doc => vscode.window.showTextDocument(doc, { viewColumn: vscode.ViewColumn.Active }));
+                void this.openShaderInEditor(msg);
                 break;
             }
             case 'analyzeMaliOffline': {
                 this.analyzeMaliOffline(msg.source, msg.stage);
                 break;
             }
+            case 'compileShaderEdit':
+                void this.compileShaderEdit(msg);
+                break;
+            case 'applyShaderEdit':
+                void this.applyShaderEdit(msg);
+                break;
+            case 'revertShaderEdit':
+                void this.revertShaderEdit(msg);
+                break;
             case 'copyToClipboard':
                 vscode.env.clipboard.writeText(msg.text ?? '');
                 vscode.window.setStatusBarMessage('Copied to clipboard', 2000);
@@ -931,6 +1008,313 @@ export class InspectorPanel {
     /** Public wrapper around dispose so callers can force-close the panel. */
     public disposePanel() {
         this.dispose();
+    }
+
+    private async withShaderEditReplay<T>(reason: string, fn: () => Promise<T>): Promise<T> {
+        if (!this.bridge.hasNativeBridge()) {
+            const recovered = await this.tryRecoverReplay(reason);
+            if (!recovered || !this.bridge.hasNativeBridge()) {
+                throw new Error('Native bridge unavailable (local replay required).');
+            }
+        }
+
+        try {
+            return await fn();
+        } catch (error: any) {
+            if (this.shouldRecoverReplayError(error) && await this.tryRecoverReplay(reason)) {
+                return fn();
+            }
+            throw error;
+        }
+    }
+
+    private shaderLanguageForEncoding(sourceEncoding: number): string {
+        switch (sourceEncoding) {
+            case 2:
+                return 'glsl';
+            case 5:
+                return 'hlsl';
+            default:
+                return 'plaintext';
+        }
+    }
+
+    private shaderDiagnosticSeverity(severity: WebviewShaderDiagnostic['severity']): vscode.DiagnosticSeverity {
+        switch (severity) {
+            case 'warning':
+                return vscode.DiagnosticSeverity.Warning;
+            case 'note':
+                return vscode.DiagnosticSeverity.Information;
+            default:
+                return vscode.DiagnosticSeverity.Error;
+        }
+    }
+
+    private setShaderProblems(
+        msg: Extract<WebviewToExtensionMessage, { type: 'applyShaderEdit' | 'compileShaderEdit' }>,
+        files: Array<{ filename: string; contents: string }>,
+        diagnostics?: WebviewShaderDiagnostic[],
+        fallbackMessage?: string,
+        fallbackSeverity: WebviewShaderDiagnostic['severity'] = 'error',
+    ) {
+        const fallbackFileIndex = files.length > 0
+            ? Math.max(0, Math.min(files.length - 1, msg.entryFileIndex ?? 0))
+            : 0;
+
+        const byFile = new Map<string, vscode.Diagnostic[]>();
+        for (let fileIndex = 0; fileIndex < files.length; fileIndex++) {
+            const uri = getShaderSourceDocumentUri({
+                context: this.context,
+                capturePath: this.captureInfo?.filePath,
+                eventId: msg.eventId,
+                resourceId: msg.resourceId,
+                stage: msg.stage,
+                filename: files[fileIndex].filename,
+                language: this.shaderLanguageForEncoding(msg.sourceEncoding),
+            });
+            byFile.set(uri.toString(), []);
+        }
+
+        const pushDiagnostic = (diagnostic: WebviewShaderDiagnostic) => {
+            const fileIndex = typeof diagnostic.fileIndex === 'number' && diagnostic.fileIndex >= 0 && diagnostic.fileIndex < files.length
+                ? diagnostic.fileIndex
+                : fallbackFileIndex;
+            const uri = getShaderSourceDocumentUri({
+                context: this.context,
+                capturePath: this.captureInfo?.filePath,
+                eventId: msg.eventId,
+                resourceId: msg.resourceId,
+                stage: msg.stage,
+                filename: files[fileIndex]?.filename,
+                language: this.shaderLanguageForEncoding(msg.sourceEncoding),
+            });
+            const startLine = Math.max(0, (diagnostic.line ?? 1) - 1);
+            const startColumn = Math.max(0, (diagnostic.column ?? 1) - 1);
+            const range = new vscode.Range(startLine, startColumn, startLine, startColumn + 1);
+            const item = new vscode.Diagnostic(
+                range,
+                diagnostic.message || diagnostic.raw || 'Shader compiler diagnostic.',
+                this.shaderDiagnosticSeverity(diagnostic.severity),
+            );
+            item.source = 'RenderDoc';
+            const key = uri.toString();
+            const list = byFile.get(key);
+            if (list) {
+                list.push(item);
+            } else {
+                byFile.set(key, [item]);
+            }
+        };
+
+        for (const diagnostic of diagnostics ?? []) {
+            pushDiagnostic(diagnostic);
+        }
+
+        if ((!diagnostics || diagnostics.length === 0) && fallbackMessage && files.length > 0) {
+            pushDiagnostic({
+                severity: fallbackSeverity,
+                message: fallbackMessage,
+                raw: fallbackMessage,
+                fileIndex: fallbackFileIndex,
+                line: 1,
+                column: 1,
+            });
+        }
+
+        for (const file of files) {
+            const uri = getShaderSourceDocumentUri({
+                context: this.context,
+                capturePath: this.captureInfo?.filePath,
+                eventId: msg.eventId,
+                resourceId: msg.resourceId,
+                stage: msg.stage,
+                filename: file.filename,
+                language: this.shaderLanguageForEncoding(msg.sourceEncoding),
+            });
+            this.shaderDiagnosticCollection.set(uri, byFile.get(uri.toString()) ?? []);
+        }
+    }
+
+    private clearShaderProblemsForStage(eventId: number, resourceId: string, stage: string) {
+        const capturePath = this.captureInfo?.filePath;
+        for (const info of findLinkedShaderDocumentInfos((entry) => {
+            return entry.capturePath === capturePath &&
+                entry.eventId === eventId &&
+                entry.resourceId === resourceId &&
+                entry.stage === stage;
+        })) {
+            this.shaderDiagnosticCollection.delete(info.uri);
+        }
+    }
+
+    private async openShaderInEditor(msg: Extract<WebviewToExtensionMessage, { type: 'openShaderInEditor' }>) {
+        try {
+            let source = msg.source ?? '';
+            let filename = msg.filename;
+
+            if (Array.isArray(msg.files) && msg.files.length > 0) {
+                const resolvedFiles = await loadShaderSourceFilesFromDocuments({
+                    context: this.context,
+                    capturePath: this.captureInfo?.filePath,
+                    eventId: msg.eventId,
+                    resourceId: msg.resourceId,
+                    stage: msg.stage,
+                    language: msg.language,
+                    files: msg.files,
+                });
+
+                if (typeof msg.selectedFileIndex === 'number' &&
+                    msg.selectedFileIndex >= 0 &&
+                    msg.selectedFileIndex < resolvedFiles.length) {
+                    source = resolvedFiles[msg.selectedFileIndex].contents;
+                    filename = resolvedFiles[msg.selectedFileIndex].filename;
+                }
+            }
+
+            await openShaderSourceDocument({
+                context: this.context,
+                source,
+                capturePath: this.captureInfo?.filePath,
+                eventId: msg.eventId,
+                resourceId: msg.resourceId,
+                stage: msg.stage,
+                filename,
+                language: msg.language,
+                viewColumn: msg.openToSide ? vscode.ViewColumn.Beside : vscode.ViewColumn.Active,
+                preserveFocus: msg.preserveFocus,
+                preview: msg.preview,
+                line: msg.line,
+                column: msg.column,
+                fileIndex: msg.selectedFileIndex,
+            });
+        } catch (error: any) {
+            console.warn('[RenderDoc] Failed to open linked shader editor:', error?.message ?? String(error));
+        }
+    }
+
+    private async resolveShaderEditFiles(msg: Extract<WebviewToExtensionMessage, { type: 'applyShaderEdit' | 'compileShaderEdit' }>) {
+        return loadShaderSourceFilesFromDocuments({
+            context: this.context,
+            capturePath: this.captureInfo?.filePath,
+            eventId: msg.eventId,
+            resourceId: msg.resourceId,
+            stage: msg.stage,
+            language: this.shaderLanguageForEncoding(msg.sourceEncoding),
+            files: msg.files,
+        });
+    }
+
+    private async applyShaderEdit(msg: Extract<WebviewToExtensionMessage, { type: 'applyShaderEdit' }>) {
+        try {
+            const files = await this.resolveShaderEditFiles(msg);
+            const result = await this.withShaderEditReplay('shader edit apply', () => this.bridge.nativeApplyShaderEdit({
+                resourceId: msg.resourceId,
+                shaderStage: msg.shaderStage,
+                sourceEncoding: msg.sourceEncoding,
+                entryPoint: msg.entryPoint,
+                entryFileIndex: msg.entryFileIndex,
+                compileFlags: msg.compileFlags,
+                files,
+            }));
+
+            const compileLog = result.errors?.trim();
+            const ok = !!result.applied;
+            this.setShaderProblems(msg, files, result.diagnostics, compileLog, ok ? 'warning' : 'error');
+            this.postShaderEditResult({
+                eventId: msg.eventId,
+                stage: msg.stage,
+                action: 'apply',
+                ok,
+                message: ok
+                    ? (compileLog ? `Shader applied.\n\n${compileLog}` : 'Shader applied.')
+                    : (compileLog || 'Shader compilation failed.'),
+                refresh: ok,
+                diagnostics: result.diagnostics,
+            });
+
+            if (ok) {
+                this.invalidateReplayCaches();
+            }
+        } catch (error: any) {
+            this.postShaderEditResult({
+                eventId: msg.eventId,
+                stage: msg.stage,
+                action: 'apply',
+                ok: false,
+                message: error?.message ?? String(error),
+            });
+        }
+    }
+
+    private async compileShaderEdit(msg: Extract<WebviewToExtensionMessage, { type: 'compileShaderEdit' }>) {
+        try {
+            const files = await this.resolveShaderEditFiles(msg);
+            const result = await this.withShaderEditReplay('shader edit compile', () => this.bridge.nativeCompileShaderEdit({
+                resourceId: msg.resourceId,
+                shaderStage: msg.shaderStage,
+                sourceEncoding: msg.sourceEncoding,
+                entryPoint: msg.entryPoint,
+                entryFileIndex: msg.entryFileIndex,
+                compileFlags: msg.compileFlags,
+                files,
+            }));
+
+            const compileLog = result.errors?.trim();
+            const ok = !!result.compiled;
+            this.setShaderProblems(msg, files, result.diagnostics, compileLog, ok ? 'warning' : 'error');
+            this.postShaderEditResult({
+                eventId: msg.eventId,
+                stage: msg.stage,
+                action: 'compile',
+                ok,
+                message: ok
+                    ? (compileLog ? `Shader compiled.\n\n${compileLog}` : 'Shader compiled successfully.')
+                    : (compileLog || 'Shader compilation failed.'),
+                refresh: false,
+                diagnostics: result.diagnostics,
+            });
+        } catch (error: any) {
+            this.postShaderEditResult({
+                eventId: msg.eventId,
+                stage: msg.stage,
+                action: 'compile',
+                ok: false,
+                message: error?.message ?? String(error),
+            });
+        }
+    }
+
+    private async revertShaderEdit(msg: Extract<WebviewToExtensionMessage, { type: 'revertShaderEdit' }>) {
+        try {
+            const result = await this.withShaderEditReplay('shader edit revert', () => this.bridge.nativeRevertShaderEdit(msg.resourceId));
+            const detail = result.errors?.trim();
+            const ok = !!result.reverted;
+            if (ok) {
+                this.clearShaderProblemsForStage(msg.eventId, msg.resourceId, msg.stage);
+            }
+            this.postShaderEditResult({
+                eventId: msg.eventId,
+                stage: msg.stage,
+                action: 'revert',
+                ok,
+                message: ok
+                    ? (detail ? `Shader replacement reverted.\n\n${detail}` : 'Shader replacement reverted.')
+                    : (detail || 'Shader replacement was not active.'),
+                refresh: ok,
+            });
+
+            if (ok) {
+                this.invalidateReplayCaches();
+            }
+        } catch (error: any) {
+            this.postShaderEditResult({
+                eventId: msg.eventId,
+                stage: msg.stage,
+                action: 'revert',
+                ok: false,
+                message: error?.message ?? String(error),
+            });
+        }
     }
 
     private async analyzeMaliOffline(source: string, stage: string) {
