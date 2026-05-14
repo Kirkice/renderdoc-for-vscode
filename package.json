@@ -39,9 +39,6 @@
     "onLanguage:rdc",
     "workspaceContains:**/*.rdc"
   ],
-  "extensionDependencies": [
-    "github.copilot-chat"
-  ],
   "main": "./dist/extension.js",
   "contributes": {
     "chatParticipants": [
@@ -294,6 +291,24 @@
         "title": "Open Inspector",
         "category": "RenderDoc",
         "icon": "$(window)"
+      },
+      {
+        "command": "renderdoc.openAiAssistant",
+        "title": "Open AI Assistant",
+        "category": "RenderDoc",
+        "icon": "$(comment-discussion)"
+      },
+      {
+        "command": "renderdoc.configureAiProvider",
+        "title": "Select AI Profile",
+        "category": "RenderDoc",
+        "icon": "$(settings-gear)"
+      },
+      {
+        "command": "renderdoc.setAiProviderApiKey",
+        "title": "Set Active AI Profile API Key",
+        "category": "RenderDoc",
+        "icon": "$(key)"
       },
       {
         "command": "renderdoc.showDrawcallOverlay",
@@ -558,6 +573,11 @@
           "group": "navigation@9"
         },
         {
+          "command": "renderdoc.openAiAssistant",
+          "when": "view == renderdoc-captureInfo || view == renderdoc-drawCalls || view == renderdoc-resources || view == renderdoc-apiInspector",
+          "group": "navigation@8"
+        },
+        {
           "command": "renderdoc.openInspector",
           "when": "view == renderdoc-drawCalls",
           "group": "navigation@0"
@@ -669,6 +689,12 @@
         {
           "command": "renderdoc.tryLocalReplay",
           "when": "false"
+        },
+        {
+          "command": "renderdoc.configureAiProvider"
+        },
+        {
+          "command": "renderdoc.setAiProviderApiKey"
         }
       ]
     },
@@ -689,6 +715,99 @@
           "type": "string",
           "default": "",
           "description": "Optional path to the Mali Offline Compiler executable (malioc.exe). Configure only if you want Mali shader analysis."
+        },
+        "renderdoc.ai.activeProfile": {
+          "type": "string",
+          "default": "",
+          "description": "Active AI profile used by the RenderDoc AI assistant. When empty, RenderDoc falls back to the legacy single-provider selection."
+        },
+        "renderdoc.ai.profiles": {
+          "type": "array",
+          "default": [],
+          "description": "Optional named AI profiles for the RenderDoc AI assistant. Each profile can target a different provider, model, endpoint, or API key environment variable.",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "id": {
+                "type": "string",
+                "description": "Unique profile identifier, used for persisted selection and secret storage."
+              },
+              "label": {
+                "type": "string",
+                "description": "Friendly name shown in the RenderDoc AI panel."
+              },
+              "provider": {
+                "type": "string",
+                "enum": [
+                  "openai-compatible",
+                  "anthropic"
+                ],
+                "description": "AI provider adapter used by this profile."
+              },
+              "model": {
+                "type": "string",
+                "description": "Model name passed to the selected provider."
+              },
+              "baseUrl": {
+                "type": "string",
+                "description": "Optional endpoint override. For OpenAI-compatible profiles this should be the API base URL."
+              },
+              "apiKeyEnvVar": {
+                "type": "string",
+                "description": "Optional environment variable name checked if no API key is stored in VS Code secrets for this profile."
+              }
+            },
+            "required": [
+              "id",
+              "provider",
+              "model"
+            ]
+          }
+        },
+        "renderdoc.ai.provider": {
+          "type": "string",
+          "enum": [
+            "openai-compatible",
+            "anthropic"
+          ],
+          "default": "openai-compatible",
+          "description": "Legacy single-provider selector used when renderdoc.ai.profiles is empty."
+        },
+        "renderdoc.ai.openai.baseUrl": {
+          "type": "string",
+          "default": "https://api.openai.com/v1",
+          "description": "Legacy OpenAI-compatible base URL used when renderdoc.ai.profiles is empty."
+        },
+        "renderdoc.ai.openai.model": {
+          "type": "string",
+          "default": "gpt-4.1-mini",
+          "description": "Legacy OpenAI-compatible model name used when renderdoc.ai.profiles is empty."
+        },
+        "renderdoc.ai.anthropic.model": {
+          "type": "string",
+          "default": "claude-3-7-sonnet-latest",
+          "description": "Legacy Anthropic model name used when renderdoc.ai.profiles is empty."
+        },
+        "renderdoc.ai.temperature": {
+          "type": "number",
+          "default": 0.2,
+          "minimum": 0,
+          "maximum": 2,
+          "description": "Sampling temperature used for external AI requests."
+        },
+        "renderdoc.ai.maxToolRounds": {
+          "type": "number",
+          "default": 8,
+          "minimum": 1,
+          "maximum": 20,
+          "description": "Maximum number of tool-calling rounds allowed for a single AI response."
+        },
+        "renderdoc.ai.requestTimeoutMs": {
+          "type": "number",
+          "default": 120000,
+          "minimum": 1000,
+          "description": "Timeout in milliseconds for requests sent to external AI providers."
         }
       }
     }
