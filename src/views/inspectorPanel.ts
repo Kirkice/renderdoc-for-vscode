@@ -60,6 +60,7 @@ export class InspectorPanel {
     // the user may page through thousands of events in a single session.
     private shaderCache = new LruCache<number, any>(200);
     private pipelineCache = new LruCache<number, any>(200);
+    private pipelineConstantBufferCache = new LruCache<string, any>(256);
     // Cache rendered textures (base64 PNG) keyed by "resId:mip:eventId".
     // Each entry can be hundreds of KB so we keep a tighter cap.
     private texturePreviewCache = new LruCache<string, { base64: string; width: number; height: number; texFormat: string }>(128);
@@ -87,6 +88,7 @@ export class InspectorPanel {
         status: 'none',
         mode: 'none',
     };
+    private shaderEditorViewColumn: vscode.ViewColumn | undefined;
 
     private readonly shaderDiagnosticCollection = vscode.languages.createDiagnosticCollection('renderdoc-shaders');
 
@@ -192,6 +194,7 @@ export class InspectorPanel {
         if (!sameFile) {
             this.shaderCache.clear();
             this.pipelineCache.clear();
+            this.pipelineConstantBufferCache.clear();
             this.texturePreviewCache.clear();
             this.currentDrawPreviewCache.clear();
             this.shaderDiagnosticCollection.clear();
@@ -408,6 +411,7 @@ export class InspectorPanel {
     public invalidateReplayCaches() {
         this.shaderCache.clear();
         this.pipelineCache.clear();
+        this.pipelineConstantBufferCache.clear();
         this.texturePreviewCache.clear();
         this.currentDrawPreviewCache.clear();
         this.meshCache.clear();
@@ -444,6 +448,10 @@ export class InspectorPanel {
         const linkedInfo = getLinkedShaderDocumentInfo(editor.document.uri);
         if (!linkedInfo) {
             return;
+        }
+
+        if (editor.viewColumn !== undefined) {
+            this.shaderEditorViewColumn = editor.viewColumn;
         }
 
         if (this.captureInfo?.filePath && linkedInfo.capturePath && this.captureInfo.filePath !== linkedInfo.capturePath) {
@@ -650,6 +658,69 @@ export class InspectorPanel {
                 type: 'pipelineLoaded',
                 eventId,
                 data: this.pipelineCache.get(eventId),
+            });
+        }
+    }
+
+    private pipelineConstantBufferCacheKey(eventId: number, stage: string, cbufferIndex: number, arrayElement = 0) {
+        return `${eventId}:${stage}:${cbufferIndex}:${arrayElement}`;
+    }
+
+    private async loadPipelineConstantBuffer(eventId: number, stage: string, cbufferIndex: number, arrayElement = 0) {
+        const key = this.pipelineConstantBufferCacheKey(eventId, stage, cbufferIndex, arrayElement);
+        console.log('[Inspector ext] loadPipelineConstantBuffer', key, 'hasNative=', this.bridge.hasNativeBridge());
+
+        if (!this.bridge.hasNativeBridge()) {
+            const recovered = await this.tryRecoverReplay('pipeline constant buffer request');
+            if (!recovered || !this.bridge.hasNativeBridge()) {
+                this.panel.webview.postMessage({
+                    type: 'pipelineConstantBufferLoaded',
+                    eventId,
+                    stage,
+                    cbufferIndex,
+                    arrayElement,
+                    error: 'Native bridge unavailable (local replay required).',
+                });
+                return;
+            }
+        }
+
+        if (!this.pipelineConstantBufferCache.has(key)) {
+            try {
+                const result = await withTimeout(
+                    this.bridge.nativeGetPipelineConstantBufferContents({ eventId, stage, cbufferIndex, arrayElement }),
+                    30000,
+                    'Pipeline constant buffer request timed out after 30s.',
+                );
+                this.pipelineConstantBufferCache.set(key, result);
+            } catch (e: any) {
+                if (this.shouldRecoverReplayError(e) && await this.tryRecoverReplay('pipeline constant buffer request')) {
+                    try {
+                        const retried = await withTimeout(
+                            this.bridge.nativeGetPipelineConstantBufferContents({ eventId, stage, cbufferIndex, arrayElement }),
+                            30000,
+                            'Pipeline constant buffer request timed out after 30s.',
+                        );
+                        this.pipelineConstantBufferCache.set(key, retried);
+                    } catch (retryError: any) {
+                        this.pipelineConstantBufferCache.set(key, { error: retryError.message });
+                    }
+                } else {
+                    this.pipelineConstantBufferCache.set(key, { error: e.message });
+                }
+            }
+        }
+
+        if (this.currentEventId === eventId) {
+            const cached = this.pipelineConstantBufferCache.get(key);
+            this.panel.webview.postMessage({
+                type: 'pipelineConstantBufferLoaded',
+                eventId,
+                stage,
+                cbufferIndex,
+                arrayElement,
+                data: cached && !cached.error ? cached : undefined,
+                error: cached?.error,
             });
         }
     }
@@ -960,6 +1031,14 @@ export class InspectorPanel {
                     msg.instance ?? 0,
                 );
                 break;
+            case 'requestPipelineConstantBuffer':
+                void this.loadPipelineConstantBuffer(
+                    msg.eventId,
+                    msg.stage,
+                    msg.cbufferIndex,
+                    msg.arrayElement ?? 0,
+                );
+                break;
             case 'openShaderInEditor': {
                 void this.openShaderInEditor(msg);
                 break;
@@ -1147,6 +1226,58 @@ export class InspectorPanel {
         }
     }
 
+    private getReusableShaderEditorViewColumn(): vscode.ViewColumn | undefined {
+        const inspectorViewColumn = this.panel.viewColumn;
+        const remembered = this.shaderEditorViewColumn;
+
+        if (remembered !== undefined &&
+            remembered !== inspectorViewColumn &&
+            vscode.window.tabGroups.all.some((group) => group.viewColumn === remembered)) {
+            return remembered;
+        }
+
+        this.shaderEditorViewColumn = undefined;
+        return undefined;
+    }
+
+    private async resolveShaderEditorViewColumn(openToSide: boolean | undefined, preserveFocus: boolean | undefined): Promise<vscode.ViewColumn> {
+        if (!openToSide) {
+            return vscode.ViewColumn.Active;
+        }
+
+        const reusable = this.getReusableShaderEditorViewColumn();
+        if (reusable !== undefined) {
+            return reusable;
+        }
+
+        const inspectorViewColumn = this.panel.viewColumn ?? vscode.ViewColumn.Active;
+        this.panel.reveal(inspectorViewColumn, false);
+
+        const beforeColumns = new Set(vscode.window.tabGroups.all.map((group) => group.viewColumn));
+
+        try {
+            await vscode.commands.executeCommand('workbench.action.newGroupBelow');
+        } catch (error: any) {
+            console.warn('[RenderDoc] Failed to create shader editor group below inspector:', error?.message ?? String(error));
+            return vscode.ViewColumn.Beside;
+        }
+
+        const createdGroup = vscode.window.tabGroups.all.find((group) => !beforeColumns.has(group.viewColumn));
+        const targetViewColumn = createdGroup?.viewColumn
+            ?? vscode.window.tabGroups.activeTabGroup.viewColumn
+            ?? vscode.ViewColumn.Beside;
+
+        if (targetViewColumn !== inspectorViewColumn) {
+            this.shaderEditorViewColumn = targetViewColumn;
+        }
+
+        if (preserveFocus) {
+            this.panel.reveal(inspectorViewColumn, false);
+        }
+
+        return this.shaderEditorViewColumn ?? targetViewColumn;
+    }
+
     private async openShaderInEditor(msg: Extract<WebviewToExtensionMessage, { type: 'openShaderInEditor' }>) {
         try {
             let source = msg.source ?? '';
@@ -1171,6 +1302,8 @@ export class InspectorPanel {
                 }
             }
 
+            const viewColumn = await this.resolveShaderEditorViewColumn(msg.openToSide, msg.preserveFocus);
+
             await openShaderSourceDocument({
                 context: this.context,
                 source,
@@ -1180,13 +1313,17 @@ export class InspectorPanel {
                 stage: msg.stage,
                 filename,
                 language: msg.language,
-                viewColumn: msg.openToSide ? vscode.ViewColumn.Beside : vscode.ViewColumn.Active,
+                viewColumn,
                 preserveFocus: msg.preserveFocus,
                 preview: msg.preview,
                 line: msg.line,
                 column: msg.column,
                 fileIndex: msg.selectedFileIndex,
             });
+
+            if (viewColumn !== vscode.ViewColumn.Active) {
+                this.shaderEditorViewColumn = viewColumn;
+            }
         } catch (error: any) {
             console.warn('[RenderDoc] Failed to open linked shader editor:', error?.message ?? String(error));
         }

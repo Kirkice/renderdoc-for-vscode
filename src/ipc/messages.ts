@@ -149,6 +149,14 @@ export interface MsgRequestMesh {
     instance?: number;
 }
 
+export interface MsgRequestPipelineConstantBuffer {
+    type: 'requestPipelineConstantBuffer';
+    eventId: number;
+    stage: string;
+    cbufferIndex: number;
+    arrayElement?: number;
+}
+
 export interface MsgUseRecommendedReplayHost {
     type: 'useRecommendedReplayHost';
 }
@@ -168,6 +176,7 @@ export type WebviewToExtensionMessage =
     | MsgShowResourceDetails
     | MsgShowShaderSource
     | MsgRequestMesh
+    | MsgRequestPipelineConstantBuffer
     | MsgUseRecommendedReplayHost;
 
 // ───────────────────────────── Extension → Webview ─────────────────────────────
@@ -243,6 +252,16 @@ export interface MsgMeshLoaded {
     error?: string;
 }
 
+export interface MsgPipelineConstantBufferLoaded {
+    type: 'pipelineConstantBufferLoaded';
+    eventId: number;
+    stage: string;
+    cbufferIndex: number;
+    arrayElement?: number;
+    data?: unknown;
+    error?: string;
+}
+
 export interface MsgMaliAnalysisResult {
     type: 'maliAnalysisResult';
     result?: string;
@@ -291,6 +310,7 @@ export type ExtensionToWebviewMessage =
     | MsgTexturePreview
     | MsgCurrentDrawPreview
     | MsgMeshLoaded
+    | MsgPipelineConstantBufferLoaded
     | MsgMaliAnalysisResult
     | MsgShaderEditResult
     | MsgSyncShaderSelection

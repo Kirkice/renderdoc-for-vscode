@@ -1177,14 +1177,10 @@ export async function activate(context: vscode.ExtensionContext) {
     const available = await bridge.checkAvailability();
     console.log('[RenderDoc] checkAvailability:', available);
     if (!available) {
-        const action = await vscode.window.showWarningMessage(
-            'RenderDoc installation not found. Please install RenderDoc or configure the path.',
-            'Configure Path',
+        void vscode.window.showWarningMessage(
+            'RenderDoc bundled runtime is missing from this extension install, and no system RenderDoc runtime was auto-detected.',
             'Dismiss'
         );
-        if (action === 'Configure Path') {
-            vscode.commands.executeCommand('renderdoc.configureRenderdocPath');
-        }
     }
 
     // Try to start the native bridge for advanced features
@@ -1312,7 +1308,6 @@ export async function activate(context: vscode.ExtensionContext) {
         vscode.commands.registerCommand('renderdoc.closeCapture', () => closeCapture()),
         vscode.commands.registerCommand('renderdoc.showThumbnail', () => showThumbnail(context)),
         vscode.commands.registerCommand('renderdoc.refreshCapture', () => refreshCapture()),
-        vscode.commands.registerCommand('renderdoc.configureRenderdocPath', () => configureRenderdocPath()),
         vscode.commands.registerCommand('renderdoc.showDrawCallDetails', (item) => showDrawCallDetails(context, item)),
         vscode.commands.registerCommand('renderdoc.showResourceDetails', (item) => showResourceDetails(context, item)),
         vscode.commands.registerCommand('renderdoc.viewShaderSource', (item) => viewShaderSource(context, item)),
@@ -2308,26 +2303,6 @@ async function fetchTimings() {
             }
         }
     );
-}
-
-async function configureRenderdocPath() {
-    const uris = await vscode.window.showOpenDialog({
-        canSelectFiles: false,
-        canSelectFolders: true,
-        canSelectMany: false,
-        title: 'Select RenderDoc Installation Directory'
-    });
-
-    if (uris && uris.length > 0) {
-        const config = vscode.workspace.getConfiguration('renderdoc');
-        await config.update('installPath', uris[0].fsPath, vscode.ConfigurationTarget.Global);
-        vscode.window.showInformationMessage(`RenderDoc path set to: ${uris[0].fsPath}`);
-
-        const available = await bridge.checkAvailability();
-        if (!available) {
-            vscode.window.showErrorMessage('RenderDoc not detected at the configured path.');
-        }
-    }
 }
 
 async function showDrawCallDetails(context: vscode.ExtensionContext, item: any) {

@@ -41,6 +41,7 @@ import {
     CompileShaderEditResponse,
     RevertShaderEditResponse,
     GetPipelineStateResponse,
+    GetPipelineConstantBufferContentsResponse,
     GetTexturePreviewResponse,
     OpenCaptureResponse,
     ReplayHostInfoResponse,
@@ -63,6 +64,7 @@ import {
     type TCompileShaderEditResponse,
     type TRevertShaderEditResponse,
     type TGetPipelineStateResponse,
+    type TGetPipelineConstantBufferContentsResponse,
     type TGetTexturePreviewResponse,
     type TOpenCaptureResponse,
     type TReplayHostInfoResponse,
@@ -388,29 +390,20 @@ export class RenderDocBridge {
 
     /**
      * Detects if RenderDoc is available on the system.
-     * Checks: 1) user-configured path, 2) VSIX-bundled runtime,
-     * 3) common install locations, 4) PATH
+     * Checks: 1) VSIX-bundled runtime, 2) common install locations, 3) PATH
      */
     async checkAvailability(): Promise<boolean> {
         this.renderdocPath = undefined;
         this.renderdocCmd = undefined;
 
-        // 1. Check user-configured path
-        const config = vscode.workspace.getConfiguration('renderdoc');
-        const configuredPath = config.get<string>('installPath');
-        if (configuredPath && await this.validateRenderdocDir(configuredPath)) {
-            this.renderdocPath = configuredPath;
-            return true;
-        }
-
-        // 2. Check the self-contained runtime bundled with the extension.
+        // 1. Check the self-contained runtime bundled with the extension.
         const bundledPath = this.getBundledRenderdocDir();
         if (bundledPath && await this.validateRenderdocDir(bundledPath)) {
             this.renderdocPath = bundledPath;
             return true;
         }
 
-        // 3. Windows: check common install locations
+        // 2. Windows: check common install locations
         if (process.platform === 'win32') {
             const commonPaths = [
                 path.join(process.env['ProgramFiles'] || 'C:\\Program Files', 'RenderDoc'),
@@ -425,7 +418,7 @@ export class RenderDocBridge {
             }
         }
 
-        // 4. Linux/macOS: check PATH for renderdoccmd
+        // 3. Linux/macOS: check PATH for renderdoccmd
         if (process.platform !== 'win32') {
             try {
                 const result = await this.exec('which renderdoccmd');
@@ -463,7 +456,7 @@ export class RenderDocBridge {
     /** Get the renderdoccmd executable path */
     private getCmd(): string {
         if (!this.renderdocCmd) {
-            throw new Error('RenderDoc not found. Please install RenderDoc or configure the path.');
+            throw new Error('RenderDoc runtime is unavailable. The bundled runtime is missing and no system RenderDoc install was auto-detected.');
         }
         return this.renderdocCmd;
     }
@@ -930,11 +923,7 @@ export class RenderDocBridge {
     private findNativeBridge(): string | undefined {
         const exeName = process.platform === 'win32' ? 'renderdoc_bridge.exe' : 'renderdoc_bridge';
 
-        // 1. User setting override
-        const override = vscode.workspace.getConfiguration('renderdoc').get<string>('nativeBridge.path');
-        if (override && fs.existsSync(override)) { return override; }
-
-        // 2. Next to the extension (dev build or VSIX-bundled)
+        // 1. Next to the extension (dev build or VSIX-bundled)
         const extensionDir = this.getExtensionDir();
         const candidates = [
             path.join(extensionDir, 'native', 'build', 'Release', exeName),
@@ -942,7 +931,7 @@ export class RenderDocBridge {
             path.join(extensionDir, exeName),
         ];
 
-        // 3. Downloaded copy in globalStorage (populated on first run)
+        // 2. Downloaded copy in globalStorage (populated on first run)
         if (this.downloadedBridgeDir) {
             candidates.push(path.join(this.downloadedBridgeDir, exeName));
         }
@@ -1089,7 +1078,7 @@ export class RenderDocBridge {
     async ensureNativeBridgeReady(): Promise<void> {
         const available = await this.checkAvailability();
         if (!available || !this.renderdocPath) {
-            throw new Error('RenderDoc not found. Please install RenderDoc or configure the path.');
+            throw new Error('RenderDoc runtime is unavailable. The bundled runtime is missing and no system RenderDoc install was auto-detected.');
         }
 
         if (!this.hasNativeBridge()) {
@@ -1157,6 +1146,20 @@ export class RenderDocBridge {
     /** Get pipeline state at a specific event via native bridge */
     async nativeGetPipelineState(eventId: number): Promise<any> {
         return this.nativeCall('getPipelineState', { eventId });
+    }
+
+    async nativeGetPipelineConstantBufferContents(params: {
+        eventId: number;
+        stage: string;
+        cbufferIndex: number;
+        arrayElement?: number;
+    }): Promise<TGetPipelineConstantBufferContentsResponse> {
+        await this.ensureNativeBridgeReady();
+        return this.nativeCallT(
+            'getPipelineConstantBufferContents',
+            GetPipelineConstantBufferContentsResponse,
+            params,
+        );
     }
 
     /** Get shader source at a specific event via native bridge */

@@ -333,6 +333,14 @@ export const GetPipelineStateResponse = z
     })
     .passthrough();
 
+export const GetPipelineConstantBufferContentsResponse = z
+    .object({
+        stage: z.string().optional(),
+        cbufferIndex: z.number().optional(),
+        variables: z.array(z.unknown()).optional(),
+    })
+    .passthrough();
+
 export type TInitResponse                = z.infer<typeof InitResponse>;
 export type TGetVersionResponse          = z.infer<typeof GetVersionResponse>;
 export type TOpenCaptureResponse         = z.infer<typeof OpenCaptureResponse>;
@@ -353,6 +361,7 @@ export type TRevertShaderEditResponse   = z.infer<typeof RevertShaderEditRespons
 export type TGetTexturePreviewResponse   = z.infer<typeof GetTexturePreviewResponse>;
 export type TSaveTextureResponse         = z.infer<typeof SaveTextureResponse>;
 export type TGetPipelineStateResponse    = z.infer<typeof GetPipelineStateResponse>;
+export type TGetPipelineConstantBufferContentsResponse = z.infer<typeof GetPipelineConstantBufferContentsResponse>;
 export type TCaptureStatisticsApiSummary = z.infer<typeof CaptureStatisticsApiSummary>;
 export type TCaptureLaunchTarget         = z.infer<typeof CaptureLaunchTarget>;
 export type TCaptureAttachTarget         = z.infer<typeof CaptureAttachTarget>;

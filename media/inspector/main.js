@@ -37,6 +37,9 @@
         activeTab: 'textures',
         activeShaderStage: null,
         activeShaderFile: {}, // map: stage -> file index (or -1 for disassembly)
+        activePipelineStage: null,
+        pipelineConstantBuffer: null,
+        pipelineConstantBufferBusyKey: null,
         eventFilter: '',
         texFilter: '',
         resFilter: '',
@@ -164,6 +167,10 @@
         state.shaderEditorSyncKey = null;
         state.shaderEditorContext = null;
         state.pendingShaderSelection = null;
+    }
+
+    function invalidateShaderEditorSyncKey() {
+        state.shaderEditorSyncKey = null;
     }
 
     function shaderEditorSyncKeyForPayload(payload) {
@@ -366,6 +373,9 @@
     function clearShaderReplayViews() {
         state.shaders = null;
         state.pipeline = null;
+        state.activePipelineStage = null;
+        state.pipelineConstantBuffer = null;
+        state.pipelineConstantBufferBusyKey = null;
         state.meshCache = {};
         state.meshPending = {};
         thumbCache.clear();
@@ -537,6 +547,9 @@
     });
     function switchTab(tab) {
         state.activeTab = tab;
+        if (tab === 'shaders') {
+            invalidateShaderEditorSyncKey();
+        }
         document.querySelectorAll('.tab').forEach(el => el.classList.toggle('active', el.dataset.tab === tab));
         document.querySelectorAll('.tab-panel').forEach(el => el.classList.toggle('active', el.id === 'tab-' + tab));
         render();
@@ -640,6 +653,9 @@
                         state.drawCall = null;
                         state.shaders = null;
                         state.pipeline = null;
+                        state.activePipelineStage = null;
+                        state.pipelineConstantBuffer = null;
+                        state.pipelineConstantBufferBusyKey = null;
                         clearAllShaderDrafts();
                         clearShaderDiagnostics();
                         clearShaderEditorSync();
@@ -684,6 +700,9 @@
                     if (!sameEvent) {
                         state.shaders = null;
                         state.pipeline = null;
+                        state.activePipelineStage = null;
+                        state.pipelineConstantBuffer = null;
+                        state.pipelineConstantBufferBusyKey = null;
                         clearAllShaderDrafts();
                         clearShaderDiagnostics();
                         clearShaderEditorSync();
@@ -748,12 +767,35 @@
             case 'pipelineLoaded':
                 if (m.eventId === state.eventId) {
                     state.pipeline = m.data;
+                    state.pipelineConstantBuffer = null;
+                    state.pipelineConstantBufferBusyKey = null;
                     const aliasesChanged = updateShaderAliasesFromPipeline(m.data);
+                    syncActivePipelineStage(m.data);
                     if (state.activeTab === 'pipeline' || state.activeTab === 'overview' || state.activeTab === 'pipelinegraph' || state.activeTab === 'textures') render();
                     else if (aliasesChanged && state.activeTab === 'resources') renderResources();
                     if (state.modalResource && isOutputLikeResource(state.modalResource.resourceId)) {
                         textureModalPreviewEl.innerHTML = '<div class="muted">Loading…</div>';
                         requestTexture();
+                    }
+                }
+                break;
+            case 'pipelineConstantBufferLoaded':
+                if (m.eventId === state.eventId) {
+                    const arrayElement = m.arrayElement || 0;
+                    const requestKey = pipelineConstantBufferRequestKey(m.stage, m.cbufferIndex, arrayElement);
+                    if (state.pipelineConstantBufferBusyKey === requestKey) {
+                        state.pipelineConstantBufferBusyKey = null;
+                    }
+                    state.pipelineConstantBuffer = m.error
+                        ? {
+                            stage: m.stage,
+                            cbufferIndex: m.cbufferIndex,
+                            arrayElement,
+                            error: m.error,
+                        }
+                        : (m.data || null);
+                    if (state.activeTab === 'pipeline') {
+                        renderPipeline();
                     }
                 }
                 break;
@@ -1492,6 +1534,263 @@
         }
         return null;
     }
+    function getPipelineStageOptions(pipeline) {
+        const shaders = (pipeline && pipeline.shaders) || {};
+        const stageResources = (pipeline && pipeline.stageResources) || {};
+        const options = [];
+
+        GFX_PIPELINE.forEach((stage) => {
+            if (stage.kind !== 'Shader') return;
+            const shaderMatch = resolveShader(shaders, stage.id, stage.aliases);
+            const resourceMatch = resolveShader(stageResources, stage.id, stage.aliases);
+            if (!shaderMatch && !resourceMatch) return;
+            options.push({
+                id: stage.id,
+                label: stage.label,
+                key: (resourceMatch || shaderMatch).key,
+                shader: shaderMatch ? shaderMatch.info : null,
+                resources: resourceMatch ? resourceMatch.info : { textures: [], samplers: [], constantBlocks: [] },
+            });
+        });
+
+        const computeShader = resolveShader(shaders, 'compute', []);
+        const computeResources = resolveShader(stageResources, 'compute', []);
+        if (computeShader || computeResources) {
+            options.push({
+                id: 'compute',
+                label: 'Compute Shader',
+                key: (computeResources || computeShader).key,
+                shader: computeShader ? computeShader.info : null,
+                resources: computeResources ? computeResources.info : { textures: [], samplers: [], constantBlocks: [] },
+            });
+        }
+
+        return options;
+    }
+    function syncActivePipelineStage(pipeline) {
+        const options = getPipelineStageOptions(pipeline);
+        if (state.pipelineConstantBuffer && !options.some((option) => option.key === state.pipelineConstantBuffer.stage)) {
+            state.pipelineConstantBuffer = null;
+            state.pipelineConstantBufferBusyKey = null;
+        }
+        if (!options.length) {
+            state.activePipelineStage = null;
+            return { options, active: null };
+        }
+        let active = options.find((option) => option.key === state.activePipelineStage) || null;
+        if (!active) {
+            active = options[0];
+            state.activePipelineStage = active.key;
+        }
+        return { options, active };
+    }
+    function pipelineConstantBufferRequestKey(stage, cbufferIndex, arrayElement) {
+        return [String(stage || ''), String(cbufferIndex), String(arrayElement || 0)].join(':');
+    }
+    function requestPipelineConstantBuffer(stage, cbufferIndex, arrayElement) {
+        if (state.eventId == null) return;
+        const requestKey = pipelineConstantBufferRequestKey(stage, cbufferIndex, arrayElement);
+        state.pipelineConstantBufferBusyKey = requestKey;
+        state.pipelineConstantBuffer = {
+            stage,
+            cbufferIndex,
+            arrayElement: arrayElement || 0,
+            loading: true,
+        };
+        renderPipeline();
+        vscode.postMessage({
+            type: 'requestPipelineConstantBuffer',
+            eventId: state.eventId,
+            stage,
+            cbufferIndex,
+            arrayElement: arrayElement || 0,
+        });
+    }
+    function pipelineBindingLabel(binding, prefix) {
+        const slot = binding && binding.slot != null ? binding.slot : null;
+        const bindingIndex = binding && binding.bindingIndex != null ? binding.bindingIndex : null;
+        const baseIndex = slot != null ? slot : (bindingIndex != null ? bindingIndex : '?');
+        let label = prefix + baseIndex;
+        if ((binding && binding.bindArraySize > 1) || (binding && binding.arrayElement)) {
+            label += '[' + (binding.arrayElement || 0) + ']';
+        }
+        const extras = [];
+        if (binding && binding.space) {
+            extras.push('space ' + binding.space);
+        }
+        if (bindingIndex != null && bindingIndex !== slot) {
+            extras.push('idx ' + bindingIndex);
+        }
+        return extras.length ? label + ' · ' + extras.join(' · ') : label;
+    }
+    function renderPipelineStageTabs(options, activeKey) {
+        return '<div class="stage-tabs pipe-stage-tabs">' + options.map((option) =>
+            '<button type="button" class="stage-tab' + (option.key === activeKey ? ' active' : '') + '" data-pipeline-stage="' + esc(option.key) + '">' + esc(option.label) + '</button>'
+        ).join('') + '</div>';
+    }
+    function renderPipelineStageSummary(activeStage) {
+        const resources = activeStage && activeStage.resources ? activeStage.resources : {};
+        const textures = Array.isArray(resources.textures) ? resources.textures : [];
+        const samplers = Array.isArray(resources.samplers) ? resources.samplers : [];
+        const constantBlocks = Array.isArray(resources.constantBlocks) ? resources.constantBlocks : [];
+        let html = '<div class="stat-row">';
+        html += stat(textures.length, 'Textures');
+        html += stat(samplers.length, 'Samplers');
+        html += stat(constantBlocks.length, 'Uniform Blocks');
+        html += '</div>';
+        return html;
+    }
+    function renderPipelineResourceName(entry, fallbackLabel) {
+        const meta = [];
+        if (entry && entry.kind) meta.push(entry.kind);
+        if (entry && entry.compileConstants) meta.push('Compile-time');
+        else if (entry && entry.inlineDataBytes) meta.push('Inline');
+        else if (entry && entry.bufferBacked === false) meta.push('Direct');
+        if (entry && entry.staticallyUnused) meta.push('Unused');
+        let html = '<div>' + esc((entry && entry.name) || fallbackLabel || 'Unnamed') + '</div>';
+        if (meta.length) {
+            html += '<div class="pipe-muted">' + esc(meta.join(' · ')) + '</div>';
+        }
+        return html;
+    }
+    function renderPipelineResourceBinding(entry, resourceIdField, resourceNameField, emptyLabel) {
+        const resourceId = entry && entry[resourceIdField];
+        if (!resourceId) {
+            return '<span class="pipe-muted">' + esc(emptyLabel || 'Unbound') + '</span>';
+        }
+        let html = renderResourceChip(resourceId, (entry && entry[resourceNameField]) || resName(resourceId));
+        const offset = entry && (entry.byteOffset != null ? entry.byteOffset : 0);
+        const size = entry && (entry.boundByteSize != null ? entry.boundByteSize : entry.byteSize);
+        const meta = [];
+        if (offset) meta.push(offset + ' B offset');
+        if (size) meta.push(formatByteSize(size));
+        if (meta.length) {
+            html += '<div class="pipe-muted">' + esc(meta.join(' · ')) + '</div>';
+        }
+        return html;
+    }
+    function renderStageTexturesSection(resources) {
+        const textures = Array.isArray(resources && resources.textures) ? resources.textures : [];
+        const rows = textures.map((entry, idx) => [
+            esc(pipelineBindingLabel(entry, 't')),
+            renderPipelineResourceName(entry, 'Texture ' + idx),
+            renderPipelineResourceBinding(entry, 'resourceId', 'resourceName', 'Unbound'),
+        ]);
+        return renderPipelineTable(['Binding', 'Resource', 'Bound View'], rows);
+    }
+    function renderStageSamplersSection(resources) {
+        const samplers = Array.isArray(resources && resources.samplers) ? resources.samplers : [];
+        const rows = samplers.map((entry, idx) => {
+            const filter = [entry.minFilter, entry.magFilter, entry.mipFilter].filter(Boolean).join(' / ');
+            const address = [entry.addressU, entry.addressV, entry.addressW].filter(Boolean).join(' / ');
+            return [
+                esc(pipelineBindingLabel(entry, 's')),
+                renderPipelineResourceName(entry, 'Sampler ' + idx),
+                esc(filter || '—'),
+                esc(address || '—'),
+                entry.compareEnable ? esc(entry.compareFunc || 'Enabled') : '<span class="pipe-muted">Disabled</span>',
+            ];
+        });
+        return renderPipelineTable(['Binding', 'Sampler', 'Filter', 'Address', 'Compare'], rows);
+    }
+    function renderPipelineConstantBufferBacking(entry) {
+        if (entry && entry.bufferResourceId) {
+            return renderPipelineResourceBinding(entry, 'bufferResourceId', 'bufferResourceName', 'Unbound');
+        }
+        if (entry && entry.compileConstants) {
+            return '<span class="pipe-muted">Compile-time constants</span>';
+        }
+        if (entry && entry.inlineDataBytes) {
+            return '<span class="pipe-muted">Inline data bytes</span>';
+        }
+        if (entry && entry.bufferBacked === false) {
+            return '<span class="pipe-muted">Direct uniforms</span>';
+        }
+        return '<span class="pipe-muted">Unbound</span>';
+    }
+    function renderStageConstantBlocksSection(stageKey, resources) {
+        const constantBlocks = Array.isArray(resources && resources.constantBlocks) ? resources.constantBlocks : [];
+        const rows = constantBlocks.map((entry, idx) => {
+            const arrayElement = entry && entry.arrayElement != null ? entry.arrayElement : 0;
+            const requestKey = pipelineConstantBufferRequestKey(stageKey, entry.cbufferIndex, arrayElement);
+            const loading = state.pipelineConstantBufferBusyKey === requestKey;
+            const activeDetails = state.pipelineConstantBuffer && !state.pipelineConstantBuffer.error &&
+                state.pipelineConstantBuffer.stage === stageKey &&
+                Number(state.pipelineConstantBuffer.cbufferIndex) === Number(entry.cbufferIndex) &&
+                Number(state.pipelineConstantBuffer.arrayElement || 0) === Number(arrayElement);
+            return [
+                esc(pipelineBindingLabel(entry, 'b')),
+                renderPipelineResourceName(entry, 'Block ' + idx),
+                renderPipelineConstantBufferBacking(entry),
+                esc(formatByteSize((entry && (entry.boundByteSize || entry.byteSize)) || 0)),
+                '<button type="button" class="pipe-inline-action' + (activeDetails ? ' active' : '') + '" data-pipeline-cbuffer-stage="' + esc(stageKey) + '" data-pipeline-cbuffer-index="' + esc(String(entry.cbufferIndex)) + '" data-pipeline-cbuffer-array="' + esc(String(arrayElement)) + '"' + (loading ? ' disabled' : '') + '>' + esc(loading ? 'Loading…' : (activeDetails ? 'Refresh' : 'Inspect')) + '</button>',
+            ];
+        });
+        return renderPipelineTable(['Binding', 'Block', 'Backing', 'Size', 'View'], rows);
+    }
+    function formatPipelineVariableRow(row) {
+        if (!Array.isArray(row)) return row == null ? '—' : String(row);
+        return row.map((cell) => String(cell)).join(', ');
+    }
+    function flattenPipelineVariables(variables, depth, rows) {
+        (variables || []).forEach((variable, index) => {
+            const members = Array.isArray(variable && variable.members) ? variable.members : [];
+            const displayRows = Array.isArray(variable && variable.displayRows) ? variable.displayRows : [];
+            const indent = '&nbsp;'.repeat(depth * 4);
+            let valueCell = '<span class="pipe-muted">—</span>';
+            if (!members.length) {
+                if (displayRows.length <= 1) {
+                    valueCell = esc(displayRows.length ? formatPipelineVariableRow(displayRows[0]) : '—');
+                } else {
+                    valueCell = '<span class="pipe-muted">' + esc(displayRows.length + ' rows') + '</span>';
+                }
+            }
+            rows.push([
+                indent + esc((variable && variable.name) || ('var ' + index)),
+                esc((variable && (variable.type || variable.baseType)) || '—'),
+                valueCell,
+            ]);
+            if (members.length) {
+                flattenPipelineVariables(members, depth + 1, rows);
+            } else if (displayRows.length > 1) {
+                displayRows.forEach((row, rowIndex) => {
+                    rows.push([
+                        '&nbsp;'.repeat((depth + 1) * 4) + esc('[' + rowIndex + ']'),
+                        '<span class="pipe-muted">row</span>',
+                        esc(formatPipelineVariableRow(row)),
+                    ]);
+                });
+            }
+        });
+        return rows;
+    }
+    function renderPipelineConstantBufferDetails(activeStageKey) {
+        const details = state.pipelineConstantBuffer;
+        if (!details || details.stage !== activeStageKey) return '';
+        if (details.loading) {
+            return '<div class="pipe-empty">Loading buffer details…</div>';
+        }
+        if (details.error) {
+            return '<div class="pipe-empty">Buffer details unavailable: ' + esc(details.error) + '</div>';
+        }
+
+        const variables = Array.isArray(details.variables) ? details.variables : [];
+        const flattened = flattenPipelineVariables(variables, 0, []);
+        const meta = renderPipelineKvGrid([
+            ['Block', formatPipelineValue(details.name)],
+            ['Binding', formatPipelineValue(pipelineBindingLabel(details, 'b'))],
+            ['Entry Point', formatPipelineValue(details.entryPoint)],
+            ['Backing', renderPipelineConstantBufferBacking(details)],
+            ['Declared Size', formatPipelineValue(formatByteSize(details.byteSize || 0))],
+            ['Resolved Size', formatPipelineValue(details.boundByteSize ? formatByteSize(details.boundByteSize) : undefined)],
+        ]);
+
+        if (!flattened.length) {
+            return meta + '<div class="pipe-empty">No decoded variables were reported for this buffer.</div>';
+        }
+
+        return meta + renderPipelineTable(['Variable', 'Type', 'Value'], flattened);
+    }
     function renderPipeline() {
         const body = document.getElementById('pipeline-body');
         if (state.eventId == null) { body.textContent = 'Select an event.'; body.className = 'empty-state'; return; }
@@ -1510,6 +1809,7 @@
         const samplers = Array.isArray(p.samplers) ? p.samplers : [];
         const boundTextures = Array.isArray(p.boundTextures) ? p.boundTextures : [];
         const resMap = resById();
+        const stageState = syncActivePipelineStage(p);
 
         let html = '<div class="info-grid">';
         html += '<div class="k">API</div><div class="v">' + esc(p.api || '?') + '</div>';
@@ -1518,7 +1818,7 @@
         html += '</div>';
 
         html += '<div class="stat-row">';
-        html += stat(Object.keys(shaders).length, 'Bound Stages');
+        html += stat(stageState.options.length || Object.keys(shaders).length, 'Bound Stages');
         html += stat((fb.colorTargets || []).length, 'Color Targets');
         html += stat((vi.vertexBuffers || []).length, 'Vertex Buffers');
         html += stat(boundTextures.length, 'Bound Textures');
@@ -1544,7 +1844,7 @@
                 let flowHtml = '<div class="pipe-flow">';
                 GFX_PIPELINE.forEach((stage, idx) => {
                     if (idx > 0) flowHtml += '<span class="pipe-arrow">▼</span>';
-                    flowHtml += renderPipelineStage(stage, shaders, fb, vi);
+                    flowHtml += renderPipelineStage(stage, shaders, fb, vi, stageState.active ? stageState.active.key : null);
                 });
                 flowHtml += '</div>';
                 return flowHtml;
@@ -1557,9 +1857,48 @@
             html += renderPipelineCard(
                 'Compute Pipeline',
                 'Standalone compute state when the selected event uses a compute shader.',
-                '<div class="pipe-flow">' + renderPipelineStage({ id: 'compute', kind: 'Shader', label: 'Compute Shader' }, shaders, fb, vi) + '</div>',
+                '<div class="pipe-flow">' + renderPipelineStage({ id: 'compute', kind: 'Shader', label: 'Compute Shader' }, shaders, fb, vi, stageState.active ? stageState.active.key : null) + '</div>',
                 'pipe-card-flow'
             );
+        }
+
+        if (stageState.active) {
+            html += renderPipelineCard(
+                'Stage Resources',
+                'RenderDoc-style per-stage textures, samplers, and uniform buffers for the selected shader stage.',
+                renderPipelineStageTabs(stageState.options, stageState.active.key) + renderPipelineStageSummary(stageState.active),
+                'pipe-card-compact'
+            );
+
+            html += '<div class="pipe-grid pipe-grid-3">';
+            html += renderPipelineCard(
+                'Textures',
+                'Shader-visible textures and read-only buffers for the selected stage.',
+                renderStageTexturesSection(stageState.active.resources),
+                'pipe-card-compact'
+            );
+            html += renderPipelineCard(
+                'Samplers',
+                'Sampler bindings and resolved filter/address state for the selected stage.',
+                renderStageSamplersSection(stageState.active.resources),
+                'pipe-card-compact'
+            );
+            html += renderPipelineCard(
+                'Uniforms and Buffers',
+                'Constant blocks, direct uniforms, and specialization constants for the selected stage.',
+                renderStageConstantBlocksSection(stageState.active.key, stageState.active.resources),
+                'pipe-card-compact'
+            );
+            html += '</div>';
+
+            const detailsHtml = renderPipelineConstantBufferDetails(stageState.active.key);
+            if (detailsHtml) {
+                html += renderPipelineCard(
+                    'Buffer Details',
+                    'Expanded variable values for the selected constant/uniform block.',
+                    detailsHtml
+                );
+            }
         }
 
         const colorRTs = fb.colorTargets || [];
@@ -1640,14 +1979,42 @@
         body.querySelectorAll('.pipe-stage.clickable').forEach(el => {
             el.addEventListener('click', () => {
                 const stageKey = el.dataset.stage;
-                if (stageKey) { switchTab('shaders'); state.activeShaderStage = stageKey; renderShaders(); }
+                if (stageKey) {
+                    state.activePipelineStage = stageKey;
+                    if (state.pipelineConstantBuffer && state.pipelineConstantBuffer.stage !== stageKey) {
+                        state.pipelineConstantBuffer = null;
+                        state.pipelineConstantBufferBusyKey = null;
+                    }
+                    renderPipeline();
+                }
+            });
+        });
+        body.querySelectorAll('.stage-tab[data-pipeline-stage]').forEach(el => {
+            el.addEventListener('click', () => {
+                const stageKey = el.dataset.pipelineStage;
+                if (!stageKey || state.activePipelineStage === stageKey) return;
+                state.activePipelineStage = stageKey;
+                if (state.pipelineConstantBuffer && state.pipelineConstantBuffer.stage !== stageKey) {
+                    state.pipelineConstantBuffer = null;
+                    state.pipelineConstantBufferBusyKey = null;
+                }
+                renderPipeline();
+            });
+        });
+        body.querySelectorAll('[data-pipeline-cbuffer-stage]').forEach(el => {
+            el.addEventListener('click', () => {
+                const stageKey = el.dataset.pipelineCbufferStage;
+                const cbufferIndex = Number(el.dataset.pipelineCbufferIndex);
+                const arrayElement = Number(el.dataset.pipelineCbufferArray || '0');
+                if (!stageKey || !Number.isFinite(cbufferIndex)) return;
+                requestPipelineConstantBuffer(stageKey, cbufferIndex, Number.isFinite(arrayElement) ? arrayElement : 0);
             });
         });
         body.querySelectorAll('.resource-chip[data-resid]').forEach(el => {
             el.addEventListener('click', () => activateResourceById(el.dataset.resid));
         });
     }
-    function renderPipelineStage(stage, shaders, fb, vi) {
+    function renderPipelineStage(stage, shaders, fb, vi, activePipelineStageKey) {
         let shaderInfo = null;
         let stageKey = stage.id;
         if (stage.kind === 'Shader') {
@@ -1656,7 +2023,8 @@
         }
         const active = stage.fixed ? true : !!shaderInfo;
         const clickable = stage.kind === 'Shader' && shaderInfo;
-        let cls = 'pipe-stage' + (stage.fixed ? ' fixed' : '') + (!active ? ' inactive' : '') + (clickable ? ' clickable' : '');
+        const selected = clickable && activePipelineStageKey && stageKey === activePipelineStageKey;
+        let cls = 'pipe-stage' + (stage.fixed ? ' fixed' : '') + (!active ? ' inactive' : '') + (clickable ? ' clickable' : '') + (selected ? ' selected' : '');
         let html = '<div class="' + cls + '"' + (clickable ? ' data-stage="' + esc(stageKey) + '"' : '') + '>';
         html += '<span class="ps-kind">' + esc(stage.kind) + '</span>';
         html += '<span class="ps-name">' + esc(stage.label) + '</span>';
@@ -2541,6 +2909,9 @@
             btn.className = 'stage-tab' + (stage === state.activeShaderStage ? ' active' : '');
             btn.textContent = stage;
             btn.addEventListener('click', () => {
+                if (stage === state.activeShaderStage) {
+                    invalidateShaderEditorSyncKey();
+                }
                 state.activeShaderStage = stage;
                 renderShaders();
             });
@@ -2659,6 +3030,9 @@
             tab.textContent = label;
             tab.title = label;
             tab.addEventListener('click', () => {
+                if (idx === state.activeShaderFile[activeStage]) {
+                    invalidateShaderEditorSyncKey();
+                }
                 state.activeShaderFile[activeStage] = idx;
                 renderShaders();
             });

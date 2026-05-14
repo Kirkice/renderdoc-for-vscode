@@ -117,6 +117,7 @@ static const ActionDescription *findStructuredActionByEventId(
     const rdcarray<ActionDescription> &actions, uint32_t eventId);
 static ResourceId getCurrentColorTargetId();
 static std::string resultMessage(const ResultDetails &r);
+static std::string rdcToStr(const rdcstr &s);
 static uint64_t resIdToU64(const ResourceId &r);
 static ResourceId u64ToResId(uint64_t v);
 
@@ -125,6 +126,397 @@ static std::string lowerAscii(std::string value) {
         return static_cast<char>(std::tolower(ch));
     });
     return value;
+}
+
+struct BoundShaderStage
+{
+    std::string name;
+    ShaderStage stage = ShaderStage::Vertex;
+    ResourceId shaderId = ResourceId();
+    ResourceId pipelineId = ResourceId();
+    std::string entryPoint;
+    const ShaderReflection *reflection = nullptr;
+};
+
+static ResourceId pickGLShaderResource(const GLPipe::Shader &shader)
+{
+    return shader.shaderResourceId != ResourceId() ? shader.shaderResourceId : shader.programResourceId;
+}
+
+static void appendBoundShaderStage(
+    std::vector<BoundShaderStage> &stages,
+    const char *name,
+    ShaderStage stage,
+    ResourceId shaderId,
+    ResourceId pipelineId,
+    const ShaderReflection *reflection)
+{
+    if (shaderId == ResourceId()) {
+        return;
+    }
+
+    BoundShaderStage info;
+    info.name = name;
+    info.stage = stage;
+    info.shaderId = shaderId;
+    info.pipelineId = pipelineId;
+    info.reflection = reflection;
+    if (reflection) {
+        info.entryPoint = rdcToStr(reflection->entryPoint);
+    }
+    if (info.entryPoint.empty()) {
+        info.entryPoint = "main";
+    }
+    stages.push_back(std::move(info));
+}
+
+static std::vector<BoundShaderStage> collectBoundShaderStages()
+{
+    std::vector<BoundShaderStage> stages;
+    if (!g_replay) {
+        return stages;
+    }
+
+    const auto *gl = g_replay->GetGLPipelineState();
+    if (gl) {
+        appendBoundShaderStage(
+            stages,
+            "vertex",
+            ShaderStage::Vertex,
+            pickGLShaderResource(gl->vertexShader),
+            gl->pipelineResourceId != ResourceId() ? gl->pipelineResourceId : gl->vertexShader.programResourceId,
+            gl->vertexShader.reflection);
+        appendBoundShaderStage(
+            stages,
+            "tessCtrl",
+            ShaderStage::Hull,
+            pickGLShaderResource(gl->tessControlShader),
+            gl->pipelineResourceId != ResourceId() ? gl->pipelineResourceId : gl->tessControlShader.programResourceId,
+            gl->tessControlShader.reflection);
+        appendBoundShaderStage(
+            stages,
+            "tessEval",
+            ShaderStage::Domain,
+            pickGLShaderResource(gl->tessEvalShader),
+            gl->pipelineResourceId != ResourceId() ? gl->pipelineResourceId : gl->tessEvalShader.programResourceId,
+            gl->tessEvalShader.reflection);
+        appendBoundShaderStage(
+            stages,
+            "geometry",
+            ShaderStage::Geometry,
+            pickGLShaderResource(gl->geometryShader),
+            gl->pipelineResourceId != ResourceId() ? gl->pipelineResourceId : gl->geometryShader.programResourceId,
+            gl->geometryShader.reflection);
+        appendBoundShaderStage(
+            stages,
+            "fragment",
+            ShaderStage::Pixel,
+            pickGLShaderResource(gl->fragmentShader),
+            gl->pipelineResourceId != ResourceId() ? gl->pipelineResourceId : gl->fragmentShader.programResourceId,
+            gl->fragmentShader.reflection);
+        appendBoundShaderStage(
+            stages,
+            "compute",
+            ShaderStage::Compute,
+            pickGLShaderResource(gl->computeShader),
+            gl->pipelineResourceId != ResourceId() ? gl->pipelineResourceId : gl->computeShader.programResourceId,
+            gl->computeShader.reflection);
+    }
+
+    const auto *vk = g_replay->GetVulkanPipelineState();
+    if (vk) {
+        appendBoundShaderStage(stages, "vertex", ShaderStage::Vertex, vk->vertexShader.resourceId,
+                               vk->graphics.pipelineResourceId, vk->vertexShader.reflection);
+        appendBoundShaderStage(stages, "tessCtrl", ShaderStage::Hull, vk->tessControlShader.resourceId,
+                               vk->graphics.pipelineResourceId, vk->tessControlShader.reflection);
+        appendBoundShaderStage(stages, "tessEval", ShaderStage::Domain, vk->tessEvalShader.resourceId,
+                               vk->graphics.pipelineResourceId, vk->tessEvalShader.reflection);
+        appendBoundShaderStage(stages, "geometry", ShaderStage::Geometry, vk->geometryShader.resourceId,
+                               vk->graphics.pipelineResourceId, vk->geometryShader.reflection);
+        appendBoundShaderStage(stages, "fragment", ShaderStage::Pixel, vk->fragmentShader.resourceId,
+                               vk->graphics.pipelineResourceId, vk->fragmentShader.reflection);
+        appendBoundShaderStage(stages, "compute", ShaderStage::Compute, vk->computeShader.resourceId,
+                               vk->compute.pipelineResourceId, vk->computeShader.reflection);
+    }
+
+    const auto *d11 = g_replay->GetD3D11PipelineState();
+    if (d11) {
+        appendBoundShaderStage(stages, "vertex", ShaderStage::Vertex, d11->vertexShader.resourceId,
+                               ResourceId(), d11->vertexShader.reflection);
+        appendBoundShaderStage(stages, "hull", ShaderStage::Hull, d11->hullShader.resourceId,
+                               ResourceId(), d11->hullShader.reflection);
+        appendBoundShaderStage(stages, "domain", ShaderStage::Domain, d11->domainShader.resourceId,
+                               ResourceId(), d11->domainShader.reflection);
+        appendBoundShaderStage(stages, "geometry", ShaderStage::Geometry, d11->geometryShader.resourceId,
+                               ResourceId(), d11->geometryShader.reflection);
+        appendBoundShaderStage(stages, "pixel", ShaderStage::Pixel, d11->pixelShader.resourceId,
+                               ResourceId(), d11->pixelShader.reflection);
+        appendBoundShaderStage(stages, "compute", ShaderStage::Compute, d11->computeShader.resourceId,
+                               ResourceId(), d11->computeShader.reflection);
+    }
+
+    const auto *d12 = g_replay->GetD3D12PipelineState();
+    if (d12) {
+        appendBoundShaderStage(stages, "vertex", ShaderStage::Vertex, d12->vertexShader.resourceId,
+                               d12->pipelineResourceId, d12->vertexShader.reflection);
+        appendBoundShaderStage(stages, "hull", ShaderStage::Hull, d12->hullShader.resourceId,
+                               d12->pipelineResourceId, d12->hullShader.reflection);
+        appendBoundShaderStage(stages, "domain", ShaderStage::Domain, d12->domainShader.resourceId,
+                               d12->pipelineResourceId, d12->domainShader.reflection);
+        appendBoundShaderStage(stages, "geometry", ShaderStage::Geometry, d12->geometryShader.resourceId,
+                               d12->pipelineResourceId, d12->geometryShader.reflection);
+        appendBoundShaderStage(stages, "pixel", ShaderStage::Pixel, d12->pixelShader.resourceId,
+                               d12->pipelineResourceId, d12->pixelShader.reflection);
+        appendBoundShaderStage(stages, "compute", ShaderStage::Compute, d12->computeShader.resourceId,
+                               d12->pipelineResourceId, d12->computeShader.reflection);
+    }
+
+    return stages;
+}
+
+static bool parseShaderStageName(const std::string &stageName, ShaderStage &stage)
+{
+    const std::string lower = lowerAscii(stageName);
+    if (lower == "vertex" || lower == "vs") {
+        stage = ShaderStage::Vertex;
+        return true;
+    }
+    if (lower == "tessctrl" || lower == "tesscontrol" || lower == "hull" || lower == "hs") {
+        stage = ShaderStage::Hull;
+        return true;
+    }
+    if (lower == "tesseval" || lower == "tessevaluation" || lower == "domain" || lower == "ds") {
+        stage = ShaderStage::Domain;
+        return true;
+    }
+    if (lower == "geometry" || lower == "gs") {
+        stage = ShaderStage::Geometry;
+        return true;
+    }
+    if (lower == "fragment" || lower == "pixel" || lower == "ps") {
+        stage = ShaderStage::Pixel;
+        return true;
+    }
+    if (lower == "compute" || lower == "cs") {
+        stage = ShaderStage::Compute;
+        return true;
+    }
+    if (lower == "task") {
+        stage = ShaderStage::Task;
+        return true;
+    }
+    if (lower == "mesh") {
+        stage = ShaderStage::Mesh;
+        return true;
+    }
+    return false;
+}
+
+static bool findBoundShaderStage(const std::string &stageName, BoundShaderStage &outStage)
+{
+    ShaderStage stage = ShaderStage::Count;
+    if (!parseShaderStageName(stageName, stage)) {
+        return false;
+    }
+
+    const std::vector<BoundShaderStage> stages = collectBoundShaderStages();
+    for (const BoundShaderStage &candidate : stages) {
+        if (candidate.stage == stage) {
+            outStage = candidate;
+            return true;
+        }
+    }
+
+    return false;
+}
+
+static std::string trimTrailingFloatZeros(std::string value)
+{
+    const size_t exponentPos = value.find_first_of("eE");
+    std::string exponent;
+    if (exponentPos != std::string::npos) {
+        exponent = value.substr(exponentPos);
+        value.erase(exponentPos);
+    }
+
+    const size_t dotPos = value.find('.');
+    if (dotPos != std::string::npos) {
+        while (!value.empty() && value.back() == '0') {
+            value.pop_back();
+        }
+        if (!value.empty() && value.back() == '.') {
+            value.pop_back();
+        }
+    }
+
+    return value + exponent;
+}
+
+static std::string formatFloatScalar(double value)
+{
+    if (std::isnan(value)) {
+        return "NaN";
+    }
+    if (std::isinf(value)) {
+        return value < 0.0 ? "-Inf" : "Inf";
+    }
+
+    std::ostringstream stream;
+    stream.precision(6);
+    stream << value;
+    return trimTrailingFloatZeros(stream.str());
+}
+
+static float localHalfToFloat(uint16_t half)
+{
+    const uint32_t sign = (uint32_t)(half & 0x8000u) << 16;
+    const uint32_t exponent = (half >> 10) & 0x1Fu;
+    uint32_t mantissa = half & 0x03FFu;
+    uint32_t bits = 0;
+
+    if (exponent == 0) {
+        if (mantissa == 0) {
+            bits = sign;
+        } else {
+            int32_t exp = -14;
+            while ((mantissa & 0x0400u) == 0) {
+                mantissa <<= 1;
+                exp--;
+            }
+            mantissa &= 0x03FFu;
+            bits = sign | ((uint32_t)(exp + 127) << 23) | (mantissa << 13);
+        }
+    } else if (exponent == 0x1Fu) {
+        bits = sign | 0x7F800000u | (mantissa << 13);
+    } else {
+        bits = sign | ((exponent + 112u) << 23) | (mantissa << 13);
+    }
+
+    float value = 0.0f;
+    memcpy(&value, &bits, sizeof(value));
+    return value;
+}
+
+static std::string shaderBaseTypeName(VarType type)
+{
+    switch (type) {
+        case VarType::Float: return "float";
+        case VarType::Double: return "double";
+        case VarType::Half: return "half";
+        case VarType::SInt: return "int";
+        case VarType::UInt: return "uint";
+        case VarType::SShort: return "short";
+        case VarType::UShort: return "ushort";
+        case VarType::SLong: return "long";
+        case VarType::ULong: return "ulong";
+        case VarType::SByte: return "byte";
+        case VarType::UByte: return "ubyte";
+        case VarType::Bool: return "bool";
+        case VarType::Enum: return "enum";
+        case VarType::Struct: return "struct";
+        case VarType::GPUPointer: return "pointer";
+        case VarType::ConstantBlock: return "cbuffer";
+        case VarType::ReadOnlyResource: return "readonly";
+        case VarType::ReadWriteResource: return "readwrite";
+        case VarType::Sampler: return "sampler";
+        default: return "unknown";
+    }
+}
+
+static std::string shaderDeclaredType(const ShaderVariable &var)
+{
+    const std::string baseType = shaderBaseTypeName(var.type);
+    if (var.rows > 1 && var.columns > 1) {
+        return baseType + std::to_string((uint32_t)var.rows) + "x" + std::to_string((uint32_t)var.columns);
+    }
+    if (var.columns > 1) {
+        return baseType + std::to_string((uint32_t)var.columns);
+    }
+    return baseType;
+}
+
+static std::string shaderScalarValueString(const ShaderVariable &var, uint32_t index)
+{
+    switch (var.type) {
+        case VarType::Float:
+            return formatFloatScalar(var.value.f32v[index]);
+        case VarType::Double:
+            return formatFloatScalar(var.value.f64v[index]);
+        case VarType::Half:
+            return formatFloatScalar(localHalfToFloat((uint16_t)var.value.f16v[index]));
+        case VarType::SInt:
+            return std::to_string(var.value.s32v[index]);
+        case VarType::UInt:
+        case VarType::Enum:
+            return std::to_string(var.value.u32v[index]);
+        case VarType::SShort:
+            return std::to_string(var.value.s16v[index]);
+        case VarType::UShort:
+            return std::to_string(var.value.u16v[index]);
+        case VarType::SLong:
+            return std::to_string(var.value.s64v[index]);
+        case VarType::ULong:
+            return std::to_string(var.value.u64v[index]);
+        case VarType::SByte:
+            return std::to_string(var.value.s8v[index]);
+        case VarType::UByte:
+            return std::to_string(var.value.u8v[index]);
+        case VarType::Bool:
+            return var.value.u32v[index] != 0 ? "true" : "false";
+        case VarType::GPUPointer: {
+            std::ostringstream stream;
+            stream << "0x" << std::hex << var.value.u64v[index];
+            return stream.str();
+        }
+        default:
+            return "?";
+    }
+}
+
+static json shaderVariableDisplayRows(const ShaderVariable &var)
+{
+    json rows = json::array();
+
+    const uint32_t rowCount = std::max<uint32_t>((uint32_t)var.rows, 1u);
+    const uint32_t columnCount = std::max<uint32_t>((uint32_t)var.columns, 1u);
+
+    for (uint32_t row = 0; row < rowCount && row * columnCount < 16; row++) {
+        json cols = json::array();
+        for (uint32_t col = 0; col < columnCount; col++) {
+            const uint32_t valueIndex = row * columnCount + col;
+            if (valueIndex >= 16) {
+                break;
+            }
+            cols.push_back(shaderScalarValueString(var, valueIndex));
+        }
+        rows.push_back(cols);
+    }
+
+    return rows;
+}
+
+static json serializeShaderVariable(const ShaderVariable &var)
+{
+    json members = json::array();
+    for (const ShaderVariable &member : var.members) {
+        members.push_back(serializeShaderVariable(member));
+    }
+
+    json result = {
+        {"name", rdcToStr(var.name)},
+        {"type", shaderDeclaredType(var)},
+        {"baseType", shaderBaseTypeName(var.type)},
+        {"rows", (uint32_t)var.rows},
+        {"columns", (uint32_t)var.columns},
+        {"rowMajor", var.RowMajor()},
+        {"members", members},
+    };
+
+    if (var.members.empty()) {
+        result["displayRows"] = shaderVariableDisplayRows(var);
+    }
+
+    return result;
 }
 
 static DebugOverlay parseTextureOverlayMode(const std::string &mode, bool &ok, std::string &normalizedMode) {
@@ -5541,7 +5933,401 @@ static json handleGetPipelineState(int id, const json &params) {
         result["samplers"] = samplers;
     }
 
+    // ── Per-stage shader resources (RenderDoc-style stage cards) ───────────
+    {
+        json stageResources = json::object();
+        const std::vector<BoundShaderStage> boundStages = collectBoundShaderStages();
+        const rdcarray<DescriptorAccess> &accesses = g_replay->GetDescriptorAccess();
+        std::map<size_t, Descriptor> descriptorCache;
+        std::map<size_t, SamplerDescriptor> samplerCache;
+
+        auto resolveDescriptorForAccess = [&](size_t accessIndex, Descriptor &out) -> bool {
+            auto it = descriptorCache.find(accessIndex);
+            if (it != descriptorCache.end()) {
+                out = it->second;
+                return true;
+            }
+
+            if (accessIndex >= accesses.size()) {
+                return false;
+            }
+
+            const DescriptorAccess &acc = accesses[accessIndex];
+            if (acc.descriptorStore == ResourceId()) {
+                return false;
+            }
+
+            rdcarray<DescriptorRange> ranges;
+            ranges.push_back(DescriptorRange(acc));
+            const rdcarray<Descriptor> resolved = g_replay->GetDescriptors(acc.descriptorStore, ranges);
+            if (resolved.empty()) {
+                return false;
+            }
+
+            descriptorCache[accessIndex] = resolved[0];
+            out = resolved[0];
+            return true;
+        };
+
+        auto resolveSamplerForAccess = [&](size_t accessIndex, SamplerDescriptor &out) -> bool {
+            auto it = samplerCache.find(accessIndex);
+            if (it != samplerCache.end()) {
+                out = it->second;
+                return true;
+            }
+
+            if (accessIndex >= accesses.size()) {
+                return false;
+            }
+
+            const DescriptorAccess &acc = accesses[accessIndex];
+            if (acc.descriptorStore == ResourceId()) {
+                return false;
+            }
+
+            rdcarray<DescriptorRange> ranges;
+            ranges.push_back(DescriptorRange(acc));
+            const rdcarray<SamplerDescriptor> resolved = g_replay->GetSamplerDescriptors(acc.descriptorStore, ranges);
+            if (resolved.empty()) {
+                return false;
+            }
+
+            samplerCache[accessIndex] = resolved[0];
+            out = resolved[0];
+            return true;
+        };
+
+        for (const BoundShaderStage &stageInfo : boundStages) {
+            json stageJson = {
+                {"stage", stageInfo.name},
+                {"shaderResourceId", resIdToString(stageInfo.shaderId)},
+                {"entryPoint", stageInfo.entryPoint},
+                {"hasReflection", stageInfo.reflection != nullptr},
+                {"textures", json::array()},
+                {"samplers", json::array()},
+                {"constantBlocks", json::array()},
+            };
+
+            if (!stageInfo.reflection) {
+                stageResources[stageInfo.name] = stageJson;
+                continue;
+            }
+
+            auto appendTextureBinding = [&](const ShaderResource &binding, size_t bindingIndex,
+                                            const DescriptorAccess *access, const Descriptor *descriptor) {
+                std::string bindingName = rdcToStr(binding.name);
+                if (bindingName.empty()) {
+                    bindingName = (binding.isTexture ? "Texture " : "Resource ") + std::to_string(bindingIndex);
+                }
+
+                json entry = {
+                    {"name", bindingName},
+                    {"bindingIndex", (uint32_t)bindingIndex},
+                    {"slot", binding.fixedBindNumber},
+                    {"space", binding.fixedBindSetOrSpace},
+                    {"bindArraySize", binding.bindArraySize},
+                    {"arrayElement", access ? access->arrayElement : 0u},
+                    {"kind", binding.isTexture ? "Texture" : "Buffer"},
+                    {"hasSampler", binding.hasSampler},
+                    {"inputAttachment", binding.isInputAttachment},
+                    {"staticallyUnused", access ? access->staticallyUnused : false},
+                };
+
+                if (descriptor && descriptor->resource != ResourceId()) {
+                    entry["resourceId"] = resIdToString(descriptor->resource);
+                    entry["resourceName"] = resNameLookup(descriptor->resource);
+                    if (descriptor->byteOffset != 0) {
+                        entry["byteOffset"] = (uint64_t)descriptor->byteOffset;
+                    }
+                    if (descriptor->byteSize != 0) {
+                        entry["byteSize"] = (uint64_t)descriptor->byteSize;
+                    }
+                }
+
+                stageJson["textures"].push_back(entry);
+            };
+
+            auto appendSamplerBinding = [&](const ShaderSampler &binding, size_t bindingIndex,
+                                            const DescriptorAccess *access, const SamplerDescriptor *descriptor) {
+                std::string bindingName = rdcToStr(binding.name);
+                if (bindingName.empty()) {
+                    bindingName = "Sampler " + std::to_string(bindingIndex);
+                }
+
+                json entry = {
+                    {"name", bindingName},
+                    {"bindingIndex", (uint32_t)bindingIndex},
+                    {"slot", binding.fixedBindNumber},
+                    {"space", binding.fixedBindSetOrSpace},
+                    {"bindArraySize", binding.bindArraySize},
+                    {"arrayElement", access ? access->arrayElement : 0u},
+                    {"staticallyUnused", access ? access->staticallyUnused : false},
+                };
+
+                if (descriptor) {
+                    const uint64_t samplerId = resIdToU64(descriptor->object);
+                    if (samplerId != 0) {
+                        entry["resourceId"] = resIdToString(descriptor->object);
+                        entry["resourceName"] = resNameLookup(descriptor->object);
+                    }
+                    entry["minFilter"] = filterModeStr(descriptor->filter.minify);
+                    entry["magFilter"] = filterModeStr(descriptor->filter.magnify);
+                    entry["mipFilter"] = filterModeStr(descriptor->filter.mip);
+                    entry["addressU"] = addressModeStr(descriptor->addressU);
+                    entry["addressV"] = addressModeStr(descriptor->addressV);
+                    entry["addressW"] = addressModeStr(descriptor->addressW);
+                    entry["compareEnable"] = descriptor->compareFunction != CompareFunction::AlwaysTrue;
+                    entry["compareFunc"] = cmpFnStr(descriptor->compareFunction);
+                    entry["maxAnisotropy"] = descriptor->maxAnisotropy;
+                    entry["minLOD"] = descriptor->minLOD;
+                    entry["maxLOD"] = descriptor->maxLOD;
+                    entry["mipBias"] = descriptor->mipBias;
+                }
+
+                stageJson["samplers"].push_back(entry);
+            };
+
+            auto appendConstantBlock = [&](const ConstantBlock &block, uint32_t cbufferIndex,
+                                           const DescriptorAccess *access, const Descriptor *descriptor) {
+                std::string blockName = rdcToStr(block.name);
+                if (blockName.empty()) {
+                    if (block.compileConstants) {
+                        blockName = "Specialization Constants";
+                    } else if (!block.bufferBacked) {
+                        blockName = "Uniforms";
+                    } else {
+                        blockName = "Constant Buffer " + std::to_string(cbufferIndex);
+                    }
+                }
+
+                json entry = {
+                    {"name", blockName},
+                    {"cbufferIndex", cbufferIndex},
+                    {"slot", block.fixedBindNumber},
+                    {"space", block.fixedBindSetOrSpace},
+                    {"bindArraySize", block.bindArraySize},
+                    {"arrayElement", access ? access->arrayElement : 0u},
+                    {"byteSize", block.byteSize},
+                    {"bufferBacked", block.bufferBacked},
+                    {"inlineDataBytes", block.inlineDataBytes},
+                    {"compileConstants", block.compileConstants},
+                    {"variablesCount", block.variables.size()},
+                    {"staticallyUnused", access ? access->staticallyUnused : false},
+                };
+
+                if (descriptor && descriptor->resource != ResourceId()) {
+                    entry["bufferResourceId"] = resIdToString(descriptor->resource);
+                    entry["bufferResourceName"] = resNameLookup(descriptor->resource);
+                    if (descriptor->byteOffset != 0) {
+                        entry["byteOffset"] = (uint64_t)descriptor->byteOffset;
+                    }
+                    if (descriptor->byteSize != 0) {
+                        entry["boundByteSize"] = (uint64_t)descriptor->byteSize;
+                    }
+                }
+
+                stageJson["constantBlocks"].push_back(entry);
+            };
+
+            for (size_t bindingIndex = 0; bindingIndex < stageInfo.reflection->readOnlyResources.size(); bindingIndex++) {
+                const ShaderResource &binding = stageInfo.reflection->readOnlyResources[bindingIndex];
+                bool matchedAny = false;
+                for (size_t accessIndex = 0; accessIndex < accesses.size(); accessIndex++) {
+                    const DescriptorAccess &acc = accesses[accessIndex];
+                    if (acc.stage != stageInfo.stage || !IsReadOnlyDescriptor(acc.type) || acc.index != bindingIndex) {
+                        continue;
+                    }
+
+                    Descriptor descriptor;
+                    const Descriptor *descriptorPtr = resolveDescriptorForAccess(accessIndex, descriptor) ? &descriptor : nullptr;
+                    appendTextureBinding(binding, bindingIndex, &acc, descriptorPtr);
+                    matchedAny = true;
+                }
+
+                if (!matchedAny) {
+                    appendTextureBinding(binding, bindingIndex, nullptr, nullptr);
+                }
+            }
+
+            for (size_t bindingIndex = 0; bindingIndex < stageInfo.reflection->samplers.size(); bindingIndex++) {
+                const ShaderSampler &binding = stageInfo.reflection->samplers[bindingIndex];
+                bool matchedAny = false;
+                for (size_t accessIndex = 0; accessIndex < accesses.size(); accessIndex++) {
+                    const DescriptorAccess &acc = accesses[accessIndex];
+                    if (acc.stage != stageInfo.stage || !IsSamplerDescriptor(acc.type) || acc.index != bindingIndex) {
+                        continue;
+                    }
+
+                    SamplerDescriptor descriptor;
+                    const SamplerDescriptor *descriptorPtr = resolveSamplerForAccess(accessIndex, descriptor) ? &descriptor : nullptr;
+                    appendSamplerBinding(binding, bindingIndex, &acc, descriptorPtr);
+                    matchedAny = true;
+                }
+
+                if (!matchedAny) {
+                    appendSamplerBinding(binding, bindingIndex, nullptr, nullptr);
+                }
+            }
+
+            for (size_t bindingIndex = 0; bindingIndex < stageInfo.reflection->constantBlocks.size(); bindingIndex++) {
+                const ConstantBlock &binding = stageInfo.reflection->constantBlocks[bindingIndex];
+                bool matchedAny = false;
+                for (size_t accessIndex = 0; accessIndex < accesses.size(); accessIndex++) {
+                    const DescriptorAccess &acc = accesses[accessIndex];
+                    if (acc.stage != stageInfo.stage || !IsConstantBlockDescriptor(acc.type) || acc.index != bindingIndex) {
+                        continue;
+                    }
+
+                    Descriptor descriptor;
+                    const Descriptor *descriptorPtr = resolveDescriptorForAccess(accessIndex, descriptor) ? &descriptor : nullptr;
+                    appendConstantBlock(binding, (uint32_t)bindingIndex, &acc, descriptorPtr);
+                    matchedAny = true;
+                }
+
+                if (!matchedAny) {
+                    appendConstantBlock(binding, (uint32_t)bindingIndex, nullptr, nullptr);
+                }
+            }
+
+            stageResources[stageInfo.name] = stageJson;
+        }
+
+        result["stageResources"] = stageResources;
+    }
+
     result["shaders"] = shaders;
+    return makeResult(id, result);
+}
+
+static json handleGetPipelineConstantBufferContents(int id, const json &params) {
+    if (!g_replay)
+        return makeError(id, -1, "No replay active");
+
+    const uint32_t eventId = params.value("eventId", (uint32_t)0);
+    const std::string stageName = params.value("stage", std::string());
+    const int32_t cbufferIndex = params.value("cbufferIndex", -1);
+    const uint32_t requestedArrayElement = params.value("arrayElement", (uint32_t)0);
+
+    if (stageName.empty())
+        return makeError(id, -2, "stage is required");
+    if (cbufferIndex < 0)
+        return makeError(id, -3, "cbufferIndex is required");
+
+    if (eventId > 0) {
+        ensureEvent(eventId);
+    }
+
+    BoundShaderStage stageInfo;
+    if (!findBoundShaderStage(stageName, stageInfo)) {
+        return makeError(id, -4, "Requested shader stage is not bound at this event");
+    }
+    if (!stageInfo.reflection) {
+        return makeError(id, -5, "Shader reflection is unavailable for the requested stage");
+    }
+    if ((size_t)cbufferIndex >= stageInfo.reflection->constantBlocks.size()) {
+        return makeError(id, -6, "cbufferIndex is out of range for this stage");
+    }
+
+    const ConstantBlock &block = stageInfo.reflection->constantBlocks[(size_t)cbufferIndex];
+    const rdcarray<DescriptorAccess> &accesses = g_replay->GetDescriptorAccess();
+
+    const DescriptorAccess *selectedAccess = nullptr;
+    const DescriptorAccess *fallbackAccess = nullptr;
+    for (size_t i = 0; i < accesses.size(); i++) {
+        const DescriptorAccess &acc = accesses[i];
+        if (acc.stage != stageInfo.stage || !IsConstantBlockDescriptor(acc.type) || acc.index != (uint32_t)cbufferIndex) {
+            continue;
+        }
+        if (!fallbackAccess) {
+            fallbackAccess = &acc;
+        }
+        if (acc.arrayElement == requestedArrayElement) {
+            selectedAccess = &acc;
+            break;
+        }
+    }
+
+    if (!selectedAccess) {
+        selectedAccess = fallbackAccess;
+    }
+
+    ResourceId bufferId = ResourceId();
+    uint64_t byteOffset = 0;
+    uint64_t byteSize = 0;
+    uint32_t resolvedArrayElement = selectedAccess ? selectedAccess->arrayElement : requestedArrayElement;
+
+    if (selectedAccess && selectedAccess->descriptorStore != ResourceId()) {
+        rdcarray<DescriptorRange> ranges;
+        ranges.push_back(DescriptorRange(*selectedAccess));
+        const rdcarray<Descriptor> descriptors = g_replay->GetDescriptors(selectedAccess->descriptorStore, ranges);
+        if (!descriptors.empty()) {
+            bufferId = descriptors[0].resource;
+            byteOffset = descriptors[0].byteOffset;
+            byteSize = descriptors[0].byteSize;
+        }
+    }
+
+    rdcarray<ShaderVariable> variables;
+    if (stageInfo.shaderId != ResourceId()) {
+        rdcstr entryPoint(stageInfo.entryPoint.c_str());
+        variables = g_replay->GetCBufferVariableContents(
+            stageInfo.pipelineId,
+            stageInfo.shaderId,
+            stageInfo.stage,
+            entryPoint,
+            (uint32_t)cbufferIndex,
+            bufferId,
+            byteOffset,
+            byteSize);
+    }
+
+    json variableRows = json::array();
+    for (const ShaderVariable &variable : variables) {
+        variableRows.push_back(serializeShaderVariable(variable));
+    }
+
+    std::string blockName = rdcToStr(block.name);
+    if (blockName.empty()) {
+        if (block.compileConstants) {
+            blockName = "Specialization Constants";
+        } else if (!block.bufferBacked) {
+            blockName = "Uniforms";
+        } else {
+            blockName = "Constant Buffer " + std::to_string(cbufferIndex);
+        }
+    }
+
+    json result = {
+        {"eventId", eventId},
+        {"stage", stageInfo.name},
+        {"shaderStage", (uint32_t)stageInfo.stage},
+        {"shaderResourceId", resIdToString(stageInfo.shaderId)},
+        {"entryPoint", stageInfo.entryPoint},
+        {"name", blockName},
+        {"cbufferIndex", cbufferIndex},
+        {"slot", block.fixedBindNumber},
+        {"space", block.fixedBindSetOrSpace},
+        {"bindArraySize", block.bindArraySize},
+        {"arrayElement", resolvedArrayElement},
+        {"byteSize", block.byteSize},
+        {"bufferBacked", block.bufferBacked},
+        {"inlineDataBytes", block.inlineDataBytes},
+        {"compileConstants", block.compileConstants},
+        {"variables", variableRows},
+        {"staticallyUnused", selectedAccess ? selectedAccess->staticallyUnused : false},
+    };
+
+    if (bufferId != ResourceId()) {
+        result["bufferResourceId"] = resIdToString(bufferId);
+        result["bufferResourceName"] = resNameLookup(bufferId);
+        if (byteOffset != 0) {
+            result["byteOffset"] = byteOffset;
+        }
+        if (byteSize != 0) {
+            result["boundByteSize"] = byteSize;
+        }
+    }
+
     return makeResult(id, result);
 }
 
@@ -6555,6 +7341,7 @@ static json dispatch(const json &req) {
         if (method == "getTextureThumbBatch") return handleGetTextureThumbBatch(id, params);
         if (method == "saveTexture")        return handleSaveTexture(id, params);
         if (method == "getPipelineState")   return handleGetPipelineState(id, params);
+        if (method == "getPipelineConstantBufferContents") return handleGetPipelineConstantBufferContents(id, params);
         if (method == "getDrawcallOverlay") return handleGetDrawcallOverlay(id, params);
         if (method == "getEventChunks")     return handleGetEventChunks(id, params);
         if (method == "getMeshData")        return handleGetMeshData(id, params);
