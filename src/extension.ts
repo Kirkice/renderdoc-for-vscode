@@ -2,7 +2,7 @@ import * as vscode from 'vscode';
 import * as cp from 'child_process';
 import * as fs from 'fs';
 import * as path from 'path';
-import { RenderDocBridge } from './renderdocBridge';
+import { RenderDocBridge, NATIVE_REPLAY_REQUIRED_MSG } from './renderdocBridge';
 import {
     AttachCaptureOptions,
     CaptureAttachTarget,
@@ -82,18 +82,39 @@ function findDrawCallByEventId(eventId: number, list: DrawCall[] = currentDrawCa
     return undefined;
 }
 
-async function recoverReplayForCurrentCapture(reason: string): Promise<boolean> {
-    if (!currentCapturePath || !captureInfoProvider) {
+function shouldRecoverReplayError(error: unknown): boolean {
+    const message = String((error as any)?.message ?? error ?? '');
+    if (!message) {
         return false;
     }
-    if (captureInfoProvider.getReplayStatus() !== 'active') {
+    if (message.includes('No replay active')) {
+        return true;
+    }
+    if (message.includes("Data was requested through RenderDoc's API which is not available")) {
+        return true;
+    }
+    if (message.includes(NATIVE_REPLAY_REQUIRED_MSG)) {
+        return true;
+    }
+    return false;
+}
+
+async function recoverReplayForCurrentCapture(
+    reason: string,
+    options?: { force?: boolean; filePath?: string },
+): Promise<boolean> {
+    const filePath = options?.filePath || currentCapturePath;
+    if (!filePath || !captureInfoProvider) {
+        return false;
+    }
+    if (!options?.force && captureInfoProvider.getReplayStatus() !== 'active') {
         return false;
     }
     if (!bridge.isNativeBridgeInstalled()) {
         return false;
     }
 
-    console.log('[RenderDoc] Recovering replay for current capture due to', reason);
+    console.log('[RenderDoc] Recovering replay for current capture due to', reason, 'file=', filePath);
 
     if (!bridge.hasNativeBridge()) {
         bridge.tryStartNativeBridge();
@@ -105,8 +126,8 @@ async function recoverReplayForCurrentCapture(reason: string): Promise<boolean> 
     await syncReplayHostSelection();
 
     try {
-        await bridge.nativeOpenCapture(currentCapturePath);
-        bridgeLoadedCapturePath = currentCapturePath;
+        await bridge.nativeOpenCapture(filePath);
+        bridgeLoadedCapturePath = filePath;
     } catch (error: any) {
         console.warn('[RenderDoc] Replay recovery openCapture failed:', error?.message ?? String(error));
         return false;
@@ -360,6 +381,28 @@ async function loadReplayDataWithRetry(
     }
 
     throw lastError || new Error('Failed to load replay data.');
+}
+
+async function loadReplayDataWithRecovery(
+    filePath: string,
+    reason: string,
+    token?: vscode.CancellationToken,
+    progress?: vscode.Progress<{ message?: string; increment?: number }>,
+): Promise<{ drawCalls: DrawCall[]; resources: ResourceInfo[] }> {
+    try {
+        return await loadReplayDataWithRetry(filePath, token, progress);
+    } catch (error: any) {
+        if (!shouldRecoverReplayError(error)) {
+            throw error;
+        }
+
+        const recovered = await recoverReplayForCurrentCapture(reason, { force: true, filePath });
+        if (!recovered) {
+            throw error;
+        }
+
+        return loadReplayDataWithRetry(filePath, token, progress);
+    }
 }
 
 type CaptureTriggerOptions = {
@@ -2231,21 +2274,38 @@ async function refreshCapture() {
         vscode.window.showWarningMessage('No capture file loaded.');
         return;
     }
-    const captureInfo = await bridge.getCaptureInfo(info.filePath);
-    captureInfoProvider.update(captureInfo);
-    const replayData = await loadReplayDataWithRetry(info.filePath);
-    const drawCalls = replayData.drawCalls;
-    currentDrawCalls = drawCalls;
-    updateDrawCallTree(drawCalls);
-    const resources = replayData.resources;
-    currentResources = resources;
-    resourceProvider.update(resources);
-    await enrichCaptureInfoWithStatistics(captureInfo);
-    captureInfoProvider.update(captureInfo);
-    if (InspectorPanel.currentPanel) {
-        InspectorPanel.currentPanel.setCapture(captureInfo, drawCalls, resources);
+    currentCapturePath = info.filePath;
+
+    try {
+        const captureInfo = await bridge.getCaptureInfo(info.filePath);
+        captureInfoProvider.update(captureInfo);
+
+        const replayData = await loadReplayDataWithRecovery(info.filePath, 'refresh capture');
+        const drawCalls = replayData.drawCalls;
+        currentDrawCalls = drawCalls;
+        updateDrawCallTree(drawCalls);
+
+        const resources = replayData.resources;
+        currentResources = resources;
+        resourceProvider.update(resources);
+
+        await enrichCaptureInfoWithStatistics(captureInfo);
+        captureInfoProvider.update(captureInfo);
+        if (InspectorPanel.currentPanel) {
+            InspectorPanel.currentPanel.setCapture(captureInfo, drawCalls, resources);
+        }
+        void startShaderAliasScan(captureInfo, drawCalls, resources);
+    } catch (error: any) {
+        const message = error?.message || String(error);
+        if (shouldRecoverReplayError(error)) {
+            vscode.window.showWarningMessage(
+                `RenderDoc: replay is not active for the current capture, so refresh could not complete. ${message}`
+            );
+            return;
+        }
+
+        vscode.window.showErrorMessage(`RenderDoc: Failed to refresh capture - ${message}`);
     }
-    void startShaderAliasScan(captureInfo, drawCalls, resources);
 }
 
 /** Walk draw call tree and attach GPU timings by eventId, aggregating sums for parents. */

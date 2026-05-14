@@ -31,6 +31,7 @@ import { buildInspectorHtml } from './inspector/html';
 export class InspectorPanel {
     public static currentPanel: InspectorPanel | undefined;
     private static readonly viewType = 'renderdoc-inspector';
+    private static readonly maliOfflineCompilerHint = 'Set renderdoc.maliOfflineCompilerPath in VS Code Settings to enable Mali Offline Compiler analysis.';
 
     /**
      * Optional provider the panel uses to fetch capture state when the webview
@@ -172,6 +173,33 @@ export class InspectorPanel {
                 this.shaderDiagnosticCollection.delete(event.document.uri);
             }
         }));
+        this.disposables.push(vscode.workspace.onDidChangeConfiguration((event) => {
+            if (!event.affectsConfiguration('renderdoc.maliOfflineCompilerPath')) {
+                return;
+            }
+            this.postMaliConfigState();
+        }));
+    }
+
+    private getMaliOfflineCompilerConfig() {
+        const configuredPath = vscode.workspace
+            .getConfiguration('renderdoc')
+            .get<string>('maliOfflineCompilerPath')
+            ?.trim();
+        return {
+            configured: !!configuredPath,
+            path: configuredPath,
+            hint: InspectorPanel.maliOfflineCompilerHint,
+        };
+    }
+
+    private postMaliConfigState() {
+        const maliConfig = this.getMaliOfflineCompilerConfig();
+        this.panel.webview.postMessage({
+            type: 'maliConfigChanged',
+            configured: maliConfig.configured,
+            hint: maliConfig.hint,
+        } satisfies ExtensionToWebviewMessage);
     }
 
     /** Called from extension.ts when a new capture has been loaded/refreshed. */
@@ -222,6 +250,8 @@ export class InspectorPanel {
                 height: r.height,
                 byteSize: r.byteSize,
             })),
+            maliOfflineCompilerConfigured: this.getMaliOfflineCompilerConfig().configured,
+            maliOfflineCompilerHint: InspectorPanel.maliOfflineCompilerHint,
         });
 
         if (captureInfo?.filePath) {
@@ -1256,9 +1286,9 @@ export class InspectorPanel {
         const beforeColumns = new Set(vscode.window.tabGroups.all.map((group) => group.viewColumn));
 
         try {
-            await vscode.commands.executeCommand('workbench.action.newGroupBelow');
+            await vscode.commands.executeCommand('workbench.action.newGroupRight');
         } catch (error: any) {
-            console.warn('[RenderDoc] Failed to create shader editor group below inspector:', error?.message ?? String(error));
+            console.warn('[RenderDoc] Failed to create shader editor group to the right of inspector:', error?.message ?? String(error));
             return vscode.ViewColumn.Beside;
         }
 
@@ -1456,13 +1486,15 @@ export class InspectorPanel {
 
     private async analyzeMaliOffline(source: string, stage: string) {
         try {
-            const config = vscode.workspace.getConfiguration('renderdoc');
-            const maliocPath = config.get<string>('maliOfflineCompilerPath');
+            const maliConfig = this.getMaliOfflineCompilerConfig();
+            const maliocPath = maliConfig.path;
 
             if (!maliocPath) {
+                this.latestMaliAnalysis = undefined;
                 this.panel.webview.postMessage({
                     type: 'maliAnalysisResult',
-                    error: 'Error: mali offline compiler path (malioc.exe) is not configured in settings.'
+                    notConfigured: true,
+                    hint: maliConfig.hint,
                 });
                 return;
             }

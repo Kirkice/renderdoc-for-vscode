@@ -198,6 +198,8 @@ export interface MsgCaptureLoaded {
     captureInfo: CaptureInfo;
     drawCalls: DrawCall[];
     resources: WebviewResourceSummary[];
+    maliOfflineCompilerConfigured?: boolean;
+    maliOfflineCompilerHint?: string;
 }
 
 export interface MsgEventChanged {
@@ -266,6 +268,14 @@ export interface MsgMaliAnalysisResult {
     type: 'maliAnalysisResult';
     result?: string;
     error?: string;
+    notConfigured?: boolean;
+    hint?: string;
+}
+
+export interface MsgMaliConfigChanged {
+    type: 'maliConfigChanged';
+    configured: boolean;
+    hint?: string;
 }
 
 export interface MsgShaderEditResult {
@@ -312,6 +322,7 @@ export type ExtensionToWebviewMessage =
     | MsgMeshLoaded
     | MsgPipelineConstantBufferLoaded
     | MsgMaliAnalysisResult
+    | MsgMaliConfigChanged
     | MsgShaderEditResult
     | MsgSyncShaderSelection
     | MsgTimingsLoaded

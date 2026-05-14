@@ -28,6 +28,7 @@
         shaderDrafts: {},
         shaderEditBusy: false,
         shaderEditStatus: null,
+        shaderEditStatusStage: null,
         shaderDiagnostics: [],
         shaderDiagnosticsStage: null,
         shaderDiagnosticJump: null,
@@ -71,6 +72,10 @@
             hint: null,
             recommendRemote: false,
         },
+        maliOfflineCompilerConfigured: false,
+        maliOfflineCompilerHint: null,
+        maliAnalysisByShader: {},
+        pendingMaliAnalysis: null,
     };
 
     // Build resourceId -> resource info lookup (strings for consistent key match)
@@ -155,6 +160,615 @@
 
     function renderShaderEditStatus() {
         return;
+    }
+
+    function renderMaliAnalysisPlaceholder(title, message) {
+        return '<div class="shader-editor-card neutral">'
+            + '<div class="shader-editor-eyebrow">Mali Analysis</div>'
+            + '<div class="shader-editor-title">' + esc(title) + '</div>'
+            + '<div class="shader-editor-copy">' + esc(message).replace(/\n/g, '<br>') + '</div>'
+            + '</div>';
+    }
+
+    function renderMaliAnalysisResult(message) {
+        const outDom = document.getElementById('mali-offline-result');
+        if (!outDom) {
+            return;
+        }
+
+        if (message && message.notConfigured) {
+            outDom.classList.add('empty-state');
+            outDom.innerHTML = renderMaliAnalysisPlaceholder(
+                'Mali Offline Compiler is not configured.',
+                message.hint || 'Set renderdoc.maliOfflineCompilerPath in VS Code Settings, then run Mali Analyze again.'
+            );
+            return;
+        }
+
+        outDom.classList.remove('empty-state');
+        outDom.textContent = message && message.error ? message.error : ((message && message.result) || '');
+    }
+
+    function shaderMaliAnalysisKey(eventId, stage, resourceId) {
+        return [String(eventId ?? ''), String(stage ?? ''), String(resourceId ?? '')].join('|');
+    }
+
+    function clearMaliAnalysisState() {
+        state.maliAnalysisByShader = {};
+        state.pendingMaliAnalysis = null;
+    }
+
+    function getPendingMaliAnalysisForShader(eventId, stage, resourceId) {
+        const pending = state.pendingMaliAnalysis;
+        if (!pending) return null;
+        if (pending.eventId !== eventId || pending.stage !== stage) return null;
+        if (String(pending.resourceId || '') !== String(resourceId || '')) return null;
+        return pending;
+    }
+
+    function getShaderMaliAnalysisRecord(eventId, stage, resourceId) {
+        return state.maliAnalysisByShader[shaderMaliAnalysisKey(eventId, stage, resourceId)] || null;
+    }
+
+    function storePendingMaliAnalysisResult(message) {
+        const pending = state.pendingMaliAnalysis;
+        state.pendingMaliAnalysis = null;
+        if (!pending || !message || message.notConfigured) {
+            return null;
+        }
+
+        const record = {
+            eventId: pending.eventId,
+            stage: pending.stage,
+            resourceId: pending.resourceId,
+            filename: pending.filename,
+            source: pending.source,
+            result: typeof message.result === 'string' ? message.result : '',
+            error: typeof message.error === 'string' ? message.error : '',
+            hint: typeof message.hint === 'string' ? message.hint : null,
+            completedAt: Date.now(),
+        };
+
+        state.maliAnalysisByShader[shaderMaliAnalysisKey(record.eventId, record.stage, record.resourceId)] = record;
+        return record;
+    }
+
+    function getMaliAnalyzeAvailability(selectedFileIndex, source, eventId, stage, resourceId) {
+        if (getPendingMaliAnalysisForShader(eventId, stage, resourceId)) {
+            return {
+                disabled: true,
+                title: 'Mali Offline Compiler analysis is already running for this shader stage',
+            };
+        }
+        if (!state.maliOfflineCompilerConfigured) {
+            return {
+                disabled: true,
+                title: state.maliOfflineCompilerHint || 'Set renderdoc.maliOfflineCompilerPath in VS Code Settings to enable Mali Offline Compiler analysis.',
+            };
+        }
+        if (selectedFileIndex === -1) {
+            return {
+                disabled: true,
+                title: 'Switch to a source file tab to analyze source code',
+            };
+        }
+        if (!source || !source.trim()) {
+            return {
+                disabled: true,
+                title: 'No shader source is available to analyze',
+            };
+        }
+        return {
+            disabled: false,
+            title: 'Analyze performance with Mali Offline Compiler',
+        };
+    }
+
+    function formatShaderStageLabel(stage) {
+        return String(stage || 'unknown')
+            .replace(/_/g, ' ')
+            .replace(/\b\w/g, (match) => match.toUpperCase());
+    }
+
+    function formatShaderEncodingLabel(encoding) {
+        switch (encoding) {
+            case SHADER_ENCODING.DXBC:
+                return 'DXBC';
+            case SHADER_ENCODING.GLSL:
+                return 'GLSL';
+            case SHADER_ENCODING.SPIRV:
+                return 'SPIR-V';
+            case SHADER_ENCODING.SPIRVAsm:
+                return 'SPIR-V ASM';
+            case SHADER_ENCODING.HLSL:
+                return 'HLSL';
+            case SHADER_ENCODING.DXIL:
+                return 'DXIL';
+            case SHADER_ENCODING.OpenGLSPIRV:
+                return 'OpenGL SPIR-V';
+            case SHADER_ENCODING.OpenGLSPIRVAsm:
+                return 'OpenGL SPIR-V ASM';
+            case SHADER_ENCODING.Slang:
+                return 'Slang';
+            default:
+                return 'Unknown';
+        }
+    }
+
+    function getShaderTextMetrics(text) {
+        const value = String(text || '');
+        const lines = value.length > 0 ? value.split(/\r?\n/) : [];
+        let nonEmptyLines = 0;
+        for (const line of lines) {
+            if (line.trim().length > 0) nonEmptyLines += 1;
+        }
+        return {
+            lines: lines.length,
+            nonEmptyLines,
+            characters: value.length,
+        };
+    }
+
+    function getShaderDiagnosticsSummary(stage) {
+        const summary = { total: 0, error: 0, warning: 0, note: 0 };
+        const diagnostics = state.shaderDiagnosticsStage === stage && Array.isArray(state.shaderDiagnostics)
+            ? state.shaderDiagnostics
+            : [];
+
+        for (const diagnostic of diagnostics) {
+            const severity = String(diagnostic && diagnostic.severity || 'note').toLowerCase();
+            if (severity === 'error') summary.error += 1;
+            else if (severity === 'warning') summary.warning += 1;
+            else summary.note += 1;
+            summary.total += 1;
+        }
+
+        return summary;
+    }
+
+    function getDirtyShaderFileCount(stage, files) {
+        const sourceFiles = Array.isArray(files) ? files : [];
+        let dirtyCount = 0;
+        for (let index = 0; index < sourceFiles.length; index++) {
+            const originalContents = (sourceFiles[index] && sourceFiles[index].contents) || '';
+            const currentContents = getShaderDraft(stage, index, originalContents);
+            if (currentContents !== originalContents) dirtyCount += 1;
+        }
+        return dirtyCount;
+    }
+
+    function normalizeMaliOutputLine(line) {
+        return String(line || '')
+            .replace(/\t/g, ' ')
+            .replace(/\s+/g, ' ')
+            .trim();
+    }
+
+    function extractMaliNumericValue(value) {
+        const match = String(value || '').replace(/,/g, '').match(/-?\d+(?:\.\d+)?/);
+        return match ? Number(match[0]) : null;
+    }
+
+    function parseMaliBooleanValue(value) {
+        const normalized = normalizeMaliOutputLine(value).toLowerCase();
+        if (!normalized) return null;
+        if (/\b(no|false|disabled|none|off|not required|not needed|not present)\b/.test(normalized)) return false;
+        if (/\b(yes|true|enabled|required|present|on)\b/.test(normalized)) return true;
+        const numericValue = extractMaliNumericValue(normalized);
+        if (numericValue != null) return numericValue > 0;
+        return null;
+    }
+
+    function extractMaliHighlights(text, maxCount) {
+        const lines = String(text || '')
+            .split(/\r?\n/)
+            .map((line) => normalizeMaliOutputLine(line))
+            .filter(Boolean);
+        if (lines.length === 0) return [];
+
+        const preferred = lines.filter((line) => /(cycle|instruction|register|varying|uniform|sampler|texture|spill|stack|bound|throughput|occup|thread|alu|latenc|work register|load\/store|ls)/i.test(line));
+        const metricLines = preferred.length > 0 ? preferred : lines.filter((line) => line.includes(':'));
+        const picked = (metricLines.length > 0 ? metricLines : lines)
+            .filter((line, index, all) => all.indexOf(line) === index)
+            .slice(0, Math.max(1, maxCount || 3));
+        return picked;
+    }
+
+    function getMaliAnalysisOutputText(record) {
+        if (!record) return '';
+
+        const chunks = [];
+        if (record.error) chunks.push(String(record.error));
+        if (record.result && record.result !== record.error) chunks.push(String(record.result));
+
+        return chunks.join('\n\n').trim();
+    }
+
+    function formatMaliMetricValue(spec, item) {
+        if (!spec || !item) return '—';
+        if (spec.kind === 'boolean') {
+            if (item.booleanValue === true) return 'Yes';
+            if (item.booleanValue === false) return 'No';
+        }
+        if (spec.unit === 'cycles' && item.numericValue != null) {
+            return formatCompactNumber(item.numericValue) + ' cycles';
+        }
+        if (item.numericValue != null) {
+            return formatCompactNumber(item.numericValue);
+        }
+        return item.rawValue || '—';
+    }
+
+    function parseMaliAnalysisSummary(text) {
+        const lines = String(text || '')
+            .split(/\r?\n/)
+            .map((line) => normalizeMaliOutputLine(line))
+            .filter(Boolean);
+        if (lines.length === 0) {
+            return { metrics: [], signals: [], highlights: [] };
+        }
+
+        const specs = [
+            {
+                key: 'workRegisters',
+                label: 'Work Registers',
+                meta: 'Register pressure proxy',
+                patterns: [/\bwork registers?\b\s*[:=]\s*(.+)$/i, /\bregisters used\b\s*[:=]\s*(.+)$/i],
+            },
+            {
+                key: 'uniformRegisters',
+                label: 'Uniform Registers',
+                meta: 'Uniform file usage',
+                patterns: [/\buniform registers?\b\s*[:=]\s*(.+)$/i],
+            },
+            {
+                key: 'longestCycles',
+                label: 'Longest Path',
+                meta: 'Estimated critical path length',
+                unit: 'cycles',
+                patterns: [/\blong(?:est)?(?: path)? cycles?\b\s*[:=]\s*(.+)$/i],
+            },
+            {
+                key: 'shortestCycles',
+                label: 'Shortest Path',
+                meta: 'Best-case path length',
+                unit: 'cycles',
+                patterns: [/\bshort(?:est)?(?: path)? cycles?\b\s*[:=]\s*(.+)$/i],
+            },
+            {
+                key: 'totalCycles',
+                label: 'Total Cycles',
+                meta: 'Aggregate cycle estimate',
+                unit: 'cycles',
+                patterns: [/\btotal(?: instruction)? cycles?\b\s*[:=]\s*(.+)$/i, /\binstruction cycles?\b\s*[:=]\s*(.+)$/i],
+            },
+            {
+                key: 'varyings',
+                label: 'Varyings',
+                meta: 'Interpolator pressure',
+                patterns: [/\bvaryings?\b\s*[:=]\s*(.+)$/i, /\binterpolators?\b\s*[:=]\s*(.+)$/i],
+            },
+            {
+                key: 'samplers',
+                label: 'Samplers',
+                meta: 'Sampling descriptor pressure',
+                patterns: [/\bsamplers?\b\s*[:=]\s*(.+)$/i],
+            },
+            {
+                key: 'spill',
+                label: 'Stack Spill',
+                meta: 'Register overflow risk',
+                kind: 'boolean',
+                patterns: [/\bstack spill(?:ing)?\b\s*[:=]\s*(.+)$/i, /\bspilling\b\s*[:=]\s*(.+)$/i],
+            },
+            {
+                key: 'texture',
+                label: 'Texture Pressure',
+                meta: 'Sampling / texturing pressure',
+                patterns: [/\btexture(?:\s+\w+)?\b\s*[:=]\s*(.+)$/i, /\btex(?:ture)? instructions?\b\s*[:=]\s*(.+)$/i],
+            },
+            {
+                key: 'loadStore',
+                label: 'Load / Store',
+                meta: 'Memory pipeline pressure',
+                patterns: [/\bload\/store\b\s*[:=]\s*(.+)$/i, /\bLS\b\s*[:=]\s*(.+)$/i],
+            },
+        ];
+
+        const matches = new Map();
+        const consumedLines = new Set();
+        for (const spec of specs) {
+            for (const line of lines) {
+                let matchedValue = null;
+                for (const pattern of spec.patterns) {
+                    const match = line.match(pattern);
+                    if (match) {
+                        matchedValue = normalizeMaliOutputLine(match[1] || line);
+                        break;
+                    }
+                }
+                if (!matchedValue) continue;
+
+                matches.set(spec.key, {
+                    spec,
+                    line,
+                    rawValue: matchedValue,
+                    numericValue: extractMaliNumericValue(matchedValue),
+                    booleanValue: spec.kind === 'boolean' ? parseMaliBooleanValue(matchedValue) : null,
+                });
+                consumedLines.add(line);
+                break;
+            }
+        }
+
+        const orderedKeys = ['workRegisters', 'longestCycles', 'shortestCycles', 'totalCycles', 'uniformRegisters', 'varyings', 'samplers', 'spill', 'texture', 'loadStore'];
+        const metrics = [];
+        for (const key of orderedKeys) {
+            const item = matches.get(key);
+            if (!item) continue;
+            metrics.push({
+                label: item.spec.label,
+                value: formatMaliMetricValue(item.spec, item),
+                meta: item.spec.meta,
+            });
+        }
+
+        const signals = [];
+        const workRegisters = matches.get('workRegisters');
+        if (workRegisters && workRegisters.numericValue != null) {
+            if (workRegisters.numericValue >= 64) signals.push({ text: 'High Register Pressure', tone: 'danger' });
+            else if (workRegisters.numericValue >= 32) signals.push({ text: 'Register Heavy', tone: 'warn' });
+        }
+        const samplers = matches.get('samplers');
+        if (samplers && samplers.numericValue != null && samplers.numericValue >= 8) {
+            signals.push({ text: 'Sampler Heavy', tone: 'warn' });
+        }
+        const spill = matches.get('spill');
+        if (spill && spill.booleanValue === true) signals.push({ text: 'Spilling', tone: 'danger' });
+        else if (spill && spill.booleanValue === false) signals.push({ text: 'No Spill', tone: 'good' });
+        const longestCycles = matches.get('longestCycles') || matches.get('totalCycles');
+        if (longestCycles && longestCycles.numericValue != null) {
+            if (longestCycles.numericValue >= 64) signals.push({ text: 'Long Critical Path', tone: 'danger' });
+            else if (longestCycles.numericValue >= 32) signals.push({ text: 'Long Path', tone: 'warn' });
+        }
+        const texture = matches.get('texture');
+        if (texture && /bound|limit|heavy|latenc/i.test(texture.rawValue || '')) {
+            signals.push({ text: 'Texture Bound', tone: 'warn' });
+        }
+
+        const highlights = extractMaliHighlights(text, 6)
+            .filter((line) => !consumedLines.has(normalizeMaliOutputLine(line)))
+            .slice(0, 4);
+
+        return {
+            metrics,
+            signals: signals.filter((signal, index, all) => all.findIndex((entry) => entry.text === signal.text) === index),
+            highlights,
+        };
+    }
+
+    function getShaderStageLookupAliases(stageKey) {
+        const normalized = String(stageKey || '').trim();
+        const shaderStages = GFX_PIPELINE.filter((stage) => stage.kind === 'Shader').concat([{ id: 'compute', aliases: [] }]);
+        for (const stage of shaderStages) {
+            const aliases = Array.isArray(stage.aliases) ? stage.aliases : [];
+            if (stage.id === normalized || aliases.includes(normalized)) {
+                return [stage.id].concat(aliases).filter((entry) => entry && entry !== normalized);
+            }
+        }
+        return [];
+    }
+
+    function resolvePipelineStageResources(pipeline, stageKey) {
+        const stageResources = pipeline && pipeline.stageResources;
+        if (!stageResources) return null;
+        const match = resolveShader(stageResources, stageKey, getShaderStageLookupAliases(stageKey));
+        return match ? match.info : null;
+    }
+
+    function hasResolvedConstantBlock(entry) {
+        if (!entry) return false;
+        if (entry.bufferResourceId) return true;
+        if (entry.compileConstants) return true;
+        if (entry.inlineDataBytes) return true;
+        if (entry.bufferBacked === false) return true;
+        return false;
+    }
+
+    function buildShaderBindingSummary(pipeline, stageKey) {
+        if (!pipeline) {
+            return {
+                tone: 'neutral',
+                title: 'Waiting for pipeline state',
+                copy: 'Pipeline reflection and binding summaries appear after the current event pipeline snapshot finishes loading.',
+                pills: [{ text: 'Loading', tone: 'neutral' }],
+                metrics: [
+                    { label: 'Reflection', value: 'Pending', meta: 'Pipeline snapshot not loaded yet' },
+                ],
+                kvs: [],
+                lines: [],
+            };
+        }
+
+        if (pipeline.error) {
+            return {
+                tone: 'warn',
+                title: 'Pipeline reflection unavailable',
+                copy: 'The current event pipeline state could not be resolved, so binding summaries are unavailable for this stage.',
+                pills: [{ text: 'Unavailable', tone: 'warn' }],
+                metrics: [
+                    { label: 'Reflection', value: 'Unavailable', meta: 'Pipeline state request failed' },
+                ],
+                kvs: [],
+                lines: [String(pipeline.error)],
+            };
+        }
+
+        const resources = resolvePipelineStageResources(pipeline, stageKey);
+        if (!resources) {
+            return {
+                tone: 'neutral',
+                title: 'No stage resource snapshot',
+                copy: 'This shader stage has no reflected stageResources payload in the current pipeline snapshot.',
+                pills: [{ text: 'Unavailable', tone: 'neutral' }],
+                metrics: [
+                    { label: 'Reflection', value: 'Missing', meta: 'No stageResources entry for this stage' },
+                ],
+                kvs: [],
+                lines: [],
+            };
+        }
+
+        const textures = Array.isArray(resources.textures) ? resources.textures : [];
+        const samplers = Array.isArray(resources.samplers) ? resources.samplers : [];
+        const constantBlocks = Array.isArray(resources.constantBlocks) ? resources.constantBlocks : [];
+        const hasReflection = !!resources.hasReflection;
+        const textureViews = textures.filter((entry) => String(entry && entry.kind || '').toLowerCase() === 'texture');
+        const bufferViews = textures.filter((entry) => String(entry && entry.kind || '').toLowerCase() === 'buffer');
+        const resolvedViews = textures.filter((entry) => !!(entry && entry.resourceId));
+        const compareSamplers = samplers.filter((entry) => !!(entry && entry.compareEnable));
+        const samplerObjects = samplers.filter((entry) => !!(entry && entry.resourceId));
+        const resolvedBlocks = constantBlocks.filter((entry) => hasResolvedConstantBlock(entry));
+        const directBlocks = constantBlocks.filter((entry) => entry && entry.bufferBacked === false);
+        const compileConstantBlocks = constantBlocks.filter((entry) => !!(entry && entry.compileConstants));
+        const inlineBlocks = constantBlocks.filter((entry) => !!(entry && entry.inlineDataBytes));
+        const inputAttachments = textures.filter((entry) => !!(entry && entry.inputAttachment));
+        const samplerBackedTextures = textures.filter((entry) => !!(entry && entry.hasSampler));
+        const staticallyUnused = textures.concat(samplers, constantBlocks).filter((entry) => !!(entry && entry.staticallyUnused));
+        const totalConstantBytes = constantBlocks.reduce((sum, entry) => sum + Number(entry && (entry.boundByteSize || entry.byteSize || entry.inlineDataBytes) || 0), 0);
+        const reflectedBindingCount = textures.length + samplers.length + constantBlocks.length;
+        const resolvedViewNames = resolvedViews
+            .map((entry) => entry.resourceName || entry.name)
+            .filter(Boolean)
+            .slice(0, 3);
+        const unusedNames = staticallyUnused
+            .map((entry) => entry.name)
+            .filter(Boolean)
+            .slice(0, 3);
+
+        let tone = 'info';
+        if (!hasReflection) tone = 'neutral';
+        else if (staticallyUnused.length > 0) tone = 'warn';
+        else if (reflectedBindingCount > 0) tone = 'good';
+
+        const lines = [];
+        if (resolvedViewNames.length > 0) {
+            lines.push('Resolved views: ' + resolvedViewNames.join(', ') + (resolvedViews.length > resolvedViewNames.length ? ' +' + (resolvedViews.length - resolvedViewNames.length) : ''));
+        }
+        if (unusedNames.length > 0) {
+            lines.push('Statically unused: ' + unusedNames.join(', ') + (staticallyUnused.length > unusedNames.length ? ' +' + (staticallyUnused.length - unusedNames.length) : ''));
+        }
+        if (directBlocks.length > 0 || compileConstantBlocks.length > 0 || inlineBlocks.length > 0) {
+            lines.push(
+                formatCompactNumber(directBlocks.length + inlineBlocks.length) + ' direct / inline block' + ((directBlocks.length + inlineBlocks.length) === 1 ? '' : 's')
+                + ' · '
+                + formatCompactNumber(compileConstantBlocks.length) + ' compile-time constant block' + (compileConstantBlocks.length === 1 ? '' : 's')
+            );
+        }
+
+        return {
+            tone,
+            title: hasReflection ? (formatCompactNumber(reflectedBindingCount) + ' reflected bindings') : 'Reflection unavailable',
+            copy: hasReflection
+                ? 'Binding counts come from the current pipeline reflection and resolved descriptor state for this stage.'
+                : 'RenderDoc did not expose reflection metadata for the current stage at this event.',
+            pills: [
+                { text: hasReflection ? 'Reflection Ready' : 'No Reflection', tone: hasReflection ? 'good' : 'neutral' },
+                staticallyUnused.length > 0 ? { text: staticallyUnused.length + ' Unused', tone: 'warn' } : null,
+                inputAttachments.length > 0 ? { text: inputAttachments.length + ' Input Attachments', tone: 'info' } : null,
+            ],
+            metrics: [
+                {
+                    label: 'Read-Only Views',
+                    value: formatCompactNumber(textures.length),
+                    meta: textureViews.length + ' textures · ' + bufferViews.length + ' buffers',
+                },
+                {
+                    label: 'Resolved Views',
+                    value: formatCompactNumber(resolvedViews.length),
+                    meta: textures.length > 0 ? (formatOverviewPercent(resolvedViews.length / Math.max(1, textures.length)) + ' currently bound') : 'No read-only resources',
+                },
+                {
+                    label: 'Samplers',
+                    value: formatCompactNumber(samplers.length),
+                    meta: compareSamplers.length + ' compare · ' + samplerObjects.length + ' objects',
+                },
+                {
+                    label: 'Uniform Blocks',
+                    value: formatCompactNumber(constantBlocks.length),
+                    meta: resolvedBlocks.length + ' resolved · ' + (directBlocks.length + inlineBlocks.length) + ' direct/inline',
+                },
+            ],
+            kvs: [
+                { label: 'Uniform Bytes', value: formatByteSize(totalConstantBytes) },
+                { label: 'Sampler-backed Resources', value: formatCompactNumber(samplerBackedTextures.length) },
+                { label: 'Compile Constants', value: formatCompactNumber(compileConstantBlocks.length) },
+                { label: 'Unused Bindings', value: formatCompactNumber(staticallyUnused.length) },
+            ],
+            lines,
+        };
+    }
+
+    function renderShaderStatusMetric(label, value, meta) {
+        return '<div class="shader-status-metric">'
+            + '<div class="shader-status-metric-label">' + esc(label) + '</div>'
+            + '<div class="shader-status-metric-value">' + esc(value == null ? '—' : String(value)) + '</div>'
+            + (meta ? '<div class="shader-status-metric-meta">' + esc(meta) + '</div>' : '')
+            + '</div>';
+    }
+
+    function renderShaderStatusKv(label, value) {
+        return '<div class="shader-status-k">' + esc(label) + '</div>'
+            + '<div class="shader-status-v">' + esc(value == null ? '—' : String(value)) + '</div>';
+    }
+
+    function renderShaderStatusCard(options) {
+        const pills = Array.isArray(options && options.pills) ? options.pills.filter((pill) => pill && pill.text) : [];
+        const metrics = Array.isArray(options && options.metrics) ? options.metrics.filter(Boolean) : [];
+        const kvs = Array.isArray(options && options.kvs) ? options.kvs.filter(Boolean) : [];
+        const lines = Array.isArray(options && options.lines) ? options.lines.filter(Boolean) : [];
+        const preformatted = typeof (options && options.preformatted) === 'string' ? options.preformatted : '';
+        const className = options && options.className ? String(options.className).trim() : '';
+
+        let html = '<section class="shader-status-card ' + esc(options && options.tone || 'neutral') + (className ? (' ' + esc(className)) : '') + '">';
+        html += '<div class="shader-status-card-label">' + esc(options && options.label || 'Shader Status') + '</div>';
+        html += '<div class="shader-status-card-title">' + esc(options && options.title || 'Overview') + '</div>';
+        if (options && options.copy) {
+            html += '<div class="shader-status-card-copy">' + esc(options.copy).replace(/\n/g, '<br>') + '</div>';
+        }
+        if (pills.length > 0) {
+            html += '<div class="shader-status-pill-row">';
+            for (const pill of pills) {
+                html += '<span class="shader-status-pill' + (pill.tone ? ' ' + esc(pill.tone) : '') + '">' + esc(pill.text) + '</span>';
+            }
+            html += '</div>';
+        }
+        if (metrics.length > 0) {
+            html += '<div class="shader-status-metrics">';
+            for (const metric of metrics) {
+                html += renderShaderStatusMetric(metric.label, metric.value, metric.meta);
+            }
+            html += '</div>';
+        }
+        if (kvs.length > 0) {
+            html += '<div class="shader-status-kv-grid">';
+            for (const item of kvs) {
+                html += renderShaderStatusKv(item.label, item.value);
+            }
+            html += '</div>';
+        }
+        if (lines.length > 0) {
+            html += '<div class="shader-status-lines">';
+            for (const line of lines) {
+                html += '<div class="shader-status-line">' + esc(line) + '</div>';
+            }
+            html += '</div>';
+        }
+        if (preformatted) {
+            html += '<pre class="shader-status-preformatted">' + esc(preformatted) + '</pre>';
+        }
+        html += '</section>';
+        return html;
     }
 
     function clearShaderDiagnostics() {
@@ -661,6 +1275,8 @@
                         clearShaderEditorSync();
                         state.shaderEditBusy = false;
                         state.shaderEditStatus = null;
+                        state.shaderEditStatusStage = null;
+                        clearMaliAnalysisState();
                         state.meshCache = {};
                         state.meshPending = {};
                     }
@@ -668,6 +1284,8 @@
                 state.captureInfo = m.captureInfo;
                 state.drawCalls = m.drawCalls || [];
                 state.resources = m.resources || [];
+                state.maliOfflineCompilerConfigured = !!m.maliOfflineCompilerConfigured;
+                state.maliOfflineCompilerHint = m.maliOfflineCompilerHint || null;
                 state.resourceAliases = {};
                 state.currentPreviewChannel = -1;
                 state.timings = {};
@@ -692,6 +1310,11 @@
                 };
                 renderReplayBanner();
                 break;
+            case 'maliConfigChanged':
+                state.maliOfflineCompilerConfigured = !!m.configured;
+                state.maliOfflineCompilerHint = m.hint || null;
+                if (state.activeTab === 'shaders') renderShaders();
+                break;
             case 'eventChanged':
                 {
                     const sameEvent = state.eventId === m.eventId;
@@ -708,6 +1331,7 @@
                         clearShaderEditorSync();
                         state.shaderEditBusy = false;
                         state.shaderEditStatus = null;
+                        state.shaderEditStatusStage = null;
                         state.meshCache = {};
                         state.meshPending = {};
                         state.meshCam.auto = true;
@@ -740,6 +1364,7 @@
                 state.shaderDiagnosticsStage = m.stage || null;
                 state.shaderDiagnosticJump = null;
                 clearShaderEditorSync();
+                state.shaderEditStatusStage = m.stage || null;
                 state.shaderEditStatus = {
                     kind: m.ok ? 'success' : 'error',
                     message: m.message || (m.ok ? 'Shader update complete.' : 'Shader update failed.'),
@@ -813,14 +1438,9 @@
                 }
                 break;
             case 'maliAnalysisResult':
-                const outDom = document.getElementById('mali-offline-result');
-                const containerDom = document.getElementById('mali-offline-result-container');
-                const splitterDom = document.getElementById('mali-offline-splitter');
-                if (outDom) {
-                    outDom.innerText = m.error ? m.error : (m.result || '');
-                }
-                if (containerDom) containerDom.style.display = 'flex';
-                if (splitterDom) splitterDom.style.display = 'block';
+                storePendingMaliAnalysisResult(m);
+                renderMaliAnalysisResult(m);
+                if (state.activeTab === 'shaders') renderShaders();
                 break;
             case 'timingsLoaded':
                 state.timings = m.timings || {};
@@ -2854,14 +3474,18 @@
         const toolbar = document.getElementById('shaders-toolbar');
         const shaderPaneMeta = document.getElementById('shader-pane-meta');
         const stageTabs = document.getElementById('shader-stage-tabs');
+        const editorActions = document.getElementById('shader-editor-actions');
+        const analysisActions = document.getElementById('shader-analysis-actions');
         const fileBar = document.getElementById('shader-file-tabs');
-        if (!body || !toolbar || !stageTabs || !fileBar) return;
+        if (!body || !toolbar || !stageTabs || !editorActions || !analysisActions || !fileBar) return;
 
         const setReadOnlyState = (message, metaText) => {
             body.textContent = message;
             body.className = 'shader-editor-panel empty-state';
             toolbar.hidden = true;
             stageTabs.innerHTML = '';
+            editorActions.innerHTML = '';
+            analysisActions.innerHTML = '';
             fileBar.innerHTML = '';
             fileBar.hidden = true;
             if (shaderPaneMeta) shaderPaneMeta.textContent = metaText;
@@ -2900,6 +3524,8 @@
 
         toolbar.hidden = false;
         stageTabs.innerHTML = '';
+        editorActions.innerHTML = '';
+        analysisActions.innerHTML = '';
         if (!state.activeShaderStage || !stages.includes(state.activeShaderStage)) {
             state.activeShaderStage = stages[0];
         }
@@ -2947,9 +3573,15 @@
                 ? (currentFile.contents || '')
                 : (info.source || info.disassembly || ('// No source available for ' + activeStage));
 
+        const pipeStage = state.pipeline && state.pipeline.shaders && state.pipeline.shaders[activeStage];
+        const shaderResourceId = info.resourceId || (pipeStage && pipeStage.resourceId) || '';
+        const shaderResourceKey = String(shaderResourceId || '');
+        const shaderLabel = info.name
+            || (pipeStage && (pipeStage.programName || pipeStage.shaderName || pipeStage.name))
+            || (shaderResourceId ? resName(shaderResourceId) : '');
+
         const applyBtn = document.createElement('button');
         applyBtn.className = 'icon-btn';
-        applyBtn.style.marginLeft = 'auto';
         applyBtn.textContent = 'Apply';
         applyBtn.disabled = !editableStage || state.shaderEditBusy;
         applyBtn.title = editableStage
@@ -2958,6 +3590,7 @@
         applyBtn.addEventListener('click', () => {
             if (!editableStage || state.shaderEditBusy) return;
             state.shaderEditBusy = true;
+            state.shaderEditStatusStage = activeStage;
             state.shaderEditStatus = { kind: 'info', message: 'Compiling and applying shader…' };
             renderShaders();
             vscode.postMessage({
@@ -2973,7 +3606,7 @@
                 files: linkedSourceFiles,
             });
         });
-        stageTabs.appendChild(applyBtn);
+        editorActions.appendChild(applyBtn);
 
         const revertBtn = document.createElement('button');
         revertBtn.className = 'icon-btn';
@@ -2986,6 +3619,7 @@
             if (state.shaderEditBusy) return;
             if (info.hasReplacement) {
                 state.shaderEditBusy = true;
+                state.shaderEditStatusStage = activeStage;
                 state.shaderEditStatus = { kind: 'info', message: 'Reverting shader replacement…' };
                 renderShaders();
                 vscode.postMessage({
@@ -2997,30 +3631,32 @@
                 return;
             }
         });
-        stageTabs.appendChild(revertBtn);
+        editorActions.appendChild(revertBtn);
 
         const analyzeBtn = document.createElement('button');
         analyzeBtn.className = 'icon-btn';
         analyzeBtn.textContent = 'Mali Analyze';
-        analyzeBtn.title = cur === -1
-            ? 'Switch to a source file tab to analyze source code'
-            : 'Analyze performance with Mali Offline Compiler';
-        analyzeBtn.disabled = cur === -1 || !currentCode.trim();
+        const maliAnalyzeState = getMaliAnalyzeAvailability(cur, currentCode, state.eventId, activeStage, shaderResourceKey);
+        analyzeBtn.title = maliAnalyzeState.title;
+        analyzeBtn.disabled = maliAnalyzeState.disabled;
         analyzeBtn.addEventListener('click', () => {
             if (analyzeBtn.disabled) return;
-            const container = document.getElementById('mali-offline-result-container');
-            const splitter = document.getElementById('mali-offline-splitter');
-            if (container) container.style.display = 'flex';
-            if (splitter) splitter.style.display = 'block';
-            const outDom = document.getElementById('mali-offline-result');
-            if (outDom) outDom.innerText = 'Analyzing...';
+            state.pendingMaliAnalysis = {
+                eventId: state.eventId,
+                stage: activeStage,
+                resourceId: shaderResourceKey,
+                filename: currentFileName || (activeStage + '-shader'),
+                source: currentCode,
+                startedAt: Date.now(),
+            };
+            renderShaders();
             vscode.postMessage({
                 type: 'analyzeMaliOffline',
                 source: currentCode,
                 stage: activeStage,
             });
         });
-        stageTabs.appendChild(analyzeBtn);
+        analysisActions.appendChild(analyzeBtn);
 
         fileBar.innerHTML = '';
         const makeTab = (label, idx, isDirty) => {
@@ -3052,11 +3688,6 @@
         }
         fileBar.hidden = (currentFiles.length + (hasDisasm ? 1 : 0)) <= 0;
 
-        const pipeStage = state.pipeline && state.pipeline.shaders && state.pipeline.shaders[activeStage];
-        const shaderResourceId = info.resourceId || (pipeStage && pipeStage.resourceId) || '';
-        const shaderLabel = info.name
-            || (pipeStage && (pipeStage.programName || pipeStage.shaderName || pipeStage.name))
-            || (shaderResourceId ? resName(shaderResourceId) : '');
         const resourceText = shaderLabel
             ? (' · ' + shaderLabel)
             : (shaderResourceId ? (' · Resource ' + shaderResourceId) : '');
@@ -3083,24 +3714,319 @@
             files: linkedSourceFiles,
         };
 
-        body.className = 'shader-editor-panel';
-        const statusKind = state.shaderEditStatus && state.shaderEditStatus.message
-            ? (state.shaderEditStatus.kind || 'info')
-            : 'neutral';
-        const statusTitle = state.shaderEditStatus && state.shaderEditStatus.message
-            ? (state.shaderEditStatus.kind === 'success'
-                ? 'Shader compiled and applied.'
-                : (state.shaderEditStatus.kind === 'error' ? 'Shader compile failed.' : 'Shader compile in progress.'))
-            : 'Shader editor is linked.';
-        const statusMessage = state.shaderEditStatus && state.shaderEditStatus.message
-            ? state.shaderEditStatus.message
-            : 'Edit the shader in the real VS Code editor on the right, then use Apply here. This panel will later host shader performance data.';
-        body.innerHTML = '<div class="shader-editor-card ' + esc(statusKind) + '">'
-            + '<div class="shader-editor-eyebrow">Shader Status</div>'
-            + '<div class="shader-editor-title">' + esc(statusTitle) + '</div>'
-            + '<div class="shader-editor-copy">' + esc(statusMessage)
-                .replace(/\n/g, '<br>')
-            + '</div>'
+        const diagnosticsSummary = getShaderDiagnosticsSummary(activeStage);
+        const dirtyFileCount = getDirtyShaderFileCount(activeStage, sourceFiles);
+        const currentMetrics = getShaderTextMetrics(currentCode);
+        const aggregateMetrics = currentFiles.length > 0
+            ? currentFiles.reduce((acc, file) => {
+                const metrics = getShaderTextMetrics((file && file.contents) || '');
+                acc.lines += metrics.lines;
+                acc.nonEmptyLines += metrics.nonEmptyLines;
+                acc.characters += metrics.characters;
+                return acc;
+            }, { lines: 0, nonEmptyLines: 0, characters: 0 })
+            : currentMetrics;
+        const shaderModeLabel = cur === -1 && hasDisasm
+            ? 'Disassembly Preview'
+            : (editableStage ? 'Linked Source' : 'Read-only Source');
+        const compileFlagsCount = Array.isArray(info.compileFlags) ? info.compileFlags.length : 0;
+        const rawBytesLabel = info.hasRawBytes ? formatByteSize(info.rawBytesSize) : 'Unavailable';
+        const entrySourceLabel = info.entrySourceName
+            || (sourceFiles[entryFileIndex] && sourceFiles[entryFileIndex].filename)
+            || 'Unavailable';
+        const shaderDisplayName = shaderLabel || (shaderResourceKey ? ('Resource ' + shaderResourceKey) : (formatShaderStageLabel(activeStage) + ' Stage'));
+        const shaderStatus = state.shaderEditStatusStage === activeStage ? state.shaderEditStatus : null;
+        const bindingSummary = buildShaderBindingSummary(state.pipeline, activeStage);
+
+        let buildTone = 'neutral';
+        let buildTitle = 'Linked editor ready';
+        let buildCopy = 'Edit the linked shader file in VS Code, then use Apply here to rebuild the replay session.';
+        let buildStatusValue = editableStage ? 'Ready' : 'Read Only';
+
+        if (state.shaderEditBusy && state.shaderEditStatusStage === activeStage) {
+            buildTone = 'info';
+            buildTitle = 'Shader update in progress';
+            buildCopy = (shaderStatus && shaderStatus.message) || 'RenderDoc is compiling the current shader source snapshot.';
+            buildStatusValue = 'Running';
+        } else if (shaderStatus && shaderStatus.message) {
+            if (shaderStatus.kind === 'error') {
+                buildTone = 'danger';
+                buildTitle = 'Shader compilation failed';
+                buildStatusValue = 'Failed';
+            } else if (shaderStatus.kind === 'success') {
+                buildTone = info.hasReplacement ? 'good' : 'info';
+                buildTitle = info.hasReplacement ? 'Replacement shader active' : 'Shader build succeeded';
+                buildStatusValue = info.hasReplacement ? 'Applied' : 'Succeeded';
+            } else {
+                buildTone = 'info';
+                buildTitle = 'Shader update in progress';
+                buildStatusValue = 'Running';
+            }
+            buildCopy = shaderStatus.message;
+        } else if (diagnosticsSummary.error > 0) {
+            buildTone = 'danger';
+            buildTitle = 'Diagnostics require attention';
+            buildCopy = 'Errors from the latest compile are still attached to this stage. Review the diagnostics list below before applying again.';
+            buildStatusValue = 'Issues';
+        } else if (info.hasReplacement) {
+            buildTone = 'good';
+            buildTitle = 'Replacement shader active';
+            buildCopy = 'The replay session is currently using an applied replacement for this stage.';
+            buildStatusValue = 'Applied';
+        } else if (!editableStage) {
+            buildTone = 'neutral';
+            buildTitle = cur === -1 ? 'Disassembly preview' : 'Read-only shader preview';
+            buildCopy = cur === -1
+                ? 'This tab shows the selected disassembly target. Switch back to a source file to edit or analyze the shader.'
+                : 'This shader stage exposes source as read-only in the current replay context.';
+            buildStatusValue = cur === -1 ? 'Disassembly' : 'Read Only';
+        } else if (dirtyFileCount > 0) {
+            buildTone = 'warn';
+            buildTitle = 'Edits pending apply';
+            buildCopy = dirtyFileCount + ' source file' + (dirtyFileCount === 1 ? ' differs' : 's differ') + ' from the replay snapshot. Apply to rebuild the current session.';
+            buildStatusValue = 'Dirty';
+        }
+
+        const pendingMaliAnalysis = getPendingMaliAnalysisForShader(state.eventId, activeStage, shaderResourceKey);
+        const maliRecord = getShaderMaliAnalysisRecord(state.eventId, activeStage, shaderResourceKey);
+        const maliIsStale = !!(maliRecord && maliRecord.source !== currentCode);
+        const maliOutputText = getMaliAnalysisOutputText(maliRecord);
+        const maliSummary = maliOutputText ? parseMaliAnalysisSummary(maliOutputText) : { metrics: [], signals: [], highlights: [] };
+        const maliOutputLineCount = maliOutputText ? maliOutputText.split(/\r?\n/).length : 0;
+        const maliOutputMetrics = maliOutputText
+            ? [
+                {
+                    label: 'Output Lines',
+                    value: formatCompactNumber(maliOutputLineCount),
+                    meta: 'Verbatim compiler stdout/stderr',
+                },
+                {
+                    label: 'Characters',
+                    value: formatCompactNumber(maliOutputText.length),
+                    meta: 'Captured report size',
+                },
+            ]
+            : [];
+
+        let analysisTone = 'neutral';
+        let analysisTitle = 'Ready to analyze';
+        let analysisCopy = 'Run Mali Analyze to populate static performance-oriented findings for this source snapshot.';
+        let analysisStatusValue = 'Ready';
+        let analysisSnapshotValue = currentFileName || (activeStage + '-shader');
+        let analysisPills = [{ text: 'Mali Offline Compiler', tone: 'info' }];
+        let analysisLines = [];
+        let analysisMetrics = [
+            {
+                label: 'Status',
+                value: analysisStatusValue,
+                meta: 'Static source analysis',
+            },
+            {
+                label: 'Snapshot',
+                value: analysisSnapshotValue,
+                meta: currentMetrics.lines > 0 ? (formatCompactNumber(currentMetrics.lines) + ' current lines') : 'No source text loaded',
+            },
+        ];
+
+        if (!state.maliOfflineCompilerConfigured) {
+            analysisTitle = 'Tool not configured';
+            analysisCopy = state.maliOfflineCompilerHint || 'Set renderdoc.maliOfflineCompilerPath in VS Code Settings to enable Mali analysis.';
+            analysisStatusValue = 'Unavailable';
+            analysisPills.push({ text: 'Disabled', tone: 'neutral' });
+        } else if (pendingMaliAnalysis) {
+            analysisTone = 'info';
+            analysisTitle = 'Analysis in progress';
+            analysisCopy = 'Mali Offline Compiler is processing the current source snapshot.';
+            analysisStatusValue = 'Running';
+            analysisSnapshotValue = pendingMaliAnalysis.filename || analysisSnapshotValue;
+            analysisPills.push({ text: 'Running', tone: 'info' });
+            analysisLines = ['Results will appear in this card when the analysis finishes.'];
+        } else if (maliRecord && maliRecord.error) {
+            analysisTone = maliIsStale ? 'warn' : 'danger';
+            analysisTitle = maliIsStale ? 'Last analysis failed and is stale' : 'Analysis failed';
+            analysisCopy = maliIsStale
+                ? 'The current source changed after the last failed Mali analysis run. Re-run the tool to refresh the status.'
+                : 'Mali Offline Compiler returned an error for the latest source snapshot.';
+            analysisStatusValue = maliIsStale ? 'Failed · Stale' : 'Failed';
+            analysisSnapshotValue = maliRecord.filename || analysisSnapshotValue;
+            analysisPills.push({ text: 'Failed', tone: 'danger' });
+            if (maliIsStale) analysisPills.push({ text: 'Stale', tone: 'warn' });
+            if (maliSummary.highlights.length === 0) {
+                const firstErrorLine = String(maliRecord.error || maliRecord.result || '').split(/\r?\n/).map((line) => normalizeMaliOutputLine(line)).find(Boolean);
+                if (firstErrorLine) analysisLines = [firstErrorLine];
+            } else {
+                analysisLines = maliSummary.highlights;
+            }
+        } else if (maliRecord) {
+            analysisTone = maliIsStale ? 'warn' : 'good';
+            analysisTitle = maliIsStale ? 'Analysis is stale' : 'Analysis available';
+            analysisCopy = maliIsStale
+                ? 'The current source differs from the snapshot that produced the latest Mali findings. Re-run the analysis to refresh them. Full compiler output remains available below.'
+                : 'Latest Mali Offline Compiler findings are attached to this source snapshot. Full compiler output is available below.';
+            analysisStatusValue = maliIsStale ? 'Stale' : 'Available';
+            analysisSnapshotValue = maliRecord.filename || analysisSnapshotValue;
+            analysisPills.push({ text: maliIsStale ? 'Stale' : 'Available', tone: maliIsStale ? 'warn' : 'good' });
+            analysisLines = maliSummary.highlights.length > 0
+                ? maliSummary.highlights
+                : ['Full compiler output is available below.'];
+        }
+
+        analysisMetrics[0].value = analysisStatusValue;
+        analysisMetrics[1].value = analysisSnapshotValue;
+        if (!pendingMaliAnalysis && maliRecord && maliSummary.signals.length > 0) {
+            analysisPills = analysisPills.concat(maliSummary.signals);
+        }
+        if (!pendingMaliAnalysis && maliRecord && maliSummary.metrics.length > 0) {
+            analysisMetrics = analysisMetrics.concat(maliSummary.metrics);
+        } else {
+            analysisMetrics.push({
+                label: 'Highlights',
+                value: formatCompactNumber(analysisLines.length),
+                meta: maliRecord ? 'Summary lines extracted from latest result' : 'Awaiting tool output',
+            });
+        }
+
+        const shouldShowMaliOutputCard = !!(pendingMaliAnalysis || maliRecord);
+        const maliOutputCard = shouldShowMaliOutputCard
+            ? renderShaderStatusCard({
+                tone: pendingMaliAnalysis
+                    ? 'info'
+                    : (maliRecord && maliRecord.error)
+                        ? (maliIsStale ? 'warn' : 'danger')
+                        : (maliIsStale ? 'warn' : 'neutral'),
+                className: 'shader-status-card-span-full',
+                label: 'Raw Mali Output',
+                title: pendingMaliAnalysis
+                    ? 'Compiler output pending'
+                    : (maliRecord && maliRecord.error)
+                        ? 'Compiler error output'
+                        : 'Complete compiler report',
+                copy: pendingMaliAnalysis
+                    ? 'Full stdout/stderr from Mali Offline Compiler will appear here when the current run completes.'
+                    : 'This is the verbatim output captured from Mali Offline Compiler for the analyzed shader snapshot.',
+                metrics: pendingMaliAnalysis ? [] : maliOutputMetrics,
+                preformatted: pendingMaliAnalysis ? 'Waiting for Mali Offline Compiler output…' : (maliOutputText || 'No output captured.'),
+            })
+            : '';
+
+        body.className = 'shader-editor-panel shader-status-dashboard';
+        body.innerHTML = '<div class="shader-status-grid">'
+            + renderShaderStatusCard({
+                tone: buildTone,
+                label: 'Build Health',
+                title: buildTitle,
+                copy: buildCopy,
+                pills: [
+                    { text: editableStage ? 'Editable' : 'Read-only', tone: editableStage ? 'good' : 'neutral' },
+                    { text: shaderModeLabel, tone: cur === -1 ? 'warn' : 'neutral' },
+                    info.hasReplacement ? { text: 'Replacement Active', tone: 'good' } : null,
+                    dirtyFileCount > 0 ? { text: dirtyFileCount + ' Dirty', tone: 'warn' } : null,
+                ],
+                metrics: [
+                    {
+                        label: 'Status',
+                        value: buildStatusValue,
+                        meta: formatShaderStageLabel(activeStage) + ' stage',
+                    },
+                    {
+                        label: 'Diagnostics',
+                        value: formatCompactNumber(diagnosticsSummary.total),
+                        meta: diagnosticsSummary.total > 0
+                            ? (diagnosticsSummary.error + ' errors · ' + diagnosticsSummary.warning + ' warnings')
+                            : 'No current compile diagnostics',
+                    },
+                    {
+                        label: 'Dirty Files',
+                        value: formatCompactNumber(dirtyFileCount),
+                        meta: fileCount > 0 ? (fileCount + ' tracked source file' + (fileCount === 1 ? '' : 's')) : 'No source files exposed',
+                    },
+                    {
+                        label: 'Replacement',
+                        value: info.hasReplacement ? 'Active' : 'None',
+                        meta: 'Session-scoped replay override',
+                    },
+                ],
+            })
+            + renderShaderStatusCard({
+                tone: 'neutral',
+                label: 'Shader Identity',
+                title: shaderDisplayName,
+                copy: state.drawCall && state.drawCall.name
+                    ? ('Bound at EID ' + state.eventId + ' · ' + state.drawCall.name)
+                    : 'Bound at the currently focused replay event.',
+                pills: [
+                    { text: formatShaderStageLabel(activeStage), tone: 'neutral' },
+                    { text: formatShaderEncodingLabel(info.sourceEncoding), tone: 'info' },
+                    hasDisasm ? { text: 'Disassembly Available', tone: 'warn' } : null,
+                    editableStage ? { text: 'Linked Editor', tone: 'good' } : null,
+                ],
+                kvs: [
+                    { label: 'Resource ID', value: shaderResourceKey || 'Unavailable' },
+                    { label: 'Entry Point', value: info.entryPoint || 'main' },
+                    { label: 'Current Tab', value: currentFileName || 'Unavailable' },
+                    { label: 'Entry Source', value: entrySourceLabel },
+                    { label: 'Source Files', value: formatCompactNumber(fileCount) },
+                    { label: 'Language', value: formatShaderEncodingLabel(info.sourceEncoding) },
+                ],
+            })
+            + renderShaderStatusCard({
+                tone: bindingSummary.tone,
+                label: 'Reflection & Bindings',
+                title: bindingSummary.title,
+                copy: bindingSummary.copy,
+                pills: bindingSummary.pills,
+                metrics: bindingSummary.metrics,
+                kvs: bindingSummary.kvs,
+                lines: bindingSummary.lines,
+            })
+            + renderShaderStatusCard({
+                tone: 'neutral',
+                label: 'Static Complexity',
+                title: currentMetrics.lines > 0
+                    ? (formatCompactNumber(currentMetrics.lines) + ' lines in current snapshot')
+                    : 'No source text loaded',
+                copy: cur === -1 && hasDisasm
+                    ? 'Metrics below describe the selected disassembly tab. Aggregate totals still cover all exposed source files when available.'
+                    : 'Metrics below describe the selected source file. Aggregate totals cover all exposed source files for this stage.',
+                metrics: [
+                    {
+                        label: 'Lines',
+                        value: formatCompactNumber(currentMetrics.lines),
+                        meta: currentFileName || 'Current selection',
+                    },
+                    {
+                        label: 'Non-Empty',
+                        value: formatCompactNumber(currentMetrics.nonEmptyLines),
+                        meta: currentMetrics.lines > 0
+                            ? (formatOverviewPercent(currentMetrics.nonEmptyLines / Math.max(1, currentMetrics.lines)) + ' populated')
+                            : 'No text loaded',
+                    },
+                    {
+                        label: 'Characters',
+                        value: formatCompactNumber(currentMetrics.characters),
+                        meta: cur === -1 ? 'Disassembly text' : 'Current source file',
+                    },
+                ],
+                kvs: [
+                    {
+                        label: 'Aggregate Size',
+                        value: formatCompactNumber(aggregateMetrics.characters) + ' chars · ' + formatCompactNumber(aggregateMetrics.lines) + ' lines',
+                    },
+                    { label: 'Compile Flags', value: formatCompactNumber(compileFlagsCount) },
+                    { label: 'Raw Bytes', value: rawBytesLabel },
+                    { label: 'View Mode', value: shaderModeLabel },
+                ],
+            })
+            + renderShaderStatusCard({
+                tone: analysisTone,
+                label: 'Analysis Summary',
+                title: analysisTitle,
+                copy: analysisCopy,
+                pills: analysisPills,
+                metrics: analysisMetrics,
+                lines: analysisLines,
+            })
+            + maliOutputCard
             + '</div>';
 
         syncLinkedShaderEditor({
@@ -4925,37 +5851,6 @@
             pgViewport.addEventListener('pointercancel', stopGraphDrag);
         }
         updatePipelineGraphZoomUi();
-
-        // Mali Offline Splitter
-        const maliSplitter = document.getElementById('mali-offline-splitter');
-        const shadersContainerEl = document.getElementById('shaders-container');
-        if (maliSplitter && shadersContainerEl) {
-            let isDraggingMaliSplitter = false;
-            let startX = 0;
-            let startWidth = 0;
-
-            maliSplitter.addEventListener('pointerdown', (e) => {
-                isDraggingMaliSplitter = true;
-                startX = e.clientX;
-                startWidth = shadersContainerEl.getBoundingClientRect().width;
-                maliSplitter.classList.add('dragging');
-                maliSplitter.setPointerCapture(e.pointerId);
-                e.preventDefault();
-            });
-
-            maliSplitter.addEventListener('pointermove', (e) => {
-                if (!isDraggingMaliSplitter) return;
-                const dx = e.clientX - startX;
-                const newWidth = Math.max(100, Math.min(window.innerWidth - 100, startWidth + dx));
-                shadersContainerEl.style.flex = `0 0 ${newWidth}px`;
-            });
-
-            maliSplitter.addEventListener('pointerup', (e) => {
-                isDraggingMaliSplitter = false;
-                maliSplitter.classList.remove('dragging');
-                try { maliSplitter.releasePointerCapture(e.pointerId); } catch {}
-            });
-        }
 
         // Mesh View Splitter
         const meshSplitter = document.getElementById('mesh-splitter');

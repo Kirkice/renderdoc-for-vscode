@@ -109,8 +109,19 @@ export function buildInspectorHtml(
             </section>
 
             <section id="tab-shaders" class="tab-panel">
-                <div id="shaders-toolbar" class="sub-toolbar" hidden>
-                    <div id="shader-stage-tabs" class="stage-tabs"></div>
+                <div id="shaders-toolbar" class="sub-toolbar shader-toolbar" hidden>
+                    <div class="shader-toolbar-group shader-toolbar-group-stage">
+                        <div class="shader-toolbar-group-label">Shader</div>
+                        <div id="shader-stage-tabs" class="stage-tabs shader-stage-tabs"></div>
+                    </div>
+                    <div class="shader-toolbar-group shader-toolbar-group-editor">
+                        <div class="shader-toolbar-group-label">Editor</div>
+                        <div id="shader-editor-actions" class="stage-tabs shader-action-tabs"></div>
+                    </div>
+                    <div class="shader-toolbar-group shader-toolbar-group-analysis">
+                        <div class="shader-toolbar-group-label">Analysis</div>
+                        <div id="shader-analysis-actions" class="stage-tabs shader-action-tabs"></div>
+                    </div>
                 </div>
                 <div id="shader-file-tabs" class="stage-tabs shader-file-tabs" hidden></div>
                 <div class="shader-workspace">
@@ -122,16 +133,6 @@ export function buildInspectorHtml(
                             </div>
                         </div>
                         <div id="shaders-body" class="shader-editor-panel empty-state">Select an event to view shader status.</div>
-                    </div>
-                    <div id="mali-offline-splitter" class="vertical-splitter" style="display:none;"></div>
-                    <div id="mali-offline-result-container" class="shader-pane shader-analysis-pane" style="display:none;">
-                        <div class="shader-pane-header shader-pane-header-accent">
-                            <div>
-                                <div class="shader-pane-title">Mali Offline Compiler Analysis</div>
-                                <div class="shader-pane-meta">Performance-oriented static analysis for the selected shader stage.</div>
-                            </div>
-                        </div>
-                        <div id="mali-offline-result" class="shader-analysis-result"></div>
                     </div>
                 </div>
                 <div id="shader-diagnostics" class="shader-diagnostics" hidden></div>
