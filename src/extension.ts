@@ -1376,19 +1376,24 @@ export async function activate(context: vscode.ExtensionContext) {
             }
         }),
         vscode.commands.registerCommand('renderdoc.fetchTimings', () => fetchTimings()),
-    );    // ── Copilot integration (non-critical, don't break extension if unavailable) ──
-    try {
-        const getCapturePath = () => currentCapturePath;
-        const getSelectionContext = () => ({
-            selectedDrawCall: currentSelectedDrawCall,
-            selectedResource: currentSelectedResource,
-        });
-        initTools(bridge, getCapturePath, getSelectionContext, () => currentDrawCalls);
-        initChatParticipant(bridge, getCapturePath, getSelectionContext);
-        registerAllTools(context);
-        registerChatParticipant(context);
-    } catch (err: any) {
-        console.warn('[RenderDoc] Copilot integration failed (non-critical):', err.message);
+    );    // ── Copilot integration (non-critical, disabled when copilot-chat is not installed) ──
+    const copilotExtension = vscode.extensions.getExtension('github.copilot-chat');
+    if (copilotExtension) {
+        try {
+            const getCapturePath = () => currentCapturePath;
+            const getSelectionContext = () => ({
+                selectedDrawCall: currentSelectedDrawCall,
+                selectedResource: currentSelectedResource,
+            });
+            initTools(bridge, getCapturePath, getSelectionContext, () => currentDrawCalls);
+            initChatParticipant(bridge, getCapturePath, getSelectionContext);
+            registerAllTools(context);
+            registerChatParticipant(context);
+        } catch (err: any) {
+            console.warn('[RenderDoc] Copilot integration failed (non-critical):', err.message);
+        }
+    } else {
+        console.info('[RenderDoc] GitHub Copilot Chat not found — AI features disabled.');
     }
 
     // Update status bar

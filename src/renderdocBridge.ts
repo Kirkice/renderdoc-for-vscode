@@ -1419,6 +1419,16 @@ export class RenderDocBridge {
         });
     }
 
+    /** Get raw buffer contents via native bridge. Returns base64-encoded bytes. */
+    async nativeGetBufferContents(resourceId: string, offset?: number, len?: number, eventId?: number): Promise<any> {
+        return this.nativeCall('getBufferContents', {
+            resourceId,
+            offset: offset ?? 0,
+            len: len ?? 4096,
+            eventId: eventId ?? 0,
+        });
+    }
+
     /** Get root actions (draw call tree) via native bridge */
     async nativeGetRootActions(): Promise<any> {
         return this.nativeCall('getRootActions', {});

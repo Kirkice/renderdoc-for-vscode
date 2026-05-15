@@ -310,6 +310,30 @@ Available tools (also invokable via `#tool-name`):
 | `#textureInfo` | Texture-specific metadata |
 | `#analyzeFrame` | Comprehensive frame summary with flagged issues |
 
+#### Default Copilot Skill
+
+The workspace also ships a project-scoped skill at `.github/skills/renderdoc-analysis` for the default Copilot chat experience. That skill helps plain Copilot recognize RenderDoc-oriented prompts and route them through the existing `renderdoc_*` tools even when you do not explicitly address `@renderdoc`.
+
+For Unity engineering workspaces, the project also ships `.github/skills/renderdoc-unity-analysis`. That skill reuses the same RenderDoc capture tools for timings, EIDs, shaders, and pipeline facts, then adds Unity-specific routing for URP, HDRP, SRP, RenderGraph, `ScriptableRendererFeature`, `ScriptableRenderPass`, and Unity-side pass/shader implementation lookup.
+
+Typical default-Copilot prompts that should auto-load the skill:
+
+```text
+这个帧大概有哪些 pass？先给我一个结构概览。
+当前选中的这个 Draw 绑定了哪些纹理？
+帮我分析 EID 495 的 fragment shader。
+这个 ResourceId 对应的 buffer 前 256 字节是什么？
+```
+
+Responsibility split:
+
+- **Language model tools** are the capability layer. They provide the real capture data: draw calls, frame summary, pipeline state, shader source, textures, buffers, and selection context.
+- **`renderdoc-analysis` skill** is the workflow layer for default Copilot. It owns question-to-workflow routing, trigger phrases, and generic analysis guidance.
+- **`renderdoc-unity-analysis` skill** is a Unity-specialized workflow layer. It reuses the same capture facts but interprets them in Unity render-pipeline terms and maps suspicious passes or shaders back to Unity project code.
+- **`@renderdoc` participant prompt** is the runtime policy layer. It keeps hard rules that must always apply in participant chats, such as resolving missing IDs from selection context, trusting `expensiveDraws` for cost ranking, and surfacing native bridge limitations.
+
+Use `@renderdoc` when you want the most deterministic RenderDoc-specific behavior. Use default Copilot when you want the same capture tools to be discovered through the workspace skill.
+
 ---
 
 ### 8 · Exporting Resources

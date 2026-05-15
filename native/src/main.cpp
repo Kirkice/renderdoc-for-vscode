@@ -6331,6 +6331,42 @@ static json handleGetPipelineConstantBufferContents(int id, const json &params) 
     return makeResult(id, result);
 }
 
+static std::vector<uint8_t> readBuffer(ResourceId resId, uint64_t offset, uint64_t len);
+
+// ─── Get Buffer Contents ─────────────────────────────────────────────────────
+// Read raw bytes from a GPU buffer resource and return them base64-encoded.
+// params: { resourceId, offset?, len?, eventId? }
+// len is capped at 65536 bytes to avoid huge responses.
+static json handleGetBufferContents(int id, const json &params) {
+    if (!g_replay)
+        return makeError(id, -1, "No replay active");
+
+    const uint64_t rid = jsonToU64(params.contains("resourceId") ? params["resourceId"] : json());
+    if (rid == 0)
+        return makeError(id, -2, "resourceId is required");
+
+    const uint64_t offset   = params.value("offset", (uint64_t)0);
+    const uint64_t lenParam = params.value("len",    (uint64_t)4096);
+    const uint64_t len      = std::min(lenParam, (uint64_t)65536);
+    const uint32_t eventId  = params.value("eventId", (uint32_t)0);
+
+    if (eventId > 0)
+        ensureEvent(eventId);
+
+    const ResourceId resId = u64ToResId(rid);
+    const std::vector<uint8_t> data = readBuffer(resId, offset, len);
+    if (data.empty())
+        return makeError(id, -3, "Failed to read buffer data (buffer may be empty or resource not found)");
+
+    json result = {
+        {"resourceId", resIdToString(resId)},
+        {"offset",     offset},
+        {"len",        data.size()},
+        {"base64",     base64Encode(data)},
+    };
+    return makeResult(id, result);
+}
+
 // ────────────────────────────────────────────────────────────────────────────
 // Drawcall overlay — mirrors RenderDoc desktop's "Highlight Drawcall" feature.
 // Renders the active color RT at `eventId` with DebugOverlay::Drawcall, reads
@@ -7342,6 +7378,7 @@ static json dispatch(const json &req) {
         if (method == "saveTexture")        return handleSaveTexture(id, params);
         if (method == "getPipelineState")   return handleGetPipelineState(id, params);
         if (method == "getPipelineConstantBufferContents") return handleGetPipelineConstantBufferContents(id, params);
+        if (method == "getBufferContents")  return handleGetBufferContents(id, params);
         if (method == "getDrawcallOverlay") return handleGetDrawcallOverlay(id, params);
         if (method == "getEventChunks")     return handleGetEventChunks(id, params);
         if (method == "getMeshData")        return handleGetMeshData(id, params);

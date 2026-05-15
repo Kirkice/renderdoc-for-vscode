@@ -39,9 +39,6 @@
     "onLanguage:rdc",
     "workspaceContains:**/*.rdc"
   ],
-  "extensionDependencies": [
-    "github.copilot-chat"
-  ],
   "main": "./dist/extension.js",
   "contributes": {
     "chatParticipants": [
@@ -83,7 +80,7 @@
         "displayName": "Get Draw Calls",
         "toolReferenceName": "drawCalls",
         "icon": "$(list-tree)",
-        "modelDescription": "Get the list of GPU draw calls/events in the captured frame with event IDs, names, index/instance counts. Optionally filter by name.",
+        "modelDescription": "Get the list of GPU draw calls/events in the captured frame with event IDs, names, index/instance counts. Supports multiple filters: 'filter' (name substring), 'markerFilter' (limit to a marker subtree), 'excludeMarkers' (leaf events only), 'onlyDrawCalls' (actual GPU ops), 'eventIdMin'/'eventIdMax' (event ID range).",
         "userDescription": "Lists draw calls in the capture.",
         "inputSchema": {
           "type": "object",
@@ -91,6 +88,61 @@
             "filter": {
               "type": "string",
               "description": "Optional name filter (case-insensitive substring match)"
+            },
+            "markerFilter": {
+              "type": "string",
+              "description": "Only include events inside a marker group whose name contains this string (case-insensitive)"
+            },
+            "excludeMarkers": {
+              "type": "boolean",
+              "description": "If true, exclude marker/group nodes and return leaf events only"
+            },
+            "onlyDrawCalls": {
+              "type": "boolean",
+              "description": "If true, only return actual GPU draw operations (Drawcall, Dispatch, MeshDispatch flags)"
+            },
+            "eventIdMin": {
+              "type": "number",
+              "description": "Only include events with eventId >= this value"
+            },
+            "eventIdMax": {
+              "type": "number",
+              "description": "Only include events with eventId <= this value"
+            }
+          }
+        }
+      },
+      {
+        "name": "renderdoc_getActionTimings",
+        "displayName": "Get Action Timings",
+        "toolReferenceName": "actionTimings",
+        "icon": "$(watch)",
+        "modelDescription": "Fetch GPU action timings on demand via the native replay bridge. Use for performance questions when timings have not been pre-fetched yet, or when you need direct timing rows filtered by event IDs or marker groups.",
+        "userDescription": "Fetches GPU timings for actions in the current capture.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "eventIds": {
+              "type": "array",
+              "items": { "type": "number" },
+              "description": "Optional list of specific event IDs to query"
+            },
+            "markerFilter": {
+              "type": "string",
+              "description": "Only include actions inside marker groups whose names contain this string"
+            },
+            "excludeMarkers": {
+              "type": "array",
+              "items": { "type": "string" },
+              "description": "Exclude actions inside marker groups whose names contain any of these strings"
+            },
+            "onlyDrawCalls": {
+              "type": "boolean",
+              "description": "If true, only include actual draw/dispatch/mesh-dispatch leaf actions"
+            },
+            "limit": {
+              "type": "number",
+              "description": "Maximum timing rows to return (default 200, 0 = unlimited)"
             }
           }
         }
@@ -205,6 +257,72 @@
         }
       },
       {
+        "name": "renderdoc_getShaderInfo",
+        "displayName": "Get Shader Info",
+        "toolReferenceName": "shaderInfo",
+        "icon": "$(symbol-method)",
+        "modelDescription": "Get a higher-level shader summary at a draw call event by aggregating shader metadata/source, bound textures/samplers, and decoded constant buffer contents for one or more stages. Prefer this over calling shaderSource + pipelineState + constant buffer inspection separately when analyzing a shader stage.",
+        "userDescription": "Reads aggregated shader source, bindings, and constant buffers at a draw call.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "eventId": {
+              "type": "number",
+              "description": "The event ID to inspect"
+            },
+            "stage": {
+              "type": "string",
+              "description": "Optional shader stage filter: vertex, fragment, pixel, geometry, hull, domain, tessControl, tessEval, compute"
+            },
+            "includeSource": {
+              "type": "boolean",
+              "description": "Include full source files / disassembly when available. Defaults to true when stage is specified."
+            },
+            "includeConstantBuffers": {
+              "type": "boolean",
+              "description": "Include decoded constant buffer contents (default true)"
+            }
+          },
+          "required": [
+            "eventId"
+          ]
+        }
+      },
+      {
+        "name": "renderdoc_findProjectImplementation",
+        "displayName": "Find Project Implementation",
+        "toolReferenceName": "projectImplementation",
+        "icon": "$(search)",
+        "modelDescription": "Find likely project-side implementation files for a RenderDoc issue by searching the open workspace with shader names, pass/marker names, or a specific event ID. Use to bridge from capture analysis back to shader files and C# render-pass code.",
+        "userDescription": "Searches the open project for shader/pass implementation candidates related to the current capture.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "eventId": {
+              "type": "number",
+              "description": "Optional event ID to derive shader names and pass/marker names from"
+            },
+            "shaderName": {
+              "type": "string",
+              "description": "Optional explicit shader name or shader file name to search"
+            },
+            "passName": {
+              "type": "string",
+              "description": "Optional explicit pass or marker name to search in C# project code"
+            },
+            "additionalTerms": {
+              "type": "array",
+              "items": { "type": "string" },
+              "description": "Additional search terms to include in project lookup"
+            },
+            "limit": {
+              "type": "number",
+              "description": "Maximum results to return per category (default 12)"
+            }
+          }
+        }
+      },
+      {
         "name": "renderdoc_getTextureInfo",
         "displayName": "Get Texture Info",
         "toolReferenceName": "textureInfo",
@@ -231,6 +349,132 @@
         "inputSchema": {
           "type": "object",
           "properties": {}
+        }
+      },
+      {
+        "name": "renderdoc_getFrameSummary",
+        "displayName": "Get Frame Summary",
+        "toolReferenceName": "frameSummary",
+        "icon": "$(list-ordered)",
+        "modelDescription": "Get a concise structural overview of the frame: top-level render passes/markers with child counts, leaf draw/dispatch/clear counts, and GPU capture statistics. Use this FIRST before getDrawCalls to understand the frame structure without overwhelming context.",
+        "userDescription": "Returns a high-level summary of the frame structure.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {}
+        }
+      },
+      {
+        "name": "renderdoc_findDrawsByShader",
+        "displayName": "Find Draws by Shader",
+        "toolReferenceName": "findDrawsByShader",
+        "icon": "$(search)",
+        "modelDescription": "Find all draw call event IDs that use a given shader (by name or entry point substring). Builds a reverse index on first call — may be slow for large captures. Use to trace which draws use a specific shader.",
+        "userDescription": "Reverse-searches draws by bound shader name.",
+        "inputSchema": {
+          "type": "object",
+          "required": ["shaderName"],
+          "properties": {
+            "shaderName": {
+              "type": "string",
+              "description": "Shader name or entry point substring to search (case-insensitive)"
+            }
+          }
+        }
+      },
+      {
+        "name": "renderdoc_findDrawsByTexture",
+        "displayName": "Find Draws by Texture",
+        "toolReferenceName": "findDrawsByTexture",
+        "icon": "$(search)",
+        "modelDescription": "Find all draw call event IDs that sample a given texture (by name substring). Builds a reverse index on first call. Use to trace where a specific texture is read.",
+        "userDescription": "Reverse-searches draws by bound texture name.",
+        "inputSchema": {
+          "type": "object",
+          "required": ["textureName"],
+          "properties": {
+            "textureName": {
+              "type": "string",
+              "description": "Texture name substring to search (case-insensitive)"
+            }
+          }
+        }
+      },
+      {
+        "name": "renderdoc_findDrawsByResourceId",
+        "displayName": "Find Draws by Resource ID",
+        "toolReferenceName": "findDrawsByResourceId",
+        "icon": "$(search)",
+        "modelDescription": "Find all draw call event IDs that bind a specific resource ID. Useful for tracing exact resource usage by ID.",
+        "userDescription": "Reverse-searches draws by resource ID.",
+        "inputSchema": {
+          "type": "object",
+          "required": ["resourceId"],
+          "properties": {
+            "resourceId": {
+              "type": "string",
+              "description": "Resource ID string to find (exact match)"
+            }
+          }
+        }
+      },
+      {
+        "name": "renderdoc_getTextureData",
+        "displayName": "Get Texture Data",
+        "toolReferenceName": "textureData",
+        "icon": "$(file-media)",
+        "modelDescription": "Sample a texture at a specific event and mip level, returning a base64-encoded PNG. Use to inspect texture pixel content (color, depth, normal maps, etc.). Specify eventId to see the texture at that point in the frame.",
+        "userDescription": "Reads texture pixel data as a base64 PNG.",
+        "inputSchema": {
+          "type": "object",
+          "required": ["textureId"],
+          "properties": {
+            "textureId": {
+              "type": "string",
+              "description": "Resource ID of the texture"
+            },
+            "mip": {
+              "type": "number",
+              "description": "Mip level (0 = full resolution). Default: 0"
+            },
+            "eventId": {
+              "type": "number",
+              "description": "Event ID at which to sample the texture (0 = end of frame). Default: 0"
+            },
+            "channelExtract": {
+              "type": "number",
+              "description": "Channel to extract: -1=all RGBA, 0=R, 1=G, 2=B, 3=A. Default: -1"
+            }
+          }
+        }
+      },
+      {
+        "name": "renderdoc_getBufferContents",
+        "displayName": "Get Buffer Contents",
+        "toolReferenceName": "bufferContents",
+        "icon": "$(symbol-array)",
+        "modelDescription": "Read raw bytes from a GPU buffer resource and return them base64-encoded. Use to inspect vertex buffers, index buffers, constant/uniform buffers, storage buffers, etc. Max 65536 bytes per call; use offset+len to page through larger buffers.",
+        "userDescription": "Reads raw bytes from a GPU buffer resource.",
+        "inputSchema": {
+          "type": "object",
+          "required": ["resourceId"],
+          "properties": {
+            "resourceId": {
+              "type": "string",
+              "description": "Resource ID of the buffer"
+            },
+            "offset": {
+              "type": "number",
+              "description": "Byte offset into the buffer. Default: 0"
+            },
+            "len": {
+              "type": "number",
+              "description": "Number of bytes to read. Default: 4096. Max: 65536"
+            },
+            "eventId": {
+              "type": "number",
+              "description": "Event ID at which to read the buffer (0 = end of frame). Default: 0"
+            }
+          }
         }
       }
     ],
