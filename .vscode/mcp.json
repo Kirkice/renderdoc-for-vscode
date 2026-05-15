@@ -6,7 +6,7 @@
                 "c:\\Users\\admin\\.vscode\\extensions\\marvel-ai.gemini-image-generator-0.2.6\\dist\\server.js"
             ],
             "env": {
-                "GEMINI_API_KEY": "",
+                "GEMINI_API_KEY": "sk-9aNrvcvoOKiFtWKRsIGVIQ",
                 "GEMINI_BASE_URL": "http://llm.moontontech.net",
                 "GEMINI_DEFAULT_ASPECT_RATIO": "4:3",
                 "GEMINI_DEFAULT_IMAGE_SIZE": "1k",

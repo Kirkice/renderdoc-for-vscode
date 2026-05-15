@@ -17,7 +17,7 @@
 
 ## Overview
 
-**RenderDoc for VS Code** brings the full power of the RenderDoc graphics debugger into Visual Studio Code. Open any `.rdc` capture file and get an instant, first-class inspection experience — hierarchical draw call timelines, live shader source, full pipeline state, texture previews, GPU timing profiling, Mali shader analysis, and an AI-powered frame analyzer through VS Code Chat or the built-in AI assistant.
+**RenderDoc for VS Code** brings the full power of the RenderDoc graphics debugger into Visual Studio Code. Open any `.rdc` capture file and get an instant, first-class inspection experience — hierarchical draw call timelines, live shader source, full pipeline state, texture previews, GPU timing profiling, Mali shader analysis, and an AI-powered frame analyzer via GitHub Copilot Chat.
 
 No context switching. No external viewers. Just your capture, your editor, and your agent.
 
@@ -73,8 +73,8 @@ A C++ bridge (`renderdoc_bridge.exe`) links directly to RenderDoc's replay DLL �
 <tr>
 <td width="50%" valign="top">
 
-### AI-Powered Frame Analysis
-Ask `@renderdoc` anything about your capture in VS Code Chat, or open the built-in AI assistant panel for OpenAI-compatible, Anthropic, and local model endpoints. Both paths share the same RenderDoc tool runtime, including Inspector selection context, GPU timing-aware draw ranking, and Mali shader analysis results.
+### AI-Powered Frame Analysis (`@renderdoc`)
+Ask `@renderdoc` anything about your capture. The Copilot participant reads your current Inspector selection and dispatches 10 specialized language-model tools — including GPU timing-aware draw ranking and Mali shader analysis results.
 
 </td>
 <td width="50%" valign="top">
@@ -172,14 +172,14 @@ Analyze any shader directly from the Inspector's Shaders tab using the **Mali Of
 </tr>
 </table>
 
-### AI Workflow
+### Copilot Workflow
 
 <table>
 <tr>
 <td width="100%" valign="top" align="center">
     <img src="https://raw.githubusercontent.com/Kirkice/renderdoc-for-vscode/main/screenshots/Chat-with-Copilot.jpeg" alt="Chat with Copilot" width="72%" />
     <br />
-    <sub><b>AI Analysis</b> — use <code>@renderdoc</code> in VS Code Chat or open the RenderDoc AI Assistant panel to analyze the current frame, draw calls, resources, and shaders.</sub>
+    <sub><b>Chat with Copilot</b> — use <code>@renderdoc</code> to analyze the current frame, draw calls, resources, and shaders.</sub>
 </td>
 </tr>
 </table>
@@ -194,7 +194,7 @@ Analyze any shader directly from the Inspector's Shaders tab using the **Mali Of
 3. The RenderDoc sidebar appears automatically
 4. Click any draw call → Inspector opens beside your editor
 5. Run "Fetch GPU Timings" to populate durationUs per draw
-6. Use `@renderdoc` in VS Code Chat or run `RenderDoc: Open AI Assistant` for deep frame analysis
+6. Chat with @renderdoc for deep frame analysis
 ```
 
 > **Requires:** Either a bundled RenderDoc runtime inside the VSIX or a local RenderDoc installation. The extension first honors **`RenderDoc: Configure RenderDoc Path`**, then tries the bundled `.renderdoc-runtime`, then falls back to the default system install path.
@@ -281,7 +281,7 @@ Navigation:
 
 ---
 
-### 7 · VS Code Chat (`@renderdoc`)
+### 7 · Copilot Chat (`@renderdoc`)
 
 Open VS Code Chat (`Ctrl+Alt+I`) and address `@renderdoc`:
 
@@ -312,40 +312,14 @@ Available tools (also invokable via `#tool-name`):
 
 ---
 
-### 8 · External AI Assistant
-
-Run **RenderDoc: Open AI Assistant** to open the built-in panel for external providers. The panel can switch between configured AI profiles directly from its profile picker.
-
-- **OpenAI-compatible:** OpenAI, OpenRouter, LM Studio, Ollama bridges, vLLM, or any compatible local/self-hosted endpoint via `renderdoc.ai.openai.baseUrl`
-- **Anthropic:** Claude models via the Anthropic Messages API
-- **Shared tools:** the assistant uses the same RenderDoc selection context and tool runtime as `@renderdoc`
-
-If you want multiple models, define them under `renderdoc.ai.profiles` and set the default via `renderdoc.ai.activeProfile`. Each profile can point at a different provider, model, endpoint, and API key environment variable.
-
-Key settings:
-
-- `renderdoc.ai.activeProfile`
-- `renderdoc.ai.profiles`
-- `renderdoc.ai.provider` (legacy fallback)
-- `renderdoc.ai.openai.baseUrl` (legacy fallback)
-- `renderdoc.ai.openai.model` (legacy fallback)
-- `renderdoc.ai.anthropic.model` (legacy fallback)
-- `renderdoc.ai.temperature`
-- `renderdoc.ai.maxToolRounds`
-- `renderdoc.ai.requestTimeoutMs`
-
-Use **RenderDoc: Select AI Profile** to switch profiles and **RenderDoc: Set Active AI Profile API Key** to store credentials in VS Code secrets.
-
----
-
-### 9 · Exporting Resources
+### 8 · Exporting Resources
 
 - **Texture → PNG:** right-click a texture in **Resources** → **Export Texture** (ASTC, HDR, sRGB handled automatically)
 - **Shader source:** Inspector → Shaders tab → **Copy** button, or **Open in Editor** for a full VS Code buffer
 
 ---
 
-### 10 · Troubleshooting
+### 9 · Troubleshooting
 
 | Symptom | Fix |
 | ------- | --- |
@@ -353,8 +327,7 @@ Use **RenderDoc: Select AI Profile** to switch profiles and **RenderDoc: Set Act
 | Inspector stays blank after clicking a draw | `Developer: Reload Window` — auto-recreates the panel |
 | Textures tab shows nothing | The draw has no sampled inputs/RTs, or pipeline is still loading |
 | Mali Offline Compiler button missing | Set `renderdoc.maliOfflineCompilerPath` to the path of `malioc.exe` |
-| `@renderdoc` not available in Chat | Ensure a VS Code chat-capable model/provider is available and enabled |
-| External AI assistant says API key is missing | Run `RenderDoc: Set AI Provider API Key`, or point `renderdoc.ai.openai.baseUrl` at a local endpoint that does not require auth |
+| `@renderdoc` not available in Chat | Ensure GitHub Copilot Chat is signed in and enabled |
 | GPU timings show `N/A` | Click **Fetch GPU Timings** in the Draw Calls sidebar first |
 
 ---

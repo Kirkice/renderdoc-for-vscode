@@ -2,7 +2,6 @@ import * as vscode from 'vscode';
 import * as cp from 'child_process';
 import * as fs from 'fs';
 import * as path from 'path';
-import { RenderDocAiService } from './ai/chatService';
 import { RenderDocBridge, NATIVE_REPLAY_REQUIRED_MSG } from './renderdocBridge';
 import {
     AttachCaptureOptions,
@@ -29,7 +28,6 @@ import { ResourceProvider } from './views/resourceProvider';
 import { ThumbnailPanel } from './views/thumbnailPanel';
 import { InspectorPanel } from './views/inspectorPanel';
 import { DrawOverlayPanel } from './views/drawOverlayPanel';
-import { AiChatPanel } from './views/aiChatPanel';
 import { initTools, registerAllTools } from './copilot/tools';
 import { initChatParticipant, registerChatParticipant } from './copilot/chatParticipant';
 import { ensureNativeBridge } from './bridgeInstaller';
@@ -48,7 +46,6 @@ let drawCallProvider: DrawCallProvider;
 let apiInspectorProvider: ApiInspectorProvider;
 let resourceProvider: ResourceProvider;
 let launchTargetState: LaunchTargetState;
-let aiService: RenderDocAiService;
 let currentCapturePath: string | undefined;
 let currentCaptureSuggestsRemote = false;
 
@@ -874,7 +871,6 @@ async function saveSessionCaptureAs(context: vscode.ExtensionContext, captureId:
 
     if (currentCapturePath && path.normalize(currentCapturePath) === path.normalize(capture.filePath)) {
         currentCapturePath = uri.fsPath;
-        void AiChatPanel.currentPanel?.refresh();
         bridgeLoadedCapturePath = uri.fsPath;
         const currentInfo = captureInfoProvider.getCaptureInfo();
         if (currentInfo) {
@@ -1219,15 +1215,6 @@ export async function activate(context: vscode.ExtensionContext) {
     bridge = new RenderDocBridge();
     captureCache = new CaptureCache(context);
     launchTargetState = new LaunchTargetState(context);
-    aiService = new RenderDocAiService(
-        context,
-        bridge,
-        () => currentCapturePath,
-        () => ({
-            selectedDrawCall: currentSelectedDrawCall,
-            selectedResource: currentSelectedResource,
-        }),
-    );
 
     // Check RenderDoc availability on startup
     const available = await bridge.checkAvailability();
@@ -1300,7 +1287,6 @@ export async function activate(context: vscode.ExtensionContext) {
                 const label = currentSelectedDrawCall.name || (typeof item.label === 'string' ? item.label : item.label?.label);
                 DrawOverlayPanel.currentPanel.showEvent(currentSelectedDrawCall.eventId, label).catch(() => {});
             }
-            void AiChatPanel.currentPanel?.refresh();
         }
     });
     resourceTreeView.onDidChangeSelection(e => {
@@ -1312,7 +1298,6 @@ export async function activate(context: vscode.ExtensionContext) {
                 resourceType: item.resourceType,
                 description: item.description,
             };
-            void AiChatPanel.currentPanel?.refresh();
         }
     });
 
@@ -1320,11 +1305,6 @@ export async function activate(context: vscode.ExtensionContext) {
         vscode.window.registerTreeDataProvider('renderdoc-captureInfo', captureInfoProvider),
         vscode.window.registerTreeDataProvider('renderdoc-apiInspector', apiInspectorProvider),
         vscode.window.registerWebviewViewProvider('renderdoc-launchTarget', launchTargetViewProvider),
-        vscode.workspace.onDidChangeConfiguration((event) => {
-            if (event.affectsConfiguration('renderdoc.ai')) {
-                void AiChatPanel.currentPanel?.refresh();
-            }
-        }),
         launchTargetState.onDidChange(() => {
             void vscode.commands.executeCommand('setContext', 'renderdoc.liveTargetActive', !!launchTargetState.getLiveTarget());
             syncLaunchApplicationPanelState();
@@ -1388,17 +1368,6 @@ export async function activate(context: vscode.ExtensionContext) {
         }),
         vscode.commands.registerCommand('renderdoc.clearCache', () => clearCaptureCache()),
         vscode.commands.registerCommand('renderdoc.openInspector', () => openInspector(context)),
-        vscode.commands.registerCommand('renderdoc.openAiAssistant', () => {
-            AiChatPanel.createOrShow(context, aiService);
-        }),
-        vscode.commands.registerCommand('renderdoc.configureAiProvider', async () => {
-            await aiService.configureProvider();
-            await AiChatPanel.currentPanel?.refresh();
-        }),
-        vscode.commands.registerCommand('renderdoc.setAiProviderApiKey', async () => {
-            await aiService.setApiKey();
-            await AiChatPanel.currentPanel?.refresh();
-        }),
         vscode.commands.registerCommand('renderdoc.showDrawcallOverlay', async () => {
             await DrawOverlayPanel.createOrShow(context, bridge);
             const sel = currentSelectedDrawCall;
@@ -1789,7 +1758,6 @@ function closeCapture() {
     currentDrawCalls = [];
     currentResources = [];
     shaderAliasScanGeneration += 1;
-    void AiChatPanel.currentPanel?.refresh();
 
     // Shut down the bridge to cleanly release all memory and file locks
     console.log('[RenderDoc] User requested close capture; killing bridge.');
@@ -1911,7 +1879,6 @@ async function loadCapture(context: vscode.ExtensionContext, filePath: string, s
         currentSelectedDrawCall = undefined;
         currentSelectedResource = undefined;
     }
-    void AiChatPanel.currentPanel?.refresh();
     console.log('[RenderDoc] loadCapture called:', filePath, 'silent:', silent);
     console.log('[RenderDoc] hasNativeBridge:', bridge.hasNativeBridge());
 
@@ -2308,7 +2275,6 @@ async function refreshCapture() {
         return;
     }
     currentCapturePath = info.filePath;
-    void AiChatPanel.currentPanel?.refresh();
 
     try {
         const captureInfo = await bridge.getCaptureInfo(info.filePath);
