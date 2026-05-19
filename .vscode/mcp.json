@@ -1,0 +1,23 @@
+{
+    "servers": {
+        "gemini-image": {
+            "command": "node",
+            "args": [
+                "c:\\Users\\admin\\.vscode\\extensions\\marvel-ai.gemini-image-generator-0.2.6\\dist\\server.js"
+            ],
+            "env": {
+                "GEMINI_API_KEY": "sk-nBWbL6fXCdzOOOi208SHJg",
+                "GEMINI_BASE_URL": "http://llm.moontontech.net",
+                "GEMINI_DEFAULT_ASPECT_RATIO": "4:3",
+                "GEMINI_DEFAULT_IMAGE_SIZE": "1k",
+                "GEMINI_NUMBER_OF_IMAGES": "1",
+                "GEMINI_MAX_INPUT_IMAGES": "10",
+                "GEMINI_RESPONSE_MODALITIES": "TEXT,IMAGE",
+                "GEMINI_TRANSPARENT_BACKGROUND": "false",
+                "GEMINI_OUTPUT_DIRECTORY": "",
+                "GEMINI_AUTO_OPEN_IMAGE": "false",
+                "GEMINI_TEMPERATURE": "0.2"
+            }
+        }
+    }
+}

@@ -1,0 +1,16 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"label": "package-vsix",
+			"type": "shell",
+			"command": "npx",
+			"args": [
+				"@vscode/vsce",
+				"package"
+			],
+			"isBackground": false,
+			"group": "build"
+		}
+	]
+}

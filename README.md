@@ -17,7 +17,7 @@
 
 ## Overview
 
-**RenderDoc for VS Code** brings the full power of the RenderDoc graphics debugger into Visual Studio Code. Open any `.rdc` capture file and get an instant, first-class inspection experience — hierarchical draw call timelines, live shader source, full pipeline state, texture previews, GPU timing profiling, Mali shader analysis, and an AI-powered frame analyzer via GitHub Copilot Chat.
+**RenderDoc for VS Code** brings the full power of the RenderDoc graphics debugger into Visual Studio Code. Open any `.rdc` capture file and get an instant, first-class inspection experience — hierarchical draw call timelines, live shader source, full pipeline state, texture and buffer inspection, GPU timing profiling, project-source mapping, Mali shader analysis, and an AI-powered frame analyzer via GitHub Copilot Chat.
 
 No context switching. No external viewers. Just your capture, your editor, and your agent.
 
@@ -74,7 +74,7 @@ A C++ bridge (`renderdoc_bridge.exe`) links directly to RenderDoc's replay DLL �
 <td width="50%" valign="top">
 
 ### AI-Powered Frame Analysis (`@renderdoc`)
-Ask `@renderdoc` anything about your capture. The Copilot participant reads your current Inspector selection and dispatches 10 specialized language-model tools — including GPU timing-aware draw ranking and Mali shader analysis results.
+Ask `@renderdoc` anything about your capture. The Copilot participant reads your current Inspector selection and dispatches 19 specialized language-model tools — including on-demand action timings, shader and constant-buffer inspection, resource reverse lookups, project-source mapping, and Mali shader analysis results.
 
 </td>
 <td width="50%" valign="top">
@@ -190,14 +190,14 @@ Analyze any shader directly from the Inspector's Shaders tab using the **Mali Of
 
 ```
 1. Install the extension in VS Code 1.95+
-2. Run `RenderDoc: Launch Program And Capture`, `RenderDoc: Attach To Process And Capture`, or open an existing `.rdc`
+2. Run `RenderDoc: Open Launch Application`, `RenderDoc: Attach On Selected Target`, or open an existing `.rdc`
 3. The RenderDoc sidebar appears automatically
 4. Click any draw call → Inspector opens beside your editor
 5. Run "Fetch GPU Timings" to populate durationUs per draw
-6. Chat with @renderdoc for deep frame analysis
+6. Chat with `@renderdoc` or plain Copilot for deep frame analysis
 ```
 
-> **Requires:** Either a bundled RenderDoc runtime inside the VSIX or a local RenderDoc installation. The extension first honors **`RenderDoc: Configure RenderDoc Path`**, then tries the bundled `.renderdoc-runtime`, then falls back to the default system install path.
+> **Requires:** A bundled `.renderdoc-runtime` inside the VSIX or a local RenderDoc installation. Packaged VSIX builds can run directly from the bundled runtime and native bridge. When working from source, build `native/build/Release/renderdoc_bridge.exe`; if a packaged install is missing it, run **`RenderDoc: Download Native Bridge…`**.
 
 ---
 
@@ -207,7 +207,7 @@ Analyze any shader directly from the Inspector's Shaders tab using the **Mali Of
 
 **Option A — from VSIX (recommended):**
 ```powershell
-code --install-extension renderdoc-for-vscode-0.0.5.vsix
+code --install-extension renderdoc-for-vscode-0.0.7.vsix
 ```
 Or: `Extensions` panel → `···` menu → **Install from VSIX…**
 
@@ -221,22 +221,23 @@ The extension loads RenderDoc's replay library (`renderdoc.dll` / `librenderdoc.
 
 **[renderdoc.org/builds](https://renderdoc.org/builds)** — any stable version **v1.30 or newer**.
 
-| Platform | Auto-detected path                                 |
-| -------- | -------------------------------------------------- |
-| Windows  | `C:\Program Files\RenderDoc\`                      |
-| Linux    | `/usr/lib/x86_64-linux-gnu/librenderdoc.so`        |
-| macOS    | `/Applications/RenderDoc.app/`                     |
+| Platform | Common path |
+| -------- | ----------- |
+| Windows  | `C:\Program Files\RenderDoc\` |
+| Linux    | `/usr/lib/x86_64-linux-gnu/librenderdoc.so` |
+| macOS    | `/Applications/RenderDoc.app/` |
 
-For non-default paths, run **`RenderDoc: Configure RenderDoc Path`** or set `renderdoc.installPath` in Settings.
+If you are developing from source, also build the native helper in `native/build/Release/renderdoc_bridge.exe`. Packaged VSIX installs include auto-discovery for the bundled runtime and bridge when they are present.
 
 ---
 
 ### 3 · Opening a Capture
 
 - **File explorer:** right-click a `.rdc` → **Open RDC Capture**
-- **Command palette:** run **RenderDoc: Launch Program And Capture** to launch a Windows executable or a supported remote device target, then auto-open the captured frame
-- **Command palette:** run **RenderDoc: Attach To Process And Capture** to inject into a running Windows process or capture an already running remote RenderDoc target
+- **Command palette:** run **RenderDoc: Open Launch Application** to configure and launch a local executable or supported remote target, then auto-open the captured frame
+- **Capture Target view:** select a process/device, then run **RenderDoc: Attach On Selected Target** to attach to a running process or remote RenderDoc target
 - **Command palette:** `RenderDoc: Open RDC Capture`
+- **Live sessions:** run **RenderDoc: Capture Frame From Live Session** after connecting to a target
 - **Drag & drop** a `.rdc` onto the VS Code window
 
 The activity bar shows three sidebar views: **Capture Info**, **Draw Calls**, and **Resources**.
@@ -267,7 +268,7 @@ Navigation:
 1. Open the **Draw Calls** sidebar.
 2. Click the **Fetch GPU Timings** button (⏱).
 3. Each draw call is annotated with its measured GPU time (`durationUs`).
-4. Ask `@renderdoc` to rank draws by cost — it reads the timing data directly.
+4. Ask `@renderdoc` or plain Copilot to rank draws by cost, summarize hot passes, or drill into a specific hot EID.
 
 ---
 
@@ -281,34 +282,73 @@ Navigation:
 
 ---
 
-### 7 · Copilot Chat (`@renderdoc`)
+### 7 · Copilot Chat (`@renderdoc` and default Copilot)
 
-Open VS Code Chat (`Ctrl+Alt+I`) and address `@renderdoc`:
+Open VS Code Chat (`Ctrl+Alt+I`). Use `@renderdoc` when you want the most deterministic RenderDoc-specific behavior, or ask plain Copilot in this repo to let the workspace skill route into the same local `renderdoc_*` tools.
 
-```
-@renderdoc 帮我找出当前帧耗时最高的前20个Draw，带完整层级名称
+Typical `@renderdoc` prompts:
+
+```text
+@renderdoc 帮我找出当前帧耗时最高的前20个 Draw，带完整层级名称
 @renderdoc Analyze the fragment shader for EID 495 and suggest optimizations
 @renderdoc Find all draw calls rendering to the shadow map
 @renderdoc Show pipeline state diff between EID 300 and EID 355
 @renderdoc Which textures are bound at the currently selected draw?
 ```
 
-The participant reads your **active Inspector selection** (focused EID, draw call, sidebar resource) so natural references like *"this draw"* or *"the current event"* resolve automatically.
+Typical default-Copilot prompts in this workspace:
 
-Available tools (also invokable via `#tool-name`):
+```text
+这个帧大概有哪些 pass？先给我一个结构概览。
+当前选中的这个 Draw 绑定了哪些纹理？
+帮我分析 EID 495 的 fragment shader，并看看它在工程里对应哪个 shader/pass 实现。
+这个 ResourceId 对应的 buffer 前 256 字节是什么？
+```
+
+Both flows can use your **active Inspector selection** (focused EID, draw call, sidebar resource), so natural references like *"this draw"* or *"the current event"* resolve automatically.
+
+In this repository, default Copilot is guided by both the workspace skills and `.github/copilot-instructions.md`, so it prefers the local `renderdoc_*` tools over an external RenderDoc MCP path when equivalent local capture data is available.
+
+Available tools (also invokable via `#toolReferenceName`):
+
+Context and overview:
 
 | Tool | Description |
 | ---- | ----------- |
-| `#selectionContext` | Current Inspector focus: EID, draw call, pipeline state, Mali analysis |
-| `#captureInfo` | Capture metadata: API, driver, version, sections |
-| `#drawCalls` | Full draw call tree with GPU `durationUs` timings and pre-sorted `expensiveDraws` |
-| `#resources` | All GPU resources: textures, buffers, shaders |
-| `#resourceDetail` | Detail for a specific resource by ID |
-| `#eventDetails` | Full event info including pipeline state |
-| `#pipelineState` | Complete pipeline state at a given EID (native bridge required) |
-| `#shaderSource` | GLSL/HLSL source for all bound stages at an EID |
-| `#textureInfo` | Texture-specific metadata |
-| `#analyzeFrame` | Comprehensive frame summary with flagged issues |
+| `#selectionContext` | Current Inspector focus: selected EID, draw call, sidebar resource, replay status, and related context |
+| `#captureInfo` | Capture metadata: API, driver, version, file sections, and capture summary |
+| `#frameSummary` | High-level frame structure: top-level passes/markers, draw counts, and capture stats |
+| `#analyzeFrame` | Holistic frame analysis with flagged issues and suggested next inspection steps |
+
+Events and timings:
+
+| Tool | Description |
+| ---- | ----------- |
+| `#drawCalls` | Full draw call tree with marker hierarchy, filtering, and `durationUs` when timings are available |
+| `#actionTimings` | Fetch GPU timings on demand, optionally filtered by event IDs or marker groups |
+| `#eventDetails` | Full details for one EID, including richer pipeline context when replay is active |
+| `#pipelineState` | Complete pipeline state at a given EID |
+
+Shaders and resources:
+
+| Tool | Description |
+| ---- | ----------- |
+| `#shaderSource` | Raw GLSL/HLSL source for the bound shader stages at an EID |
+| `#shaderInfo` | Higher-level shader analysis with bindings, samplers, and decoded constant buffers |
+| `#resources` | Paginated list of textures, buffers, and shaders in the capture |
+| `#resourceDetail` | Detailed information for a specific resource ID |
+| `#textureInfo` | Texture metadata and identity lookup |
+| `#textureData` | Texture pixel data sampled at a specific event/mip and returned as PNG data |
+| `#bufferContents` | Raw bytes from a GPU buffer with offset/length paging |
+
+Reverse lookups and source mapping:
+
+| Tool | Description |
+| ---- | ----------- |
+| `#findDrawsByShader` | Reverse-search draw calls by shader name or entry point |
+| `#findDrawsByTexture` | Reverse-search draw calls by sampled texture name |
+| `#findDrawsByResourceId` | Reverse-search draw calls by exact resource ID |
+| `#projectImplementation` | Search the open workspace for likely shader/pass implementation files related to a capture event |
 
 #### Default Copilot Skill
 
@@ -316,23 +356,15 @@ The workspace also ships a project-scoped skill at `.github/skills/renderdoc-ana
 
 For Unity engineering workspaces, the project also ships `.github/skills/renderdoc-unity-analysis`. That skill reuses the same RenderDoc capture tools for timings, EIDs, shaders, and pipeline facts, then adds Unity-specific routing for URP, HDRP, SRP, RenderGraph, `ScriptableRendererFeature`, `ScriptableRenderPass`, and Unity-side pass/shader implementation lookup.
 
-Typical default-Copilot prompts that should auto-load the skill:
-
-```text
-这个帧大概有哪些 pass？先给我一个结构概览。
-当前选中的这个 Draw 绑定了哪些纹理？
-帮我分析 EID 495 的 fragment shader。
-这个 ResourceId 对应的 buffer 前 256 字节是什么？
-```
-
 Responsibility split:
 
-- **Language model tools** are the capability layer. They provide the real capture data: draw calls, frame summary, pipeline state, shader source, textures, buffers, and selection context.
+- **Language model tools** are the capability layer. They provide the real capture data: frame summaries, draw calls, timings, pipeline state, shader data, textures, buffers, and reverse lookups.
 - **`renderdoc-analysis` skill** is the workflow layer for default Copilot. It owns question-to-workflow routing, trigger phrases, and generic analysis guidance.
 - **`renderdoc-unity-analysis` skill** is a Unity-specialized workflow layer. It reuses the same capture facts but interprets them in Unity render-pipeline terms and maps suspicious passes or shaders back to Unity project code.
-- **`@renderdoc` participant prompt** is the runtime policy layer. It keeps hard rules that must always apply in participant chats, such as resolving missing IDs from selection context, trusting `expensiveDraws` for cost ranking, and surfacing native bridge limitations.
+- **`.github/copilot-instructions.md`** is the always-on workspace guidance layer for default Copilot in this repository. It reinforces that local `renderdoc_*` tools are authoritative when they can answer the question.
+- **`@renderdoc` participant prompt** is the runtime policy layer. It keeps hard rules that must always apply in participant chats, such as resolving missing IDs from selection context, trusting timing data for cost ranking, and surfacing native bridge limitations.
 
-Use `@renderdoc` when you want the most deterministic RenderDoc-specific behavior. Use default Copilot when you want the same capture tools to be discovered through the workspace skill.
+Use `@renderdoc` when you want the strongest routing guarantees. Use default Copilot when you want the same capture tools to combine with broader repository reasoning.
 
 ---
 
@@ -347,12 +379,13 @@ Use `@renderdoc` when you want the most deterministic RenderDoc-specific behavio
 
 | Symptom | Fix |
 | ------- | --- |
-| "Native bridge not available" / empty shaders | Install RenderDoc and set `renderdoc.installPath` |
+| "Native bridge not available" / empty shaders | If you are running from source, build `native/build/Release/renderdoc_bridge.exe`. If you installed from VSIX and the helper is missing, run **RenderDoc: Download Native Bridge…**. Replay also needs either a bundled `.renderdoc-runtime` or a local RenderDoc install. |
 | Inspector stays blank after clicking a draw | `Developer: Reload Window` — auto-recreates the panel |
 | Textures tab shows nothing | The draw has no sampled inputs/RTs, or pipeline is still loading |
 | Mali Offline Compiler button missing | Set `renderdoc.maliOfflineCompilerPath` to the path of `malioc.exe` |
 | `@renderdoc` not available in Chat | Ensure GitHub Copilot Chat is signed in and enabled |
 | GPU timings show `N/A` | Click **Fetch GPU Timings** in the Draw Calls sidebar first |
+| Capture recommends a remote replay host | Connect a compatible target, use **RenderDoc: Try Local Replay**, or set `renderdoc.alwaysReplayLocally` if you do not want the prompt |
 
 ---
 
@@ -363,7 +396,7 @@ Use `@renderdoc` when you want the most deterministic RenderDoc-specific behavio
 │                        VS Code Extension Host                        │
 │  ┌──────────────┐   ┌──────────────────┐   ┌──────────────────────┐  │
 │  │   Sidebar    │   │    Inspector     │   │  Copilot Participant  │  │
-│  │   Views      │   │    Webview       │   │  + LM Tools (10×)    │  │
+│  │   Views      │   │    Webview       │   │  + LM Tools (19×)    │  │
 │  └──────┬───────┘   └────────┬─────────┘   └──────────┬───────────┘  │
 │         └────────────────────┼────────────────────────┘              │
 │                              ▼                                       │
@@ -448,11 +481,11 @@ Press `F5` in VS Code — launches an Extension Development Host with the extens
 
 | Setting | Default | Description |
 | ------- | ------- | ----------- |
-| `renderdoc.installPath` | *(auto-detect)* | RenderDoc installation directory |
-| `renderdoc.nativeBridge.path` | *(auto-detect)* | Path to `renderdoc_bridge.exe` |
+| `renderdoc.commandTimeout` | `60000` | Timeout in milliseconds for `renderdoccmd` operations such as thumbnail fallbacks |
+| `renderdoc.alwaysReplayLocally` | `false` | Skip the replay-host prompt and continue locally when a capture suggests remote replay |
 | `renderdoc.maliOfflineCompilerPath` | *(empty)* | Path to `malioc.exe` for shader analysis |
 
-Run **`RenderDoc: Configure RenderDoc Path`** for a guided setup wizard.
+Packaged VSIX installs auto-discover the bundled runtime and native bridge when they are present. Extra setup is typically only needed for source builds or optional Mali analysis.
 
 ---
 

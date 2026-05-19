@@ -2,7 +2,7 @@
   "name": "renderdoc-for-vscode",
   "displayName": "RenderDoc for VS Code",
   "description": "View and analyze RenderDoc capture (.rdc) files in VS Code",
-  "version": "0.0.6",
+  "version": "0.0.7",
   "publisher": "Kirkice",
   "icon": "logo.png",
   "galleryBanner": {
@@ -37,7 +37,29 @@
   ],
   "activationEvents": [
     "onLanguage:rdc",
-    "workspaceContains:**/*.rdc"
+    "workspaceContains:**/*.rdc",
+    "onChatParticipant:renderdoc",
+    "onLanguageModelTool:renderdoc_openCapture",
+    "onLanguageModelTool:renderdoc_getSelectionContext",
+    "onLanguageModelTool:renderdoc_getCaptureInfo",
+    "onLanguageModelTool:renderdoc_getFrameSummary",
+    "onLanguageModelTool:renderdoc_getDrawCalls",
+    "onLanguageModelTool:renderdoc_getActionTimings",
+    "onLanguageModelTool:renderdoc_getResources",
+    "onLanguageModelTool:renderdoc_getResourceDetail",
+    "onLanguageModelTool:renderdoc_getEventDetails",
+    "onLanguageModelTool:renderdoc_getPipelineState",
+    "onLanguageModelTool:renderdoc_getShaderSource",
+    "onLanguageModelTool:renderdoc_getShaderInfo",
+    "onLanguageModelTool:renderdoc_findProjectImplementation",
+    "onLanguageModelTool:renderdoc_getTextureInfo",
+    "onLanguageModelTool:renderdoc_analyzeFrame",
+    "onLanguageModelTool:renderdoc_getMeshData",
+    "onLanguageModelTool:renderdoc_findDrawsByShader",
+    "onLanguageModelTool:renderdoc_findDrawsByTexture",
+    "onLanguageModelTool:renderdoc_findDrawsByResourceId",
+    "onLanguageModelTool:renderdoc_getTextureData",
+    "onLanguageModelTool:renderdoc_getBufferContents"
   ],
   "main": "./dist/extension.js",
   "contributes": {
@@ -52,9 +74,28 @@
     ],
     "languageModelTools": [
       {
+        "name": "renderdoc_openCapture",
+        "displayName": "Resolve Or Open Capture",
+        "toolReferenceName": "openCapture",
+        "canBeReferencedInPrompt": true,
+        "icon": "$(file-binary)",
+        "modelDescription": "Resolve the RenderDoc capture to analyze in this window. If a capture is already loaded, returns it. Otherwise it can load a provided filePath or the active/open .rdc tab. Call this BEFORE workspace file scans or terminal commands when the user says 'this capture' or asks for capture analysis and no capture is loaded yet.",
+        "userDescription": "Loads the current RenderDoc capture for local analysis.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "filePath": {
+              "type": "string",
+              "description": "Optional absolute path to a .rdc capture file. If omitted, the tool tries the active/open .rdc tab in this window."
+            }
+          }
+        }
+      },
+      {
         "name": "renderdoc_getSelectionContext",
         "displayName": "Get Selection Context",
         "toolReferenceName": "selectionContext",
+        "canBeReferencedInPrompt": true,
         "icon": "$(eye)",
         "modelDescription": "Get what the user is currently focused on in the RenderDoc Inspector: focused event ID, current draw call, pipeline state, and sidebar selection. Call this FIRST for any question referring to 'this/the current/the selected' draw call, event, or resource.",
         "userDescription": "Returns what the user has focused in the RenderDoc Inspector.",
@@ -67,8 +108,9 @@
         "name": "renderdoc_getCaptureInfo",
         "displayName": "Get Capture Info",
         "toolReferenceName": "captureInfo",
+        "canBeReferencedInPrompt": true,
         "icon": "$(info)",
-        "modelDescription": "Get metadata about the currently loaded RenderDoc capture file (.rdc), including graphics API, GPU driver, capture version, and file sections.",
+        "modelDescription": "Get metadata about the currently loaded RenderDoc capture file (.rdc), including graphics API, GPU driver, capture version, and file sections. Call this early when API or driver context matters, but prefer getFrameSummary first for frame structure or bottleneck questions.",
         "userDescription": "Reads metadata about the current capture.",
         "inputSchema": {
           "type": "object",
@@ -79,8 +121,9 @@
         "name": "renderdoc_getDrawCalls",
         "displayName": "Get Draw Calls",
         "toolReferenceName": "drawCalls",
+        "canBeReferencedInPrompt": true,
         "icon": "$(list-tree)",
-        "modelDescription": "Get the list of GPU draw calls/events in the captured frame with event IDs, names, index/instance counts. Supports multiple filters: 'filter' (name substring), 'markerFilter' (limit to a marker subtree), 'excludeMarkers' (leaf events only), 'onlyDrawCalls' (actual GPU ops), 'eventIdMin'/'eventIdMax' (event ID range).",
+        "modelDescription": "Get the list of GPU draw calls/events in the captured frame with event IDs, names, index/instance counts. Prefer getFrameSummary first for broad frame overview or performance questions, then use this with a narrower filter, marker subtree, or event range instead of dumping the whole frame when possible. Supports multiple filters: 'filter' (name substring), 'markerFilter' (limit to a marker subtree), 'excludeMarkers' (leaf events only), 'onlyDrawCalls' (actual GPU ops), 'eventIdMin'/'eventIdMax' (event ID range).",
         "userDescription": "Lists draw calls in the capture.",
         "inputSchema": {
           "type": "object",
@@ -116,8 +159,9 @@
         "name": "renderdoc_getActionTimings",
         "displayName": "Get Action Timings",
         "toolReferenceName": "actionTimings",
+        "canBeReferencedInPrompt": true,
         "icon": "$(watch)",
-        "modelDescription": "Fetch GPU action timings on demand via the native replay bridge. Use for performance questions when timings have not been pre-fetched yet, or when you need direct timing rows filtered by event IDs or marker groups.",
+        "modelDescription": "Fetch GPU action timings on demand via the native replay bridge. Use for performance questions when timings have not been pre-fetched yet, especially after getFrameSummary or getSelectionContext identified the relevant region or focused event. After finding the hottest passes or leaf draws, continue with getEventDetails and, if needed, getShaderInfo or getPipelineState instead of stopping at a flat timing list.",
         "userDescription": "Fetches GPU timings for actions in the current capture.",
         "inputSchema": {
           "type": "object",
@@ -151,8 +195,9 @@
         "name": "renderdoc_getResources",
         "displayName": "Get Resources",
         "toolReferenceName": "resources",
+        "canBeReferencedInPrompt": true,
         "icon": "$(database)",
-        "modelDescription": "Get the list of GPU resources in the capture: textures, buffers, shaders. Optionally filter by type. Paginated: default limit is 500, pass `limit`+`offset` for large captures.",
+        "modelDescription": "Get the list of GPU resources in the capture: textures, buffers, shaders. Use this for inventory or discovery when the target resource is not known yet; once you have a specific resource ID, prefer getResourceDetail or getTextureInfo. Paginated: default limit is 500, pass `limit`+`offset` for large captures.",
         "userDescription": "Lists GPU resources in the capture.",
         "inputSchema": {
           "type": "object",
@@ -176,8 +221,9 @@
         "name": "renderdoc_getResourceDetail",
         "displayName": "Get Resource Detail",
         "toolReferenceName": "resourceDetail",
+        "canBeReferencedInPrompt": true,
         "icon": "$(symbol-property)",
-        "modelDescription": "Get detailed information about a specific GPU resource by its resource ID.",
+        "modelDescription": "Get detailed information about a specific GPU resource by its resource ID. Use this after selection context, getResources, or reverse lookup has identified the exact resource, and prefer it before requesting raw texture pixels or buffer bytes.",
         "userDescription": "Reads details for a single GPU resource.",
         "inputSchema": {
           "type": "object",
@@ -196,8 +242,9 @@
         "name": "renderdoc_getEventDetails",
         "displayName": "Get Event Details",
         "toolReferenceName": "eventDetails",
+        "canBeReferencedInPrompt": true,
         "icon": "$(debug-step-into)",
-        "modelDescription": "Get full details of a specific GPU event/draw call by its event ID, including pipeline state if native bridge is available.",
+        "modelDescription": "Get full details of a specific GPU event/draw call by its event ID, including pipeline state if native bridge is available. This is the default first stop for a specific EID after selection context, timings, or frame summary have identified the event. Use it before deeper shader- or state-specific inspection.",
         "userDescription": "Reads full details for a specific draw call event.",
         "inputSchema": {
           "type": "object",
@@ -216,8 +263,9 @@
         "name": "renderdoc_getPipelineState",
         "displayName": "Get Pipeline State",
         "toolReferenceName": "pipelineState",
+        "canBeReferencedInPrompt": true,
         "icon": "$(symbol-event)",
-        "modelDescription": "Get the full GPU pipeline state at a specific draw call event, including bound shaders, textures, blend/depth state. Requires native bridge.",
+        "modelDescription": "Get the full GPU pipeline state at a specific draw call event, including bound shaders, textures, blend/depth state. Requires native bridge. Prefer this after getEventDetails when the question is about state, bindings, render targets, or fixed-function configuration rather than raw shader code.",
         "userDescription": "Reads the GPU pipeline state at a draw call.",
         "inputSchema": {
           "type": "object",
@@ -236,8 +284,9 @@
         "name": "renderdoc_getShaderSource",
         "displayName": "Get Shader Source",
         "toolReferenceName": "shaderSource",
+        "canBeReferencedInPrompt": true,
         "icon": "$(code)",
-        "modelDescription": "Get shader source code (GLSL/HLSL) at a specific draw call event. Optionally specify shader stage (vertex, fragment, compute).",
+        "modelDescription": "Get shader source code (GLSL/HLSL) at a specific draw call event. Optionally specify shader stage (vertex, fragment, compute). Use this only when the user explicitly wants shader code or source-level stage analysis; prefer getShaderInfo when bindings or constant buffers matter too.",
         "userDescription": "Reads shader source at a draw call.",
         "inputSchema": {
           "type": "object",
@@ -260,8 +309,9 @@
         "name": "renderdoc_getShaderInfo",
         "displayName": "Get Shader Info",
         "toolReferenceName": "shaderInfo",
+        "canBeReferencedInPrompt": true,
         "icon": "$(symbol-method)",
-        "modelDescription": "Get a higher-level shader summary at a draw call event by aggregating shader metadata/source, bound textures/samplers, and decoded constant buffer contents for one or more stages. Prefer this over calling shaderSource + pipelineState + constant buffer inspection separately when analyzing a shader stage.",
+        "modelDescription": "Get a higher-level shader summary at a draw call event by aggregating shader metadata/source, bound textures/samplers, and decoded constant buffer contents for one or more stages. Prefer this over calling shaderSource + pipelineState + constant buffer inspection separately when analyzing a shader stage, especially after getEventDetails or a timing hotspot identified the target EID.",
         "userDescription": "Reads aggregated shader source, bindings, and constant buffers at a draw call.",
         "inputSchema": {
           "type": "object",
@@ -292,8 +342,9 @@
         "name": "renderdoc_findProjectImplementation",
         "displayName": "Find Project Implementation",
         "toolReferenceName": "projectImplementation",
+        "canBeReferencedInPrompt": true,
         "icon": "$(search)",
-        "modelDescription": "Find likely project-side implementation files for a RenderDoc issue by searching the open workspace with shader names, pass/marker names, or a specific event ID. Use to bridge from capture analysis back to shader files and C# render-pass code.",
+        "modelDescription": "Find likely project-side implementation files for a RenderDoc issue by searching the open workspace with shader names, pass/marker names, or a specific event ID. Use this after a hot EID, suspicious pass, or shader has already been identified in the capture to bridge from analysis back to shader files and C# render-pass code.",
         "userDescription": "Searches the open project for shader/pass implementation candidates related to the current capture.",
         "inputSchema": {
           "type": "object",
@@ -326,8 +377,9 @@
         "name": "renderdoc_getTextureInfo",
         "displayName": "Get Texture Info",
         "toolReferenceName": "textureInfo",
+        "canBeReferencedInPrompt": true,
         "icon": "$(file-media)",
-        "modelDescription": "Get information about textures in the capture. Optionally filter by texture ID.",
+        "modelDescription": "Get information about textures in the capture. Optionally filter by texture ID. Use this after selection context or resource identification to inspect texture metadata before reverse tracing or pixel-data fetches.",
         "userDescription": "Reads information about textures.",
         "inputSchema": {
           "type": "object",
@@ -343,8 +395,9 @@
         "name": "renderdoc_analyzeFrame",
         "displayName": "Analyze Frame",
         "toolReferenceName": "analyzeFrame",
+        "canBeReferencedInPrompt": true,
         "icon": "$(graph)",
-        "modelDescription": "Perform a comprehensive analysis of the captured frame: draw call statistics, resource usage, potential performance issues.",
+        "modelDescription": "Perform a comprehensive analysis of the captured frame: draw call statistics, resource usage, potential performance issues. Use this when the user wants a broad issue scan rather than a narrow question about one selected event or resource.",
         "userDescription": "Analyzes the captured frame holistically.",
         "inputSchema": {
           "type": "object",
@@ -355,8 +408,9 @@
         "name": "renderdoc_getFrameSummary",
         "displayName": "Get Frame Summary",
         "toolReferenceName": "frameSummary",
+        "canBeReferencedInPrompt": true,
         "icon": "$(list-ordered)",
-        "modelDescription": "Get a concise structural overview of the frame: top-level render passes/markers with child counts, leaf draw/dispatch/clear counts, and GPU capture statistics. Use this FIRST before getDrawCalls to understand the frame structure without overwhelming context.",
+        "modelDescription": "Get a concise structural overview of the frame: top-level render passes/markers with child counts, leaf draw/dispatch/clear counts, and GPU capture statistics. Use this FIRST for frame overview, pass layout, render flow, or bottleneck questions before getDrawCalls. After this identifies the hot region, move to getActionTimings or specific EIDs instead of expanding the whole frame blindly.",
         "userDescription": "Returns a high-level summary of the frame structure.",
         "inputSchema": {
           "type": "object",
@@ -367,6 +421,7 @@
         "name": "renderdoc_findDrawsByShader",
         "displayName": "Find Draws by Shader",
         "toolReferenceName": "findDrawsByShader",
+        "canBeReferencedInPrompt": true,
         "icon": "$(search)",
         "modelDescription": "Find all draw call event IDs that use a given shader (by name or entry point substring). Builds a reverse index on first call — may be slow for large captures. Use to trace which draws use a specific shader.",
         "userDescription": "Reverse-searches draws by bound shader name.",
@@ -385,6 +440,7 @@
         "name": "renderdoc_findDrawsByTexture",
         "displayName": "Find Draws by Texture",
         "toolReferenceName": "findDrawsByTexture",
+        "canBeReferencedInPrompt": true,
         "icon": "$(search)",
         "modelDescription": "Find all draw call event IDs that sample a given texture (by name substring). Builds a reverse index on first call. Use to trace where a specific texture is read.",
         "userDescription": "Reverse-searches draws by bound texture name.",
@@ -403,6 +459,7 @@
         "name": "renderdoc_findDrawsByResourceId",
         "displayName": "Find Draws by Resource ID",
         "toolReferenceName": "findDrawsByResourceId",
+        "canBeReferencedInPrompt": true,
         "icon": "$(search)",
         "modelDescription": "Find all draw call event IDs that bind a specific resource ID. Useful for tracing exact resource usage by ID.",
         "userDescription": "Reverse-searches draws by resource ID.",
@@ -421,8 +478,9 @@
         "name": "renderdoc_getTextureData",
         "displayName": "Get Texture Data",
         "toolReferenceName": "textureData",
+        "canBeReferencedInPrompt": true,
         "icon": "$(file-media)",
-        "modelDescription": "Sample a texture at a specific event and mip level, returning a base64-encoded PNG. Use to inspect texture pixel content (color, depth, normal maps, etc.). Specify eventId to see the texture at that point in the frame.",
+        "modelDescription": "Sample a texture at a specific event and mip level, returning a base64-encoded PNG. Use this only when pixel inspection is necessary after the target texture has already been identified. Keep requests narrow with a specific eventId, mip, and channel when possible.",
         "userDescription": "Reads texture pixel data as a base64 PNG.",
         "inputSchema": {
           "type": "object",
@@ -451,8 +509,9 @@
         "name": "renderdoc_getBufferContents",
         "displayName": "Get Buffer Contents",
         "toolReferenceName": "bufferContents",
+        "canBeReferencedInPrompt": true,
         "icon": "$(symbol-array)",
-        "modelDescription": "Read raw bytes from a GPU buffer resource and return them base64-encoded. Use to inspect vertex buffers, index buffers, constant/uniform buffers, storage buffers, etc. Max 65536 bytes per call; use offset+len to page through larger buffers.",
+        "modelDescription": "Read raw bytes from a GPU buffer resource and return them base64-encoded. Use to inspect vertex buffers, index buffers, constant/uniform buffers, storage buffers, etc. Identify the exact buffer first, start with a small slice by default, and use offset+len to page through larger buffers. Max 65536 bytes per call.",
         "userDescription": "Reads raw bytes from a GPU buffer resource.",
         "inputSchema": {
           "type": "object",
@@ -610,6 +669,18 @@
         "icon": "$(settings-gear)"
       },
       {
+        "command": "renderdoc.reinstallCopilotCustomizations",
+        "title": "Reinstall Copilot Skills and Instructions",
+        "category": "RenderDoc",
+        "icon": "$(sync)"
+      },
+      {
+        "command": "renderdoc.showCopilotToolStatus",
+        "title": "Show Copilot Tool Status",
+        "category": "RenderDoc",
+        "icon": "$(tools)"
+      },
+      {
         "command": "renderdoc.downloadNativeBridge",
         "title": "Download Native Bridge…",
         "category": "RenderDoc",
@@ -647,6 +718,16 @@
       }
     ],
     "languages": [
+      {
+        "id": "rdc",
+        "aliases": [
+          "RenderDoc Capture",
+          "RDC"
+        ],
+        "extensions": [
+          ".rdc"
+        ]
+      },
       {
         "id": "renderdoc-glsl",
         "aliases": [

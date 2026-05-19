@@ -9,10 +9,14 @@ scripts/**
 
 # Node / tooling
 node_modules/**
+.claude/**
 .vscode/**
 .vscode-test/**
 .gitignore
 .github/**
+!.github/copilot-instructions.md
+!.github/skills/
+!.github/skills/**
 package-lock.json
 
 # Native bridge — ship only the final executable, not the build tree,

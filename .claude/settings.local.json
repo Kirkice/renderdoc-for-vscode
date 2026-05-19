@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(find /c/Users/admin -name \"mcp.json\" -type f 2>/dev/null | head -20)",
+      "Read(//c/Users/admin/**)",
+      "Bash(rm -f \"c:/Users/admin/.vscode/extensions/renderdoc-community.renderdoc-for-vscode-0.0.1/.vscode/mcp.json\" && echo \"已删除 RenderDoc 扩展目录下的 mcp.json\")",
+      "Bash(rm -f \"C:/Users/admin/AppData/Roaming/Code/User/globalStorage/mcp.json\" && echo \"已删除全局 mcp.json 配置文件\")"
+    ],
+    "additionalDirectories": [
+      "c:\\Users\\admin\\.vscode\\extensions\\renderdoc-community.renderdoc-for-vscode-0.0.1\\.vscode",
+      "C:\\Users\\admin\\AppData\\Roaming\\Code\\User\\globalStorage"
+    ]
+  }
+}

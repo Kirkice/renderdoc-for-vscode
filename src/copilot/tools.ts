@@ -9,23 +9,73 @@ let _bridge: RenderDocBridge;
 let _getCurrentCapturePath: () => string | undefined;
 let _getSelectionContext: () => { selectedDrawCall: any; selectedResource: any };
 let _getCurrentDrawCalls: () => DrawCall[];
+let _openCaptureForChat: ((filePath?: string) => Promise<OpenCaptureResult>) | undefined;
+
+interface OpenCaptureResult {
+    captureLoaded: boolean;
+    capturePath: string | null;
+    loadedNow: boolean;
+    requestedPath: string | null;
+    candidatePaths: string[];
+    message: string;
+}
 
 export function initTools(
     bridge: RenderDocBridge,
     getCurrentCapturePath: () => string | undefined,
     getSelectionContext: () => { selectedDrawCall: any; selectedResource: any },
     getCurrentDrawCalls?: () => DrawCall[],
+    openCaptureForChat?: (filePath?: string) => Promise<OpenCaptureResult>,
 ) {
     _bridge = bridge;
     _getCurrentCapturePath = getCurrentCapturePath;
     _getSelectionContext = getSelectionContext;
     _getCurrentDrawCalls = getCurrentDrawCalls ?? (() => []);
+    _openCaptureForChat = openCaptureForChat;
 }
 
 function requireCapturePath(): string {
     const p = _getCurrentCapturePath();
     if (!p) { throw new Error('No capture file is currently loaded. Use the "RenderDoc: Open RDC Capture" command first.'); }
     return p;
+}
+
+interface OpenCaptureInput {
+    filePath?: string;
+}
+
+export class OpenCaptureTool implements vscode.LanguageModelTool<OpenCaptureInput> {
+    async invoke(
+        options: vscode.LanguageModelToolInvocationOptions<OpenCaptureInput>,
+        _token: vscode.CancellationToken,
+    ): Promise<vscode.LanguageModelToolResult> {
+        const result = _openCaptureForChat
+            ? await _openCaptureForChat(options.input?.filePath)
+            : {
+                captureLoaded: false,
+                capturePath: null,
+                loadedNow: false,
+                requestedPath: options.input?.filePath ?? null,
+                candidatePaths: [],
+                message: 'RenderDoc capture bootstrap is not initialized in this session.',
+            };
+
+        return new vscode.LanguageModelToolResult([
+            new vscode.LanguageModelTextPart(JSON.stringify(result, null, 2)),
+        ]);
+    }
+
+    async prepareInvocation(
+        options: vscode.LanguageModelToolInvocationPrepareOptions<OpenCaptureInput>,
+        _token: vscode.CancellationToken,
+    ): Promise<vscode.PreparedToolInvocation> {
+        const requestedPath = options.input?.filePath?.trim();
+        return {
+            invocationMessage: requestedPath
+                ? `Loading RenderDoc capture ${path.basename(requestedPath)}…`
+                : 'Resolving the current RenderDoc capture…',
+        };
+    }
 }
 
 // ─── Tool: Get Capture Info ─────────────────────────────────────────────────
@@ -2351,6 +2401,7 @@ export class GetBufferContentsTool implements vscode.LanguageModelTool<GetBuffer
 // ─── Registration ───────────────────────────────────────────────────────────
 export function registerAllTools(context: vscode.ExtensionContext) {
     context.subscriptions.push(
+        vscode.lm.registerTool('renderdoc_openCapture', new OpenCaptureTool()),
         vscode.lm.registerTool('renderdoc_getCaptureInfo', new GetCaptureInfoTool()),
         vscode.lm.registerTool('renderdoc_getDrawCalls', new GetDrawCallsTool()),
         vscode.lm.registerTool('renderdoc_getActionTimings', new GetActionTimingsTool()),

@@ -30,6 +30,10 @@ import { InspectorPanel } from './views/inspectorPanel';
 import { DrawOverlayPanel } from './views/drawOverlayPanel';
 import { initTools, registerAllTools } from './copilot/tools';
 import { initChatParticipant, registerChatParticipant } from './copilot/chatParticipant';
+import {
+    ensureBundledCopilotCustomizationsInstalled,
+    reinstallBundledCopilotCustomizations,
+} from './copilot/skillInstaller';
 import { ensureNativeBridge } from './bridgeInstaller';
 import { openShaderSourceDocument } from './shaderEditor';
 import { CaptureCache, formatBytes } from './util/captureCache';
@@ -56,6 +60,16 @@ let currentDrawCalls: DrawCall[] = [];
 let currentResources: ResourceInfo[] = [];
 let shaderAliasScanGeneration = 0;
 let suppressDrawCallSelectionSync = false;
+let pendingAutoLoadCapturePath: string | undefined;
+
+interface RenderDocCaptureResolution {
+    captureLoaded: boolean;
+    capturePath: string | null;
+    loadedNow: boolean;
+    requestedPath: string | null;
+    candidatePaths: string[];
+    message: string;
+}
 
 const REPLAYABLE_DRAW_FLAGS = new Set([
     'Drawcall',
@@ -80,6 +94,199 @@ function findDrawCallByEventId(eventId: number, list: DrawCall[] = currentDrawCa
         }
     }
     return undefined;
+}
+
+function isRdcCaptureUri(uri: vscode.Uri | undefined): uri is vscode.Uri {
+    return !!uri && uri.scheme === 'file' && path.extname(uri.fsPath).toLowerCase() === '.rdc';
+}
+
+function getUriFromTabInput(input: unknown): vscode.Uri | undefined {
+    if (input instanceof vscode.TabInputText) {
+        return input.uri;
+    }
+    if (input instanceof vscode.TabInputCustom) {
+        return input.uri;
+    }
+    if (input instanceof vscode.TabInputNotebook) {
+        return input.uri;
+    }
+    if (input instanceof vscode.TabInputTextDiff) {
+        return input.modified;
+    }
+    if (input instanceof vscode.TabInputNotebookDiff) {
+        return input.modified;
+    }
+    return undefined;
+}
+
+function normalizeCaptureFilePath(filePath: string): string {
+    const normalized = path.normalize(filePath);
+    return process.platform === 'win32' ? normalized.toLowerCase() : normalized;
+}
+
+function getOpenRdcCaptureUris(): vscode.Uri[] {
+    const results: vscode.Uri[] = [];
+    const seen = new Set<string>();
+
+    const pushUri = (uri: vscode.Uri | undefined) => {
+        if (!isRdcCaptureUri(uri)) {
+            return;
+        }
+
+        const key = normalizeCaptureFilePath(uri.fsPath);
+        if (seen.has(key)) {
+            return;
+        }
+
+        seen.add(key);
+        results.push(uri);
+    };
+
+    pushUri(vscode.window.activeTextEditor?.document.uri);
+    pushUri(getUriFromTabInput(vscode.window.tabGroups.activeTabGroup.activeTab?.input));
+
+    for (const document of vscode.workspace.textDocuments) {
+        pushUri(document.uri);
+    }
+
+    for (const group of vscode.window.tabGroups.all) {
+        pushUri(getUriFromTabInput(group.activeTab?.input));
+        for (const tab of group.tabs) {
+            pushUri(getUriFromTabInput(tab.input));
+        }
+    }
+
+    return results;
+}
+
+function getOpenRdcCapturePaths(): string[] {
+    return getOpenRdcCaptureUris().map((uri) => uri.fsPath);
+}
+
+async function maybeAutoLoadCaptureFromUri(
+    context: vscode.ExtensionContext,
+    uri: vscode.Uri | undefined,
+    reason: string,
+): Promise<void> {
+    if (!isRdcCaptureUri(uri)) {
+        return;
+    }
+
+    const filePath = uri.fsPath;
+    const normalizedFilePath = normalizeCaptureFilePath(filePath);
+
+    if (currentCapturePath && normalizeCaptureFilePath(currentCapturePath) === normalizedFilePath) {
+        return;
+    }
+
+    if (pendingAutoLoadCapturePath && normalizeCaptureFilePath(pendingAutoLoadCapturePath) === normalizedFilePath) {
+        return;
+    }
+
+    pendingAutoLoadCapturePath = filePath;
+    console.log('[RenderDoc] Auto-loading capture from', reason, filePath);
+
+    try {
+        await loadCapture(context, filePath, true);
+    } catch (error: any) {
+        console.warn(
+            `[RenderDoc] Auto-load failed for ${filePath} (${reason}):`,
+            error?.message ?? String(error),
+        );
+    } finally {
+        if (pendingAutoLoadCapturePath
+            && normalizeCaptureFilePath(pendingAutoLoadCapturePath) === normalizedFilePath) {
+            pendingAutoLoadCapturePath = undefined;
+        }
+    }
+}
+
+async function openCaptureForChatTool(
+    context: vscode.ExtensionContext,
+    requestedPath?: string,
+): Promise<RenderDocCaptureResolution> {
+    const trimmedPath = requestedPath?.trim();
+    const candidatePaths = getOpenRdcCapturePaths();
+
+    if (currentCapturePath) {
+        const currentNormalized = normalizeCaptureFilePath(currentCapturePath);
+        if (!trimmedPath || normalizeCaptureFilePath(trimmedPath) === currentNormalized) {
+            return {
+                captureLoaded: true,
+                capturePath: currentCapturePath,
+                loadedNow: false,
+                requestedPath: trimmedPath ?? null,
+                candidatePaths,
+                message: `RenderDoc capture ${path.basename(currentCapturePath)} is already loaded in this window.`,
+            };
+        }
+    }
+
+    const preferredPath = trimmedPath
+        || (isRdcCaptureUri(vscode.window.activeTextEditor?.document.uri)
+            ? vscode.window.activeTextEditor?.document.uri.fsPath
+            : undefined)
+        || candidatePaths[0];
+
+    if (!preferredPath) {
+        return {
+            captureLoaded: false,
+            capturePath: null,
+            loadedNow: false,
+            requestedPath: trimmedPath ?? null,
+            candidatePaths,
+            message: 'No RenderDoc capture is currently loaded, and no open .rdc tab was found in this window. Open an .rdc file or provide filePath before asking for capture analysis.',
+        };
+    }
+
+    try {
+        await loadCapture(context, preferredPath, true);
+        return {
+            captureLoaded: !!currentCapturePath,
+            capturePath: currentCapturePath ?? preferredPath,
+            loadedNow: true,
+            requestedPath: trimmedPath ?? null,
+            candidatePaths,
+            message: `Loaded RenderDoc capture ${path.basename(currentCapturePath ?? preferredPath)} for local analysis.`,
+        };
+    } catch (error: any) {
+        const message = error?.message ?? String(error);
+        return {
+            captureLoaded: !!currentCapturePath,
+            capturePath: currentCapturePath ?? null,
+            loadedNow: false,
+            requestedPath: trimmedPath ?? null,
+            candidatePaths,
+            message: `Failed to load RenderDoc capture ${preferredPath}: ${message}`,
+        };
+    }
+}
+
+function showCopilotToolStatus(): void {
+    const output = vscode.window.createOutputChannel('RenderDoc Copilot Diagnostics');
+    const copilotChatExtension = vscode.extensions.getExtension('github.copilot-chat');
+    const renderDocTools = vscode.lm.tools
+        .filter((tool) => tool.name.startsWith('renderdoc_'))
+        .map((tool) => tool.name)
+        .sort((left, right) => left.localeCompare(right));
+    const openCapturePaths = getOpenRdcCapturePaths();
+
+    output.clear();
+    output.appendLine('RenderDoc Copilot Diagnostics');
+    output.appendLine('');
+    output.appendLine(`Copilot Chat installed: ${copilotChatExtension ? 'yes' : 'no'}`);
+    output.appendLine(`Copilot Chat active: ${copilotChatExtension?.isActive ? 'yes' : 'no'}`);
+    output.appendLine(`Current capture path: ${currentCapturePath ?? '<none>'}`);
+    output.appendLine(`Pending auto-load capture path: ${pendingAutoLoadCapturePath ?? '<none>'}`);
+    output.appendLine(`Open .rdc candidates in this window: ${openCapturePaths.length}`);
+    for (const capturePath of openCapturePaths) {
+        output.appendLine(`  - ${capturePath}`);
+    }
+    output.appendLine(`Registered renderdoc_* tools: ${renderDocTools.length}`);
+    for (const toolName of renderDocTools) {
+        output.appendLine(`  - ${toolName}`);
+    }
+    output.show(true);
 }
 
 function shouldRecoverReplayError(error: unknown): boolean {
@@ -163,6 +370,46 @@ async function recoverReplayForCurrentCapture(
             recommendRemote: currentCaptureSuggestsRemote && !launchTargetState.getReplayHost()?.connected,
         });
         console.warn('[RenderDoc] Replay recovery crashed:', error?.message ?? String(error));
+        return false;
+    }
+}
+
+function clearReplayDerivedState(): void {
+    currentSelectedDrawCall = undefined;
+    currentSelectedResource = undefined;
+    currentDrawCalls = [];
+    currentResources = [];
+    shaderAliasScanGeneration += 1;
+}
+
+function clearBridgeCaptureBinding(): void {
+    bridgeLoadedCapturePath = undefined;
+    currentSelectedDrawCall = undefined;
+    currentSelectedResource = undefined;
+    shaderAliasScanGeneration += 1;
+}
+
+async function restartBridgeAfterReplayCrash(
+    reason: string,
+    options?: { reopenCapturePath?: string; silent?: boolean },
+): Promise<boolean> {
+    console.warn('[RenderDoc] Restarting bridge after replay crash:', reason);
+    clearBridgeCaptureBinding();
+    bridge.restartNativeBridge();
+
+    const reopenCapturePath = options?.reopenCapturePath;
+    if (!reopenCapturePath || !bridge.hasNativeBridge()) {
+        return false;
+    }
+
+    try {
+        await syncReplayHostSelection(options?.silent ?? true);
+        await bridge.nativeOpenCapture(reopenCapturePath);
+        bridgeLoadedCapturePath = reopenCapturePath;
+        return true;
+    } catch (error: any) {
+        console.warn('[RenderDoc] Failed to re-open capture after replay crash:', error?.message ?? String(error));
+        clearBridgeCaptureBinding();
         return false;
     }
 }
@@ -1216,6 +1463,12 @@ export async function activate(context: vscode.ExtensionContext) {
     captureCache = new CaptureCache(context);
     launchTargetState = new LaunchTargetState(context);
 
+    try {
+        await ensureBundledCopilotCustomizationsInstalled(context);
+    } catch (error: any) {
+        console.warn('[RenderDoc] Failed to install bundled Copilot customizations:', error?.message ?? String(error));
+    }
+
     // Check RenderDoc availability on startup
     const available = await bridge.checkAvailability();
     console.log('[RenderDoc] checkAvailability:', available);
@@ -1361,6 +1614,16 @@ export async function activate(context: vscode.ExtensionContext) {
         vscode.commands.registerCommand('renderdoc.tryLocalReplay', () => tryLocalReplay()),
         vscode.commands.registerCommand('renderdoc.useRecommendedReplayHost', (targetUrl) => useRecommendedReplayHost(context, targetUrl)),
         vscode.commands.registerCommand('renderdoc.enableRemoteReplayPrompts', () => enableRemoteReplayPrompts()),
+        vscode.commands.registerCommand('renderdoc.reinstallCopilotCustomizations', async () => {
+            try {
+                await reinstallBundledCopilotCustomizations(context);
+            } catch (error: any) {
+                const message = error?.message ?? String(error);
+                console.warn('[RenderDoc] Failed to reinstall Copilot customizations:', message);
+                void vscode.window.showErrorMessage(`Failed to reinstall RenderDoc Copilot customizations: ${message}`);
+            }
+        }),
+        vscode.commands.registerCommand('renderdoc.showCopilotToolStatus', () => showCopilotToolStatus()),
         vscode.commands.registerCommand('renderdoc.downloadNativeBridge', async () => {
             // Clear the "don't ask again" flag so the picker shows again.
             await context.globalState.update('renderdoc.skipBridgePrompt', false);
@@ -1385,7 +1648,13 @@ export async function activate(context: vscode.ExtensionContext) {
                 selectedDrawCall: currentSelectedDrawCall,
                 selectedResource: currentSelectedResource,
             });
-            initTools(bridge, getCapturePath, getSelectionContext, () => currentDrawCalls);
+            initTools(
+                bridge,
+                getCapturePath,
+                getSelectionContext,
+                () => currentDrawCalls,
+                (filePath) => openCaptureForChatTool(context, filePath),
+            );
             initChatParticipant(bridge, getCapturePath, getSelectionContext);
             registerAllTools(context);
             registerChatParticipant(context);
@@ -1410,8 +1679,33 @@ export async function activate(context: vscode.ExtensionContext) {
             async deserializeWebviewPanel(panel: vscode.WebviewPanel, _state: any) {
                 InspectorPanel.revive(panel, context, bridge);
             }
-        })
+        }),
+        vscode.workspace.onDidOpenTextDocument((document) => {
+            void maybeAutoLoadCaptureFromUri(context, document.uri, 'opened document');
+        }),
+        vscode.window.onDidChangeActiveTextEditor((editor) => {
+            void maybeAutoLoadCaptureFromUri(context, editor?.document.uri, 'active editor');
+        }),
+        vscode.window.tabGroups.onDidChangeTabs((event) => {
+            for (const tab of event.opened) {
+                void maybeAutoLoadCaptureFromUri(context, getUriFromTabInput(tab.input), 'opened tab');
+            }
+            for (const tab of event.changed) {
+                if (tab.isActive) {
+                    void maybeAutoLoadCaptureFromUri(context, getUriFromTabInput(tab.input), 'active tab');
+                }
+            }
+        }),
     );
+
+    void maybeAutoLoadCaptureFromUri(context, vscode.window.activeTextEditor?.document.uri, 'activation active editor');
+    const existingOpenCapture = vscode.workspace.textDocuments.find((document) => isRdcCaptureUri(document.uri));
+    if (existingOpenCapture) {
+        void maybeAutoLoadCaptureFromUri(context, existingOpenCapture.uri, 'activation open document');
+    }
+    for (const uri of getOpenRdcCaptureUris()) {
+        void maybeAutoLoadCaptureFromUri(context, uri, 'activation open tab');
+    }
 
     void launchTargetState.refresh(bridge);
     void refreshLiveTargetState();
@@ -2119,11 +2413,13 @@ async function loadCapture(context: vscode.ExtensionContext, filePath: string, s
                         });
                         replayReady = false;
                         replayFailureReason = err?.message || String(err);
-                        bridge.restartNativeBridge();
+                        await restartBridgeAfterReplayCrash(`loadCapture(${path.basename(filePath)})`, {
+                            silent: true,
+                        });
                         if (!silent) {
                             vscode.window.showWarningMessage(
                                 `RenderDoc: replay initialisation failed — ${err?.message || err}. ` +
-                                `Basic capture info (draw calls, resources, thumbnail) is still available.`
+                                `Basic capture metadata and thumbnail are still available.`
                             );
                         }
                     }
@@ -2178,6 +2474,7 @@ async function loadCapture(context: vscode.ExtensionContext, filePath: string, s
             let replayErr: Error | undefined;
             if (!replayReady) {
                 replayErr = new Error(replayFailureReason || 'No active replay is available for this capture.');
+                clearReplayDerivedState();
                 updateDrawCallTree([]);
                 resourceProvider.update([]);
             } else if (cached) {
@@ -2203,6 +2500,7 @@ async function loadCapture(context: vscode.ExtensionContext, filePath: string, s
                     resourceProvider.update(resources);
                 } catch (err: any) {
                     replayErr = err;
+                    clearReplayDerivedState();
                     updateDrawCallTree([]);
                     resourceProvider.update([]);
                 }
@@ -2753,12 +3051,11 @@ async function tryLocalReplay() {
                     recommendRemote: currentCaptureSuggestsRemote && !replayHostUrl && hasSupportedReplayHostTargets(),
                     allowReplayPromptReset: currentCaptureSuggestsRemote && shouldAlwaysReplayLocally(),
                 });
-                console.log('[RenderDoc] tryLocalReplay crashed, restarting bridge...');
-                bridge.tryStartNativeBridge();
-                if (bridge.hasNativeBridge()) {
-                    await syncReplayHostSelection();
-                    try { await bridge.nativeOpenCapture(currentCapturePath!); } catch { /* ignore */ }
-                }
+                console.log('[RenderDoc] tryLocalReplay crashed, resetting bridge state...');
+                await restartBridgeAfterReplayCrash('manual tryLocalReplay', {
+                    reopenCapturePath: currentCapturePath!,
+                    silent: true,
+                });
                 vscode.window.showWarningMessage(
                     replayHostUrl
                         ? 'Remote replay failed — inspection features are disabled for this capture until replay is restored.'
