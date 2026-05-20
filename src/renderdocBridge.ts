@@ -24,6 +24,12 @@ import {
 import { parseRdcFile, parseRdcThumbnail } from './rdcParser';
 import { withTimeout } from './util/async';
 import {
+    logRenderDocDiagnostic,
+    logRenderDocError,
+    logRenderDocInfo,
+    logRenderDocWarning,
+} from './util/diagnostics';
+import {
     InitResponse,
     GetRootActionsResponse,
     GetVersionResponse,
@@ -84,6 +90,81 @@ import { BridgeError } from './ipc/bridgeError';
 const DEFAULT_NATIVE_CALL_TIMEOUT_MS = 0;
 /** Shorter timeout used for the lightweight `ping` health check. */
 const NATIVE_PING_TIMEOUT_MS = 2_000;
+const DIAGNOSTIC_NATIVE_METHODS = new Set([
+    'init',
+    'getReplayHost',
+    'setReplayHost',
+    'disconnectReplayHost',
+    'openCapture',
+    'tryReplay',
+]);
+
+function shouldTraceNativeMethod(method: string): boolean {
+    return DIAGNOSTIC_NATIVE_METHODS.has(method);
+}
+
+function summarizeNativeParams(method: string, params: any): unknown {
+    switch (method) {
+        case 'init':
+            return { renderdocPath: params?.renderdocPath };
+        case 'setReplayHost':
+            return { url: params?.url };
+        case 'openCapture':
+            return { path: params?.path };
+        default:
+            return params;
+    }
+}
+
+function summarizeNativeResult(method: string, result: any): unknown {
+    switch (method) {
+        case 'getReplayHost':
+        case 'setReplayHost':
+        case 'disconnectReplayHost':
+            return {
+                connected: result?.connected,
+                url: result?.url,
+                protocol: result?.protocol,
+                localProxies: result?.localProxies,
+                remoteSupportedReplays: result?.remoteSupportedReplays,
+            };
+        case 'openCapture':
+            return {
+                api: result?.api,
+                localReplaySupport: result?.localReplaySupport,
+                canTryReplay: result?.canTryReplay,
+                replayRemote: result?.replayRemote,
+                suggestRemote: result?.suggestRemote,
+                replayMessage: result?.replayMessage,
+            };
+        case 'tryReplay':
+            return {
+                replay: result?.replay,
+                replayRemote: result?.replayRemote,
+                replayHost: result?.replayHost,
+                replayError: result?.replayError,
+            };
+        default:
+            return result;
+    }
+}
+
+function classifyBridgeStderr(line: string): 'INFO' | 'WARN' | 'ERROR' {
+    const text = line.toLowerCase();
+    if (/crash|exception|failed|error|timeout|timed out|no replay active/.test(text)) {
+        return 'ERROR';
+    }
+    if (/retry|fallback|warning|warn|reconnect|lost/.test(text)) {
+        return 'WARN';
+    }
+    return 'INFO';
+}
+
+function shouldSuppressNativeErrorLog(method: string, code: unknown, message: string): boolean {
+    return method === 'ping'
+        && Number(code) === -100
+        && message.includes('Unknown method: ping');
+}
 
 // ─────────────────────────────────────────────────────────────────────
 // Native ActionDescription → DrawCall converter (preserves hierarchy)
@@ -371,6 +452,7 @@ export class RenderDocBridge {
     private downloadedBridgeDir: string | undefined;
     private shaderDisplayNameCache = new Map<string, string>();
     private nativeFeatureSupport = new Map<string, boolean>();
+    private pendingEnsureNativeBridgeReady: Promise<void> | undefined;
 
     constructor() {}
 
@@ -388,18 +470,52 @@ export class RenderDocBridge {
         return fs.existsSync(bundledDir) ? bundledDir : undefined;
     }
 
+    private formatDirectorySnapshot(dir: string, limit = 64): string {
+        try {
+            if (!fs.existsSync(dir)) { return '<missing>'; }
+            const entries = fs.readdirSync(dir, { withFileTypes: true })
+                .map((entry) => entry.name + (entry.isDirectory() ? '/' : ''))
+                .sort((a, b) => a.localeCompare(b));
+            if (entries.length === 0) { return '<empty>'; }
+            if (entries.length > limit) {
+                return `${entries.slice(0, limit).join(', ')} ... (+${entries.length - limit} more)`;
+            }
+            return entries.join(', ');
+        } catch (error: any) {
+            return `<error: ${error?.message ?? String(error)}>`;
+        }
+    }
+
+    private logRenderdocRuntimeDiagnostics(label: string, dir: string): void {
+        console.log(`[RenderDoc] ${label} runtime dir: ${dir}`);
+        console.log(`[RenderDoc] ${label} runtime entries: ${this.formatDirectorySnapshot(dir)}`);
+
+        const pluginsDir = path.join(dir, 'plugins');
+        console.log(`[RenderDoc] ${label} plugins dir: ${pluginsDir}`);
+        console.log(`[RenderDoc] ${label} plugins entries: ${this.formatDirectorySnapshot(pluginsDir)}`);
+
+        const glesPluginsDir = path.join(pluginsDir, 'gles');
+        console.log(`[RenderDoc] ${label} plugins/gles dir: ${glesPluginsDir}`);
+        console.log(`[RenderDoc] ${label} plugins/gles entries: ${this.formatDirectorySnapshot(glesPluginsDir)}`);
+    }
+
     /**
      * Detects if RenderDoc is available on the system.
      * Checks: 1) VSIX-bundled runtime, 2) common install locations, 3) PATH
      */
     async checkAvailability(): Promise<boolean> {
-        this.renderdocPath = undefined;
-        this.renderdocCmd = undefined;
+        let nextRenderdocPath: string | undefined;
+        let nextRenderdocCmd: string | undefined;
 
         // 1. Check the self-contained runtime bundled with the extension.
         const bundledPath = this.getBundledRenderdocDir();
-        if (bundledPath && await this.validateRenderdocDir(bundledPath)) {
-            this.renderdocPath = bundledPath;
+        const bundledCmd = bundledPath ? await this.validateRenderdocDir(bundledPath) : undefined;
+        if (bundledPath && bundledCmd) {
+            nextRenderdocPath = bundledPath;
+            nextRenderdocCmd = bundledCmd;
+            this.renderdocPath = nextRenderdocPath;
+            this.renderdocCmd = nextRenderdocCmd;
+            this.logRenderdocRuntimeDiagnostics('Bundled', bundledPath);
             return true;
         }
 
@@ -411,8 +527,13 @@ export class RenderDocBridge {
                 path.join(process.env['LOCALAPPDATA'] || '', 'Programs', 'RenderDoc'),
             ];
             for (const p of commonPaths) {
-                if (await this.validateRenderdocDir(p)) {
-                    this.renderdocPath = p;
+                const cmdPath = await this.validateRenderdocDir(p);
+                if (cmdPath) {
+                    nextRenderdocPath = p;
+                    nextRenderdocCmd = cmdPath;
+                    this.renderdocPath = nextRenderdocPath;
+                    this.renderdocCmd = nextRenderdocCmd;
+                    this.logRenderdocRuntimeDiagnostics('System', p);
                     return true;
                 }
             }
@@ -423,8 +544,10 @@ export class RenderDocBridge {
             try {
                 const result = await this.exec('which renderdoccmd');
                 if (result.trim()) {
-                    this.renderdocCmd = result.trim();
-                    this.renderdocPath = path.dirname(result.trim());
+                    nextRenderdocCmd = result.trim();
+                    nextRenderdocPath = path.dirname(result.trim());
+                    this.renderdocCmd = nextRenderdocCmd;
+                    this.renderdocPath = nextRenderdocPath;
                     return true;
                 }
             } catch {
@@ -432,24 +555,25 @@ export class RenderDocBridge {
             }
         }
 
+        this.renderdocPath = undefined;
+        this.renderdocCmd = undefined;
         return false;
     }
 
     /** Validates that a directory looks like a RenderDoc installation */
-    private async validateRenderdocDir(dir: string): Promise<boolean> {
+    private async validateRenderdocDir(dir: string): Promise<string | undefined> {
         try {
             const stat = await fs.promises.stat(dir);
-            if (!stat.isDirectory()) { return false; }
+            if (!stat.isDirectory()) { return undefined; }
 
             const cmdName = process.platform === 'win32' ? 'renderdoccmd.exe' : 'bin/renderdoccmd';
             const cmdPath = path.join(dir, cmdName);
             if (await this.fileExists(cmdPath)) {
-                this.renderdocCmd = cmdPath;
-                return true;
+                return cmdPath;
             }
-            return false;
+            return undefined;
         } catch {
-            return false;
+            return undefined;
         }
     }
 
@@ -833,6 +957,10 @@ export class RenderDocBridge {
 
         const bridgePath = this.findNativeBridge();
         console.log('[RenderDoc] findNativeBridge:', bridgePath ?? 'NOT FOUND');
+        logRenderDocInfo('Attempting to start native bridge.', {
+            bridgePath: bridgePath ?? '<not found>',
+            renderdocPath: this.renderdocPath ?? '<unset>',
+        });
         if (!bridgePath) { return; }
 
         try {
@@ -855,6 +983,11 @@ export class RenderDocBridge {
             this.nativeProcess = child;
             this.nativeFeatureSupport.clear();
             console.log('[RenderDoc] Native bridge spawned, pid:', child.pid);
+            logRenderDocInfo('Native bridge spawned.', {
+                pid: child.pid,
+                bridgePath,
+                cwd: this.renderdocPath || process.cwd(),
+            });
 
             child.stdout?.on('data', (data: Buffer) => {
                 // Only process output from the current bridge. Stale data from
@@ -866,11 +999,21 @@ export class RenderDocBridge {
             });
 
             child.stderr?.on('data', (data: Buffer) => {
-                console.log('[RenderDoc] bridge stderr:', data.toString().trim());
+                const lines = data.toString().split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+                for (const line of lines) {
+                    console.log('[RenderDoc] bridge stderr:', line);
+                    logRenderDocDiagnostic(classifyBridgeStderr(line), 'Native bridge stderr', line);
+                }
             });
 
-            child.on('exit', (code) => {
+            child.on('exit', (code, signal) => {
                 console.log('[RenderDoc] Native bridge exited with code:', code, 'pid:', child.pid);
+                logRenderDocWarning('Native bridge exited.', {
+                    pid: child.pid,
+                    code,
+                    signal,
+                    pendingRequests: Array.from(this.nativePendingRequests.values()).map((pending) => pending.method),
+                });
                 // Only clear state if this is still the active process.
                 // During a restart the old process's exit fires AFTER the new
                 // one has already been spawned — without this guard it would
@@ -889,6 +1032,7 @@ export class RenderDocBridge {
 
             child.on('error', (err) => {
                 console.error('[RenderDoc] Native bridge spawn error:', err.message);
+                logRenderDocError('Native bridge spawn error.', err);
                 if (this.nativeProcess !== child) { return; }
                 this.nativeProcess = undefined;
                 this.nativeBridgeRenderdocPath = undefined;
@@ -896,9 +1040,12 @@ export class RenderDocBridge {
 
             // Initialize with RenderDoc path
             if (this.renderdocPath) {
-                this.nativeCall('init', { renderdocPath: this.renderdocPath }).catch(() => {});
+                this.nativeCall('init', { renderdocPath: this.renderdocPath }).catch((error) => {
+                    logRenderDocError('Native bridge init failed.', error);
+                });
             }
-        } catch {
+        } catch (error) {
+            logRenderDocError('Failed to spawn native bridge.', error);
             this.nativeProcess = undefined;
         }
     }
@@ -957,12 +1104,21 @@ export class RenderDocBridge {
                     const pending = this.nativePendingRequests.get(msg.id)!;
                     this.nativePendingRequests.delete(msg.id);
                     if (msg.error) {
+                        if (!shouldSuppressNativeErrorLog(pending.method, msg.error.code, String(msg.error.message || ''))) {
+                            logRenderDocWarning(`Native bridge call failed: ${pending.method}`, {
+                                code: msg.error.code,
+                                message: msg.error.message,
+                            });
+                        }
                         pending.reject(new BridgeError(
                             'remote',
                             msg.error.message || 'Unknown native bridge error',
                             { method: pending.method, code: msg.error.code },
                         ));
                     } else {
+                        if (shouldTraceNativeMethod(pending.method)) {
+                            logRenderDocInfo(`Native bridge call succeeded: ${pending.method}`, summarizeNativeResult(pending.method, msg.result));
+                        }
                         pending.resolve(msg.result);
                     }
                 } else if (msg.id === undefined && typeof msg.method === 'string') {
@@ -976,7 +1132,7 @@ export class RenderDocBridge {
                     }
                 }
             } catch {
-                // Ignore unparseable lines
+                logRenderDocWarning('Ignored unparseable native bridge stdout line.', trimmed);
             }
         }
     }
@@ -985,11 +1141,16 @@ export class RenderDocBridge {
     private nativeCall(method: string, params: any = {}, timeoutMs?: number): Promise<unknown> {
         return new Promise<unknown>((resolve, reject) => {
             if (!this.nativeProcess || !this.nativeProcess.stdin) {
+                logRenderDocError(`Native bridge unavailable before call: ${method}`);
                 reject(new BridgeError('unavailable', 'Native bridge not available', { method }));
                 return;
             }
             const id = ++this.nativeRequestId;
             const msg = JSON.stringify({ id, method, params }) + '\n';
+
+            if (shouldTraceNativeMethod(method)) {
+                logRenderDocInfo(`Native bridge call started: ${method}`, summarizeNativeParams(method, params));
+            }
 
             // Resolve timeout: explicit arg > user setting > default.
             // A value of 0 (or negative) explicitly disables the timeout —
@@ -1006,6 +1167,7 @@ export class RenderDocBridge {
                 ? setTimeout(() => {
                     if (this.nativePendingRequests.has(id)) {
                         this.nativePendingRequests.delete(id);
+                        logRenderDocError(`Native bridge call timed out: ${method}`, { timeoutMs: ms });
                         reject(new BridgeError(
                             'timeout',
                             `Native bridge call '${method}' timed out after ${ms}ms`,
@@ -1025,6 +1187,7 @@ export class RenderDocBridge {
                 if (err) {
                     if (timer) { clearTimeout(timer); }
                     this.nativePendingRequests.delete(id);
+                    logRenderDocError(`Native bridge stdin write failed: ${method}`, err);
                     reject(new BridgeError('io', `stdin write failed: ${err.message}`, { method, cause: err }));
                 }
             });
@@ -1076,29 +1239,51 @@ export class RenderDocBridge {
     }
 
     async ensureNativeBridgeReady(): Promise<void> {
-        const available = await this.checkAvailability();
-        if (!available || !this.renderdocPath) {
-            throw new Error('RenderDoc runtime is unavailable. The bundled runtime is missing and no system RenderDoc install was auto-detected.');
+        if (this.pendingEnsureNativeBridgeReady) {
+            return this.pendingEnsureNativeBridgeReady;
         }
 
-        if (!this.hasNativeBridge()) {
-            this.tryStartNativeBridge();
-        } else if (this.nativeBridgeRenderdocPath !== this.renderdocPath || !(await this.nativePing())) {
-            this.restartNativeBridge();
-        }
+        const readyPromise = (async () => {
+            const available = await this.checkAvailability();
+            const renderdocPath = this.renderdocPath;
+            if (!available || !renderdocPath) {
+                throw new Error('RenderDoc runtime is unavailable. The bundled runtime is missing and no system RenderDoc install was auto-detected.');
+            }
 
-        if (!this.hasNativeBridge()) {
-            throw new Error('RenderDoc native bridge is not available.');
-        }
+            if (!this.hasNativeBridge()) {
+                this.tryStartNativeBridge();
+            } else if (this.nativeBridgeRenderdocPath !== renderdocPath || !(await this.nativePing())) {
+                this.restartNativeBridge();
+            }
 
-        await this.nativeCallT('init', InitResponse, { renderdocPath: this.renderdocPath });
-        this.nativeBridgeRenderdocPath = this.renderdocPath;
+            if (!this.hasNativeBridge()) {
+                throw new Error('RenderDoc native bridge is not available.');
+            }
+
+            console.log('[RenderDoc] Native bridge init renderdocPath:', renderdocPath);
+            console.log('[RenderDoc] Native bridge init cwd:', renderdocPath);
+            await this.nativeCallT('init', InitResponse, { renderdocPath });
+            this.nativeBridgeRenderdocPath = renderdocPath;
+        })();
+
+        this.pendingEnsureNativeBridgeReady = readyPromise;
+
+        try {
+            await readyPromise;
+        } finally {
+            if (this.pendingEnsureNativeBridgeReady === readyPromise) {
+                this.pendingEnsureNativeBridgeReady = undefined;
+            }
+        }
     }
 
     /** Open a capture in the native replay controller */
     async nativeOpenCapture(filePath: string): Promise<TOpenCaptureResponse> {
         await this.ensureNativeBridgeReady();
         this.shaderDisplayNameCache.clear();
+        console.log('[RenderDoc] nativeOpenCapture preflight capture:', filePath);
+        console.log('[RenderDoc] nativeOpenCapture preflight renderdocPath:', this.renderdocPath ?? '<unset>');
+        console.log('[RenderDoc] nativeOpenCapture preflight bridge cwd:', this.renderdocPath ?? '<default process cwd>');
         return this.nativeCallT('openCapture', OpenCaptureResponse, { path: filePath });
     }
 
@@ -1116,6 +1301,16 @@ export class RenderDocBridge {
         await this.ensureNativeBridgeReady();
         const result: TReplayHostInfoResponse = await this.nativeCallT(
             'getReplayHost',
+            ReplayHostInfoResponse,
+            {},
+        );
+        return result;
+    }
+
+    async nativePingReplayHost(): Promise<ReplayHostInfo> {
+        await this.ensureNativeBridgeReady();
+        const result: TReplayHostInfoResponse = await this.nativeCallT(
+            'pingReplayHost',
             ReplayHostInfoResponse,
             {},
         );

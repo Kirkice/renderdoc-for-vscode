@@ -65,6 +65,10 @@ export interface MsgAnalyzeMaliOffline {
     stage: string;
 }
 
+export interface MsgOpenMaliOfflineSettings {
+    type: 'openMaliOfflineSettings';
+}
+
 export interface WebviewShaderCompileFlag {
     name: string;
     value: string;
@@ -168,6 +172,7 @@ export type WebviewToExtensionMessage =
     | MsgRequestCurrentDrawPreview
     | MsgOpenShaderInEditor
     | MsgAnalyzeMaliOffline
+    | MsgOpenMaliOfflineSettings
     | MsgCompileShaderEdit
     | MsgApplyShaderEdit
     | MsgRevertShaderEdit

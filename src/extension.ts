@@ -19,10 +19,14 @@ import {
 } from './types';
 import { LaunchTargetState } from './launchTargetState';
 import { CaptureInfoProvider } from './views/captureInfoProvider';
-import { DrawCallProvider } from './views/drawCallProvider';
+import { EventBrowserViewProvider } from './views/eventBrowserView';
 import { ApiInspectorProvider } from './views/apiInspectorProvider';
 import { LaunchTargetViewProvider } from './views/launchTargetView';
-import { LaunchApplicationPanel, type LaunchFormState } from './views/launchApplicationPanel';
+import {
+    LaunchApplicationPanel,
+    type LaunchCaptureTriggerState,
+    type LaunchFormState,
+} from './views/launchApplicationPanel';
 import { CaptureResultPanel } from './views/captureResultPanel';
 import { ResourceProvider } from './views/resourceProvider';
 import { ThumbnailPanel } from './views/thumbnailPanel';
@@ -38,6 +42,13 @@ import { ensureNativeBridge } from './bridgeInstaller';
 import { openShaderSourceDocument } from './shaderEditor';
 import { CaptureCache, formatBytes } from './util/captureCache';
 import {
+    copyRecentRenderDocDiagnosticsToClipboard,
+    logRenderDocError,
+    logRenderDocInfo,
+    logRenderDocWarning,
+    showRenderDocDiagnostics,
+} from './util/diagnostics';
+import {
     getPipelineStateHtml,
     getTexturePreviewHtml,
     getResourceDetailHtml,
@@ -46,12 +57,15 @@ import {
 let bridge: RenderDocBridge;
 let captureCache: CaptureCache;
 let captureInfoProvider: CaptureInfoProvider;
-let drawCallProvider: DrawCallProvider;
+let eventBrowserViewProvider: EventBrowserViewProvider;
 let apiInspectorProvider: ApiInspectorProvider;
 let resourceProvider: ResourceProvider;
 let launchTargetState: LaunchTargetState;
 let currentCapturePath: string | undefined;
 let currentCaptureSuggestsRemote = false;
+let currentReplayMode: 'none' | 'local' | 'remote' = 'none';
+let remoteReplayKeepAliveTimer: NodeJS.Timeout | undefined;
+let remoteReplayKeepAliveInFlight = false;
 
 // ── Selection tracking (for Copilot context) ──
 let currentSelectedDrawCall: any | undefined;
@@ -59,9 +73,7 @@ let currentSelectedResource: any | undefined;
 let currentDrawCalls: DrawCall[] = [];
 let currentResources: ResourceInfo[] = [];
 let shaderAliasScanGeneration = 0;
-let suppressDrawCallSelectionSync = false;
 let pendingAutoLoadCapturePath: string | undefined;
-
 interface RenderDocCaptureResolution {
     captureLoaded: boolean;
     capturePath: string | null;
@@ -80,6 +92,16 @@ const REPLAYABLE_DRAW_FLAGS = new Set([
     'GenMips',
     'Present',
 ]);
+const OPEN_DIAGNOSTICS_LOG_ACTION = 'Open Diagnostics Log';
+const REMOTE_REPLAY_KEEPALIVE_INTERVAL_MS = 175;
+
+function showWarningWithDiagnostics(message: string): void {
+    void vscode.window.showWarningMessage(message, OPEN_DIAGNOSTICS_LOG_ACTION).then((choice) => {
+        if (choice === OPEN_DIAGNOSTICS_LOG_ACTION) {
+            showRenderDocDiagnostics();
+        }
+    });
+}
 
 function findDrawCallByEventId(eventId: number, list: DrawCall[] = currentDrawCalls): DrawCall | undefined {
     for (const drawCall of list) {
@@ -94,6 +116,53 @@ function findDrawCallByEventId(eventId: number, list: DrawCall[] = currentDrawCa
         }
     }
     return undefined;
+}
+
+function stopRemoteReplayKeepAlive(): void {
+    if (remoteReplayKeepAliveTimer) {
+        clearInterval(remoteReplayKeepAliveTimer);
+        remoteReplayKeepAliveTimer = undefined;
+    }
+}
+
+function shouldRunRemoteReplayKeepAlive(): boolean {
+    return !!currentCapturePath
+        && currentReplayMode === 'remote'
+        && captureInfoProvider.getReplayStatus() === 'active'
+        && bridge.hasNativeBridge();
+}
+
+function updateRemoteReplayKeepAlive(): void {
+    if (!shouldRunRemoteReplayKeepAlive()) {
+        stopRemoteReplayKeepAlive();
+        return;
+    }
+
+    if (remoteReplayKeepAliveTimer) {
+        return;
+    }
+
+    remoteReplayKeepAliveTimer = setInterval(() => {
+        if (!shouldRunRemoteReplayKeepAlive()) {
+            stopRemoteReplayKeepAlive();
+            return;
+        }
+        if (remoteReplayKeepAliveInFlight) {
+            return;
+        }
+
+        remoteReplayKeepAliveInFlight = true;
+        void bridge.nativePingReplayHost()
+            .catch((error: any) => {
+                logRenderDocWarning('Remote replay keep-alive RPC failed.', {
+                    currentCapturePath: currentCapturePath ?? '<none>',
+                    message: error?.message ?? String(error),
+                });
+            })
+            .finally(() => {
+                remoteReplayKeepAliveInFlight = false;
+            });
+    }, REMOTE_REPLAY_KEEPALIVE_INTERVAL_MS);
 }
 
 function isRdcCaptureUri(uri: vscode.Uri | undefined): uri is vscode.Uri {
@@ -321,56 +390,85 @@ async function recoverReplayForCurrentCapture(
         return false;
     }
 
-    console.log('[RenderDoc] Recovering replay for current capture due to', reason, 'file=', filePath);
-
-    if (!bridge.hasNativeBridge()) {
-        bridge.tryStartNativeBridge();
-    }
-    if (!bridge.hasNativeBridge()) {
-        return false;
-    }
-
-    await syncReplayHostSelection();
-
-    try {
-        await bridge.nativeOpenCapture(filePath);
-        bridgeLoadedCapturePath = filePath;
-    } catch (error: any) {
-        console.warn('[RenderDoc] Replay recovery openCapture failed:', error?.message ?? String(error));
-        return false;
+    if (pendingReplayRecovery && pendingReplayRecovery.filePath === filePath) {
+        logRenderDocInfo('Joining in-flight replay recovery.', {
+            reason,
+            filePath,
+            force: !!options?.force,
+        });
+        return pendingReplayRecovery.promise;
     }
 
-    try {
-        const result = await bridge.nativeTryReplay();
-        if (result?.replay) {
-            captureInfoProvider.setReplayStatus('active');
-            syncCaptureReplayDetails({
-                mode: result.replayRemote ? 'remote' : 'local',
-                hint: currentCaptureSuggestsRemote && !result.replayRemote
-                    ? 'Local replay is active, but a matching remote replay host is still recommended for the most reliable inspection.'
-                    : undefined,
-                recommendRemote: currentCaptureSuggestsRemote && !result.replayRemote,
-            });
-            InspectorPanel.currentPanel?.invalidateReplayCaches();
-            return true;
+    const recoveryPromise = (async (): Promise<boolean> => {
+        console.log('[RenderDoc] Recovering replay for current capture due to', reason, 'file=', filePath);
+        logRenderDocWarning('Attempting replay recovery.', {
+            reason,
+            filePath,
+            force: !!options?.force,
+        });
+
+        if (!bridge.hasNativeBridge()) {
+            bridge.tryStartNativeBridge();
         }
-        captureInfoProvider.setReplayStatus('failed');
-        syncCaptureReplayDetails({
-            mode: launchTargetState.getReplayHost()?.connected ? 'remote' : 'local',
-            hint: result?.replayError || 'Unknown error',
-            recommendRemote: currentCaptureSuggestsRemote && !launchTargetState.getReplayHost()?.connected,
-        });
-        console.warn('[RenderDoc] Replay recovery tryReplay failed:', result?.replayError || 'Unknown error');
-        return false;
-    } catch (error: any) {
-        captureInfoProvider.setReplayStatus('failed');
-        syncCaptureReplayDetails({
-            mode: launchTargetState.getReplayHost()?.connected ? 'remote' : 'local',
-            hint: error?.message || String(error),
-            recommendRemote: currentCaptureSuggestsRemote && !launchTargetState.getReplayHost()?.connected,
-        });
-        console.warn('[RenderDoc] Replay recovery crashed:', error?.message ?? String(error));
-        return false;
+        if (!bridge.hasNativeBridge()) {
+            return false;
+        }
+
+        await syncReplayHostSelection();
+
+        try {
+            await bridge.nativeOpenCapture(filePath);
+            bridgeLoadedCapturePath = filePath;
+        } catch (error: any) {
+            console.warn('[RenderDoc] Replay recovery openCapture failed:', error?.message ?? String(error));
+            logRenderDocError('Replay recovery openCapture failed.', error);
+            return false;
+        }
+
+        try {
+            const result = await bridge.nativeTryReplay();
+            if (result?.replay) {
+                captureInfoProvider.setReplayStatus('active');
+                syncCaptureReplayDetails({
+                    mode: result.replayRemote ? 'remote' : 'local',
+                    hint: currentCaptureSuggestsRemote && !result.replayRemote
+                        ? 'Local replay is active, but a matching remote replay host is still recommended for the most reliable inspection.'
+                        : undefined,
+                    recommendRemote: currentCaptureSuggestsRemote && !result.replayRemote,
+                });
+                InspectorPanel.currentPanel?.invalidateReplayCaches();
+                return true;
+            }
+            captureInfoProvider.setReplayStatus('failed');
+            syncCaptureReplayDetails({
+                mode: launchTargetState.getReplayHost()?.connected ? 'remote' : 'local',
+                hint: result?.replayError || 'Unknown error',
+                recommendRemote: currentCaptureSuggestsRemote && !launchTargetState.getReplayHost()?.connected,
+            });
+            console.warn('[RenderDoc] Replay recovery tryReplay failed:', result?.replayError || 'Unknown error');
+            logRenderDocWarning('Replay recovery tryReplay failed.', result?.replayError || 'Unknown error');
+            return false;
+        } catch (error: any) {
+            captureInfoProvider.setReplayStatus('failed');
+            syncCaptureReplayDetails({
+                mode: launchTargetState.getReplayHost()?.connected ? 'remote' : 'local',
+                hint: error?.message || String(error),
+                recommendRemote: currentCaptureSuggestsRemote && !launchTargetState.getReplayHost()?.connected,
+            });
+            console.warn('[RenderDoc] Replay recovery crashed:', error?.message ?? String(error));
+            logRenderDocError('Replay recovery crashed.', error);
+            return false;
+        }
+    })();
+
+    pendingReplayRecovery = { filePath, promise: recoveryPromise };
+
+    try {
+        return await recoveryPromise;
+    } finally {
+        if (pendingReplayRecovery?.promise === recoveryPromise) {
+            pendingReplayRecovery = undefined;
+        }
     }
 }
 
@@ -394,6 +492,11 @@ async function restartBridgeAfterReplayCrash(
     options?: { reopenCapturePath?: string; silent?: boolean },
 ): Promise<boolean> {
     console.warn('[RenderDoc] Restarting bridge after replay crash:', reason);
+    logRenderDocWarning('Restarting native bridge after replay crash.', {
+        reason,
+        reopenCapturePath: options?.reopenCapturePath,
+        silent: !!options?.silent,
+    });
     clearBridgeCaptureBinding();
     bridge.restartNativeBridge();
 
@@ -406,9 +509,11 @@ async function restartBridgeAfterReplayCrash(
         await syncReplayHostSelection(options?.silent ?? true);
         await bridge.nativeOpenCapture(reopenCapturePath);
         bridgeLoadedCapturePath = reopenCapturePath;
+        logRenderDocInfo('Re-opened capture after replay crash.', { reopenCapturePath });
         return true;
     } catch (error: any) {
         console.warn('[RenderDoc] Failed to re-open capture after replay crash:', error?.message ?? String(error));
+        logRenderDocError('Failed to re-open capture after replay crash.', error);
         clearBridgeCaptureBinding();
         return false;
     }
@@ -450,10 +555,27 @@ function normalizeSelectedDrawCall(drawCall: DrawCall | undefined): DrawCall | u
 }
 
 function updateDrawCallTree(drawCalls: DrawCall[]) {
-    suppressDrawCallSelectionSync = true;
-    drawCallProvider.update(drawCalls);
-    void delay(0).then(() => {
-        suppressDrawCallSelectionSync = false;
+    eventBrowserViewProvider.update(drawCalls);
+}
+
+async function activateDrawCallFromEventBrowser(context: vscode.ExtensionContext, drawCall: DrawCall): Promise<void> {
+    const selectedDrawCall = normalizeSelectedDrawCall(drawCall)
+        ?? normalizeSelectedDrawCall(findDrawCallByEventId(drawCall.eventId))
+        ?? drawCall;
+
+    currentSelectedDrawCall = selectedDrawCall;
+    eventBrowserViewProvider.setSelectedEvent(selectedDrawCall.eventId);
+
+    const label = selectedDrawCall.name || drawCall.name;
+    apiInspectorProvider.setEvent(selectedDrawCall.eventId, label).catch(() => {});
+    if (DrawOverlayPanel.currentPanel) {
+        DrawOverlayPanel.currentPanel.showEvent(selectedDrawCall.eventId, label).catch(() => {});
+    }
+
+    await showDrawCallDetails(context, {
+        eventId: drawCall.eventId,
+        drawCall,
+        label: drawCall.name,
     });
 }
 
@@ -477,6 +599,9 @@ function closeExclusiveRenderDocPanels(active: ExclusiveRenderDocPanel) {
 // in the same process after a prior replay was torn down.
 let bridgeLoadedCapturePath: string | undefined;
 const ALWAYS_REPLAY_LOCALLY_KEY = 'renderdoc.alwaysReplayLocally';
+let pendingReplayRecovery:
+    | { filePath: string; promise: Promise<boolean> }
+    | undefined;
 
 function getSupportedReplayHostTargets(): CaptureLaunchTarget[] {
     return launchTargetState.getDevices().filter((target) => target.supported);
@@ -521,6 +646,10 @@ async function syncReplayHostSelection(silent = true): Promise<string | undefine
     }
 
     const desiredUrl = getPreferredReplayHostUrl();
+    logRenderDocInfo('Syncing replay host selection.', {
+        desiredUrl: desiredUrl ?? '<local replay>',
+        silent,
+    });
 
     try {
         const currentHost = await bridge.nativeGetReplayHost();
@@ -528,6 +657,7 @@ async function syncReplayHostSelection(silent = true): Promise<string | undefine
             if (currentHost.connected) {
                 await bridge.nativeDisconnectReplayHost();
                 console.log('[RenderDoc] Cleared remote replay host selection.');
+                logRenderDocInfo('Cleared replay host selection.');
                 await launchTargetState.refreshReplayHost(bridge);
             }
             return undefined;
@@ -536,10 +666,14 @@ async function syncReplayHostSelection(silent = true): Promise<string | undefine
         if (!currentHost.connected || currentHost.url !== desiredUrl) {
             const connected = await bridge.nativeSetReplayHost(desiredUrl);
             console.log('[RenderDoc] Remote replay host ready:', JSON.stringify(connected));
+            logRenderDocInfo('Replay host synchronised.', connected);
             await launchTargetState.refreshReplayHost(bridge);
             if (!connected.connected) {
+                logRenderDocWarning('Selected replay host did not accept a remote replay connection.', {
+                    desiredUrl,
+                });
                 if (!silent) {
-                    vscode.window.showWarningMessage(
+                    showWarningWithDiagnostics(
                         `RenderDoc: the selected device did not accept a remote replay connection. Falling back to local replay.`
                     );
                 }
@@ -550,9 +684,13 @@ async function syncReplayHostSelection(silent = true): Promise<string | undefine
         return desiredUrl;
     } catch (error: any) {
         console.warn('[RenderDoc] Failed to sync remote replay host:', error?.message ?? String(error));
+        logRenderDocError('Failed to sync replay host selection.', {
+            desiredUrl: desiredUrl ?? '<local replay>',
+            error,
+        });
         await launchTargetState.refreshReplayHost(bridge);
         if (!silent) {
-            vscode.window.showWarningMessage(
+            showWarningWithDiagnostics(
                 `RenderDoc: failed to connect the selected remote replay host. Falling back to local replay. ` +
                 `(${error?.message ?? String(error)})`
             );
@@ -1000,16 +1138,23 @@ async function refreshLiveTargetState(): Promise<void> {
     await vscode.commands.executeCommand('setContext', 'renderdoc.liveTargetActive', !!launchTargetState.getLiveTarget());
 }
 
-function syncCaptureReplayDetails(overrides?: { mode?: 'none' | 'local' | 'remote'; hint?: string; recommendRemote?: boolean; allowReplayPromptReset?: boolean }) {
+function syncCaptureReplayDetails(overrides?: {
+    mode?: 'none' | 'local' | 'remote';
+    hostUrl?: string;
+    hint?: string;
+    recommendRemote?: boolean;
+    allowReplayPromptReset?: boolean;
+}) {
     const replayHost = launchTargetState.getReplayHost();
     const mode = overrides?.mode ?? (replayHost?.connected ? 'remote' : 'local');
-    const hostUrl = replayHost?.connected ? replayHost.url : undefined;
+    const hostUrl = overrides?.hostUrl ?? (replayHost?.connected ? replayHost.url : undefined);
+    currentReplayMode = mode;
     const hint = overrides?.hint;
     const recommendRemote = overrides?.recommendRemote ?? false;
     const allowReplayPromptReset = overrides?.allowReplayPromptReset ?? false;
     captureInfoProvider.setReplayDetails({
         mode,
-        hostUrl: replayHost?.connected ? replayHost.url : undefined,
+        hostUrl,
         hint,
         recommendRemote,
         allowReplayPromptReset,
@@ -1020,6 +1165,49 @@ function syncCaptureReplayDetails(overrides?: { mode?: 'none' | 'local' | 'remot
         hostUrl,
         hint,
         recommendRemote,
+    });
+    updateRemoteReplayKeepAlive();
+}
+
+async function handleReplayHostDisconnected(params: any): Promise<void> {
+    const url = typeof params?.url === 'string' && params.url.trim()
+        ? params.url.trim()
+        : undefined;
+    const errorMessage = typeof params?.error === 'string' && params.error.trim()
+        ? params.error.trim()
+        : 'Unknown error';
+    const hint = url
+        ? `Replay host '${url}' disconnected: ${errorMessage}`
+        : `Replay host disconnected: ${errorMessage}`;
+    const shouldRecover = !!currentCapturePath && captureInfoProvider.getReplayStatus() === 'active';
+
+    logRenderDocWarning('Replay host keep-alive reported disconnect.', {
+        url: url ?? '<unknown>',
+        error: errorMessage,
+        currentCapturePath: currentCapturePath ?? '<none>',
+        replayStatus: captureInfoProvider.getReplayStatus(),
+    });
+
+    await refreshLiveTargetState();
+
+    if (captureInfoProvider.getCaptureInfo()) {
+        captureInfoProvider.setReplayStatus('unavailable');
+        syncCaptureReplayDetails({
+            mode: 'remote',
+            hostUrl: url,
+            hint,
+            recommendRemote: currentCaptureSuggestsRemote,
+        });
+        InspectorPanel.currentPanel?.invalidateReplayCaches();
+    }
+
+    if (!shouldRecover || !currentCapturePath) {
+        return;
+    }
+
+    await recoverReplayForCurrentCapture(`Replay host keep-alive lost: ${errorMessage}`, {
+        force: true,
+        filePath: currentCapturePath,
     });
 }
 
@@ -1326,7 +1514,7 @@ async function promptForCaptureDisposition(context: vscode.ExtensionContext, cap
     return { finalPath: capturePath, saved: false };
 }
 
-async function captureFromLiveTarget(context: vscode.ExtensionContext) {
+async function captureFromLiveTarget(context: vscode.ExtensionContext, presetTrigger?: CaptureTriggerOptions) {
     try {
         const liveTarget = launchTargetState.getLiveTarget();
         if (!liveTarget) {
@@ -1334,13 +1522,16 @@ async function captureFromLiveTarget(context: vscode.ExtensionContext) {
             return;
         }
 
-        const stored = context.workspaceState.get<CaptureTriggerOptions>(LAST_TRIGGER_CAPTURE_STATE_KEY);
-        const triggerOptions = await promptForCaptureTrigger(stored);
+        const stored = getCaptureTriggerState(context);
+        const triggerOptions = presetTrigger
+            ? normalizeCaptureTriggerOptions(presetTrigger)
+            : await promptForCaptureTrigger(stored);
         if (!triggerOptions) {
             return;
         }
 
         await context.workspaceState.update(LAST_TRIGGER_CAPTURE_STATE_KEY, triggerOptions);
+        syncLaunchApplicationPanelState(undefined, triggerOptions);
 
         const tempDir = getLiveCaptureTempDir(context);
         await fs.promises.mkdir(tempDir, { recursive: true });
@@ -1459,6 +1650,12 @@ async function runCaptureWithProgress<T extends LaunchCaptureResult>(
 }
 
 export async function activate(context: vscode.ExtensionContext) {
+    logRenderDocInfo('RenderDoc extension activating.', {
+        platform: process.platform,
+        arch: process.arch,
+        vscode: vscode.version,
+        workspaceFolders: vscode.workspace.workspaceFolders?.map((folder) => folder.name) ?? [],
+    });
     bridge = new RenderDocBridge();
     captureCache = new CaptureCache(context);
     launchTargetState = new LaunchTargetState(context);
@@ -1500,47 +1697,27 @@ export async function activate(context: vscode.ExtensionContext) {
 
     // Register TreeView providers
     captureInfoProvider = new CaptureInfoProvider();
-    drawCallProvider = new DrawCallProvider();
     apiInspectorProvider = new ApiInspectorProvider(bridge);
     resourceProvider = new ResourceProvider();
     const launchTargetViewProvider = new LaunchTargetViewProvider(
         launchTargetState,
         async () => { await launchTargetState.refresh(bridge); },
     );
+    eventBrowserViewProvider = new EventBrowserViewProvider(
+        async (drawCall) => activateDrawCallFromEventBrowser(context, drawCall),
+        async (drawCall) => viewShaderSource(context, { eventId: drawCall.eventId, drawCall }),
+        async (drawCall) => viewPipelineState(context, { eventId: drawCall.eventId, drawCall }),
+    );
 
-    const drawCallTreeView = vscode.window.createTreeView('renderdoc-drawCalls', {
-        treeDataProvider: drawCallProvider,
-        showCollapseAll: true,
+    context.subscriptions.push({
+        dispose: bridge.onNativeNotification('replayHostDisconnected', (params) => {
+            void handleReplayHostDisconnected(params);
+        }),
     });
+
     const resourceTreeView = vscode.window.createTreeView('renderdoc-resources', {
         treeDataProvider: resourceProvider,
         showCollapseAll: true,
-    });
-
-    drawCallTreeView.onDidChangeSelection(e => {
-        if (suppressDrawCallSelectionSync) {
-            return;
-        }
-        if (e.selection.length > 0) {
-            const item = e.selection[0] as any;
-            const selectedDrawCall = normalizeSelectedDrawCall(item.drawCall)
-                ?? normalizeSelectedDrawCall(findDrawCallByEventId(item.eventId));
-            currentSelectedDrawCall = selectedDrawCall ?? item.drawCall ?? {
-                label: item.label,
-                eventId: item.eventId,
-            };
-            if (InspectorPanel.currentPanel && typeof currentSelectedDrawCall?.eventId === 'number') {
-                InspectorPanel.currentPanel.setEvent(currentSelectedDrawCall.eventId, currentSelectedDrawCall);
-            }
-            if (typeof currentSelectedDrawCall?.eventId === 'number') {
-                const label = currentSelectedDrawCall.name || (typeof item.label === 'string' ? item.label : item.label?.label);
-                apiInspectorProvider.setEvent(currentSelectedDrawCall.eventId, label).catch(() => {});
-            }
-            if (DrawOverlayPanel.currentPanel && typeof currentSelectedDrawCall?.eventId === 'number') {
-                const label = currentSelectedDrawCall.name || (typeof item.label === 'string' ? item.label : item.label?.label);
-                DrawOverlayPanel.currentPanel.showEvent(currentSelectedDrawCall.eventId, label).catch(() => {});
-            }
-        }
     });
     resourceTreeView.onDidChangeSelection(e => {
         if (e.selection.length > 0) {
@@ -1557,12 +1734,12 @@ export async function activate(context: vscode.ExtensionContext) {
     context.subscriptions.push(
         vscode.window.registerTreeDataProvider('renderdoc-captureInfo', captureInfoProvider),
         vscode.window.registerTreeDataProvider('renderdoc-apiInspector', apiInspectorProvider),
+        vscode.window.registerWebviewViewProvider('renderdoc-drawCalls', eventBrowserViewProvider),
         vscode.window.registerWebviewViewProvider('renderdoc-launchTarget', launchTargetViewProvider),
         launchTargetState.onDidChange(() => {
             void vscode.commands.executeCommand('setContext', 'renderdoc.liveTargetActive', !!launchTargetState.getLiveTarget());
             syncLaunchApplicationPanelState();
         }),
-        drawCallTreeView,
         resourceTreeView
     );
 
@@ -1614,6 +1791,13 @@ export async function activate(context: vscode.ExtensionContext) {
         vscode.commands.registerCommand('renderdoc.tryLocalReplay', () => tryLocalReplay()),
         vscode.commands.registerCommand('renderdoc.useRecommendedReplayHost', (targetUrl) => useRecommendedReplayHost(context, targetUrl)),
         vscode.commands.registerCommand('renderdoc.enableRemoteReplayPrompts', () => enableRemoteReplayPrompts()),
+        vscode.commands.registerCommand('renderdoc.showDiagnosticsLog', () => {
+            showRenderDocDiagnostics();
+        }),
+        vscode.commands.registerCommand('renderdoc.copyDiagnosticsLog', async () => {
+            const count = await copyRecentRenderDocDiagnosticsToClipboard();
+            vscode.window.showInformationMessage(`RenderDoc: copied ${count} diagnostics line(s) to the clipboard.`);
+        }),
         vscode.commands.registerCommand('renderdoc.reinstallCopilotCustomizations', async () => {
             try {
                 await reinstallBundledCopilotCustomizations(context);
@@ -1635,7 +1819,7 @@ export async function activate(context: vscode.ExtensionContext) {
             await DrawOverlayPanel.createOrShow(context, bridge);
             const sel = currentSelectedDrawCall;
             if (DrawOverlayPanel.currentPanel && sel && typeof sel.eventId === 'number') {
-                DrawOverlayPanel.currentPanel.showEvent(sel.eventId, sel.label).catch(() => {});
+                DrawOverlayPanel.currentPanel.showEvent(sel.eventId, sel.name || sel.label).catch(() => {});
             }
         }),
         vscode.commands.registerCommand('renderdoc.fetchTimings', () => fetchTimings()),
@@ -1805,6 +1989,24 @@ function getLaunchFormState(context: vscode.ExtensionContext): LaunchFormState {
     };
 }
 
+function normalizeCaptureTriggerOptions(options?: Partial<CaptureTriggerOptions>): LaunchCaptureTriggerState {
+    const trigger = options?.trigger === 'frame' || options?.trigger === 'delay' || options?.trigger === 'immediate'
+        ? options.trigger
+        : 'immediate';
+    const frameNumber = Number(options?.frameNumber);
+    const delaySeconds = Number(options?.delaySeconds);
+
+    return {
+        trigger,
+        frameNumber: Number.isFinite(frameNumber) && frameNumber > 0 ? Math.round(frameNumber) : 1,
+        delaySeconds: Number.isFinite(delaySeconds) && delaySeconds > 0 ? delaySeconds : 3,
+    };
+}
+
+function getCaptureTriggerState(context: vscode.ExtensionContext): LaunchCaptureTriggerState {
+    return normalizeCaptureTriggerOptions(context.workspaceState.get<CaptureTriggerOptions>(LAST_TRIGGER_CAPTURE_STATE_KEY));
+}
+
 function getLaunchApplicationPanelTarget(): { kind: 'local' } | { kind: 'device'; target?: CaptureLaunchTarget } {
     const selected = launchTargetState.getSelected();
     return selected.kind === 'local'
@@ -1812,13 +2014,14 @@ function getLaunchApplicationPanelTarget(): { kind: 'local' } | { kind: 'device'
         : { kind: 'device', target: launchTargetState.getSelectedTarget() };
 }
 
-function syncLaunchApplicationPanelState(form?: LaunchFormState) {
+function syncLaunchApplicationPanelState(form?: LaunchFormState, captureTrigger?: CaptureTriggerOptions) {
     if (!LaunchApplicationPanel.currentPanel) {
         return;
     }
 
     LaunchApplicationPanel.currentPanel.updateState({
         ...(form ? { form } : {}),
+        ...(captureTrigger ? { captureTrigger: normalizeCaptureTriggerOptions(captureTrigger) } : {}),
         target: getLaunchApplicationPanelTarget(),
         liveTarget: launchTargetState.getLiveTarget(),
         recentCaptures: launchTargetState.getRecentCaptures(),
@@ -1832,15 +2035,21 @@ function syncLaunchApplicationPanelState(form?: LaunchFormState) {
 async function openLaunchApplication(context: vscode.ExtensionContext) {
     await bridge.ensureNativeBridgeReady();
     const form = getLaunchFormState(context);
-    LaunchApplicationPanel.createOrShow(context, form, {
+    const captureTrigger = getCaptureTriggerState(context);
+    LaunchApplicationPanel.createOrShow(context, form, captureTrigger, {
         onLaunch: async (form) => {
             await launchProgramAndCaptureFromForm(context, form);
         },
         onAttach: async () => {
             await attachProcessAndCapture(context);
         },
-        onCapture: async () => {
-            await captureFromLiveTarget(context);
+        onCapture: async (trigger) => {
+            await captureFromLiveTarget(context, trigger);
+        },
+        onCaptureTriggerChanged: async (trigger) => {
+            const normalized = normalizeCaptureTriggerOptions(trigger);
+            await context.workspaceState.update(LAST_TRIGGER_CAPTURE_STATE_KEY, normalized);
+            syncLaunchApplicationPanelState(undefined, normalized);
         },
         onDisconnect: async () => {
             await disconnectLiveTarget();
@@ -1876,7 +2085,7 @@ async function openLaunchApplication(context: vscode.ExtensionContext) {
             await clearSavedCaptures(context);
         },
     });
-    syncLaunchApplicationPanelState(form);
+    syncLaunchApplicationPanelState(form, captureTrigger);
 }
 
 async function launchProgramAndCaptureFromForm(context: vscode.ExtensionContext, form: LaunchFormState) {
@@ -2051,12 +2260,15 @@ function closeCapture() {
     // Clear state
     currentCapturePath = undefined;
     currentCaptureSuggestsRemote = false;
+    currentReplayMode = 'none';
+    stopRemoteReplayKeepAlive();
     bridgeLoadedCapturePath = undefined;
     currentSelectedDrawCall = undefined;
     currentSelectedResource = undefined;
     currentDrawCalls = [];
     currentResources = [];
     shaderAliasScanGeneration += 1;
+    eventBrowserViewProvider.setSelectedEvent(undefined);
 
     // Shut down the bridge to cleanly release all memory and file locks
     console.log('[RenderDoc] User requested close capture; killing bridge.');
@@ -2180,6 +2392,14 @@ async function loadCapture(context: vscode.ExtensionContext, filePath: string, s
     }
     console.log('[RenderDoc] loadCapture called:', filePath, 'silent:', silent);
     console.log('[RenderDoc] hasNativeBridge:', bridge.hasNativeBridge());
+    logRenderDocInfo('Loading capture.', {
+        filePath,
+        silent,
+        bridgeAlive: bridge.hasNativeBridge(),
+        selectedTarget: launchTargetState.getSelected().kind === 'device'
+            ? launchTargetState.getSelectedTarget()?.url
+            : 'local',
+    });
 
     // ── Fast path: serve from cache ──────────────────────────────────────
     // If we've previously loaded this exact rdc (same path, mtime, size),
@@ -2260,9 +2480,11 @@ async function loadCapture(context: vscode.ExtensionContext, filePath: string, s
             });
         } catch (err: any) {
             console.error('[RenderDoc] nativeOpenCapture error:', err.message);
+            logRenderDocError('nativeOpenCapture failed during loadCapture.', err);
         }
     } else {
         console.log('[RenderDoc] No native bridge available');
+        logRenderDocWarning('No native bridge available while loading capture.', { filePath });
     }
 
     if (nativeResult) {
@@ -2386,9 +2608,15 @@ async function loadCapture(context: vscode.ExtensionContext, filePath: string, s
                         });
                         replayReady = false;
                         replayFailureReason = tryResult?.replayError || nativeResult.replayMessage || 'Unknown error';
+                        logRenderDocWarning('Automatic tryReplay reported failure.', {
+                            filePath,
+                            replayHostUrl: replayHostUrl ?? '<local replay>',
+                            replayFailureReason,
+                            replayRemote: tryResult?.replayRemote || nativeResult.replayRemote,
+                        });
                         if (!silent) {
                             const label = tryResult?.replayRemote || nativeResult.replayRemote ? 'remote replay' : 'local replay';
-                            vscode.window.showWarningMessage(`RenderDoc: ${label} failed — ${replayFailureReason}`);
+                            showWarningWithDiagnostics(`RenderDoc: ${label} failed — ${replayFailureReason}`);
                         }
                     }
                 } catch (err: any) {
@@ -2404,6 +2632,11 @@ async function loadCapture(context: vscode.ExtensionContext, filePath: string, s
                         replayReady = false;
                     } else {
                         console.warn('[RenderDoc] tryReplay crashed:', err?.message);
+                        logRenderDocError('Automatic tryReplay crashed.', {
+                            filePath,
+                            replayHostUrl: replayHostUrl ?? '<local replay>',
+                            error: err,
+                        });
                         captureInfoProvider.setReplayStatus('failed');
                         syncCaptureReplayDetails({
                             mode: replayHostUrl ? 'remote' : 'local',
@@ -2417,7 +2650,7 @@ async function loadCapture(context: vscode.ExtensionContext, filePath: string, s
                             silent: true,
                         });
                         if (!silent) {
-                            vscode.window.showWarningMessage(
+                            showWarningWithDiagnostics(
                                 `RenderDoc: replay initialisation failed — ${err?.message || err}. ` +
                                 `Basic capture metadata and thumbnail are still available.`
                             );
@@ -2571,33 +2804,39 @@ async function showThumbnail(context: vscode.ExtensionContext) {
     }
 }
 
+async function reloadCaptureData(filePath: string, recoveryReason: string): Promise<CaptureInfo> {
+    currentCapturePath = filePath;
+
+    const captureInfo = await bridge.getCaptureInfo(filePath);
+    captureInfoProvider.update(captureInfo);
+
+    const replayData = await loadReplayDataWithRecovery(filePath, recoveryReason);
+    const drawCalls = replayData.drawCalls;
+    currentDrawCalls = drawCalls;
+    updateDrawCallTree(drawCalls);
+
+    const resources = replayData.resources;
+    currentResources = resources;
+    resourceProvider.update(resources);
+
+    await enrichCaptureInfoWithStatistics(captureInfo);
+    captureInfoProvider.update(captureInfo);
+    if (InspectorPanel.currentPanel) {
+        InspectorPanel.currentPanel.setCapture(captureInfo, drawCalls, resources);
+    }
+    void startShaderAliasScan(captureInfo, drawCalls, resources);
+    return captureInfo;
+}
+
 async function refreshCapture() {
     const info = captureInfoProvider.getCaptureInfo();
     if (!info) {
         vscode.window.showWarningMessage('No capture file loaded.');
         return;
     }
-    currentCapturePath = info.filePath;
 
     try {
-        const captureInfo = await bridge.getCaptureInfo(info.filePath);
-        captureInfoProvider.update(captureInfo);
-
-        const replayData = await loadReplayDataWithRecovery(info.filePath, 'refresh capture');
-        const drawCalls = replayData.drawCalls;
-        currentDrawCalls = drawCalls;
-        updateDrawCallTree(drawCalls);
-
-        const resources = replayData.resources;
-        currentResources = resources;
-        resourceProvider.update(resources);
-
-        await enrichCaptureInfoWithStatistics(captureInfo);
-        captureInfoProvider.update(captureInfo);
-        if (InspectorPanel.currentPanel) {
-            InspectorPanel.currentPanel.setCapture(captureInfo, drawCalls, resources);
-        }
-        void startShaderAliasScan(captureInfo, drawCalls, resources);
+        await reloadCaptureData(info.filePath, 'refresh capture');
     } catch (error: any) {
         const message = error?.message || String(error);
         if (shouldRecoverReplayError(error)) {
@@ -2675,6 +2914,7 @@ async function showDrawCallDetails(context: vscode.ExtensionContext, item: any) 
     const normalizedDrawCall = normalizeSelectedDrawCall(item.drawCall)
         ?? normalizeSelectedDrawCall(findDrawCallByEventId(item.eventId));
     const resolvedEventId = normalizedDrawCall?.eventId ?? item.eventId;
+    eventBrowserViewProvider.setSelectedEvent(resolvedEventId);
 
     closeExclusiveRenderDocPanels('inspector');
 
@@ -2918,6 +3158,11 @@ async function tryLocalReplay() {
         vscode.window.showWarningMessage('No capture file loaded.');
         return;
     }
+    logRenderDocInfo('Manual tryLocalReplay requested.', {
+        currentCapturePath,
+        bridgeAlive: bridge.hasNativeBridge(),
+        bridgeLoadedCapturePath,
+    });
     // Auto-recover: the bridge process may have died (e.g. from a previous
     // replay crash). If the binary is installed, transparently restart it
     // and re-open the capture before proceeding.
@@ -2946,7 +3191,7 @@ async function tryLocalReplay() {
         
         // Give the process a moment to spawn; hasNativeBridge() flips synchronously on spawn.
         if (!bridge.hasNativeBridge()) {
-            vscode.window.showWarningMessage(
+            showWarningWithDiagnostics(
                 'Failed to start the native bridge process. Check the Extension Host log for [RenderDoc] errors.'
             );
             return;
@@ -2954,7 +3199,8 @@ async function tryLocalReplay() {
         await syncReplayHostSelection(false);
         try { await bridge.nativeOpenCapture(currentCapturePath); }
         catch (err: any) {
-            vscode.window.showWarningMessage(`Native bridge restarted but failed to open capture: ${err.message}`);
+            logRenderDocError('Manual tryLocalReplay failed to re-open capture after bridge restart.', err);
+            showWarningWithDiagnostics(`Native bridge restarted but failed to open capture: ${err.message}`);
             return;
         }
         bridgeLoadedCapturePath = currentCapturePath;
@@ -3017,6 +3263,16 @@ async function tryLocalReplay() {
                         allowReplayPromptReset: currentCaptureSuggestsRemote && shouldAlwaysReplayLocally(),
                     });
                     InspectorPanel.currentPanel?.invalidateReplayCaches();
+                    progress.report({ message: 'Reloading capture data...' });
+                    try {
+                        await reloadCaptureData(currentCapturePath!, 'manual replay refresh');
+                    } catch (reloadError: any) {
+                        const reloadMessage = reloadError?.message || String(reloadError);
+                        vscode.window.showWarningMessage(
+                            `RenderDoc: replay started, but refreshing draw calls/resources failed - ${reloadMessage}`
+                        );
+                        return;
+                    }
                     if (result.replayRemote && result.replayHost) {
                         vscode.window.showInformationMessage(`Remote replay active on ${result.replayHost}. Shader/pipeline/texture features are now available.`);
                     } else {
@@ -3031,7 +3287,13 @@ async function tryLocalReplay() {
                         allowReplayPromptReset: currentCaptureSuggestsRemote && shouldAlwaysReplayLocally(),
                     });
                     const label = result?.replayRemote ? 'Remote replay' : 'Local replay';
-                    vscode.window.showWarningMessage(`${label} failed: ${result?.replayError || 'Unknown error'}`);
+                    logRenderDocWarning('Manual tryLocalReplay reported failure.', {
+                        currentCapturePath,
+                        replayHostUrl: replayHostUrl ?? '<local replay>',
+                        replayError: result?.replayError || 'Unknown error',
+                        replayRemote: result?.replayRemote,
+                    });
+                    showWarningWithDiagnostics(`${label} failed: ${result?.replayError || 'Unknown error'}`);
                 }
             } catch (err: any) {
                 if (cancelled) {
@@ -3052,11 +3314,16 @@ async function tryLocalReplay() {
                     allowReplayPromptReset: currentCaptureSuggestsRemote && shouldAlwaysReplayLocally(),
                 });
                 console.log('[RenderDoc] tryLocalReplay crashed, resetting bridge state...');
+                logRenderDocError('Manual tryLocalReplay crashed.', {
+                    currentCapturePath,
+                    replayHostUrl: replayHostUrl ?? '<local replay>',
+                    error: err,
+                });
                 await restartBridgeAfterReplayCrash('manual tryLocalReplay', {
                     reopenCapturePath: currentCapturePath!,
                     silent: true,
                 });
-                vscode.window.showWarningMessage(
+                showWarningWithDiagnostics(
                     replayHostUrl
                         ? 'Remote replay failed — inspection features are disabled for this capture until replay is restored.'
                         : 'Local replay crashed — this capture cannot be replayed on this GPU. Inspection features are disabled for this capture.'

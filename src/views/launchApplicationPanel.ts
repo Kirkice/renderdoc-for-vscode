@@ -7,6 +7,12 @@ export interface LaunchFormState {
     cmdLine: string;
 }
 
+export interface LaunchCaptureTriggerState {
+  trigger: 'immediate' | 'frame' | 'delay';
+  frameNumber: number;
+  delaySeconds: number;
+}
+
 type LaunchPanelTarget =
     | { kind: 'local' }
     | { kind: 'device'; target?: CaptureLaunchTarget };
@@ -17,7 +23,8 @@ type LaunchPanelMessage =
     | { type: 'browseAndroidPackage'; value: string }
     | { type: 'launch'; form: LaunchFormState }
     | { type: 'attach' }
-    | { type: 'capture' }
+  | { type: 'capture'; trigger: LaunchCaptureTriggerState }
+  | { type: 'updateCaptureTrigger'; trigger: LaunchCaptureTriggerState }
     | { type: 'disconnect' }
     | { type: 'clearSavedCaptures' }
     | { type: 'openCapture'; captureId: string }
@@ -27,6 +34,7 @@ type LaunchPanelMessage =
 interface LaunchPanelViewState {
     target: LaunchPanelTarget;
     form: LaunchFormState;
+  captureTrigger: LaunchCaptureTriggerState;
     liveTarget?: LiveTargetInfo;
     recentCaptures: LiveCaptureEntry[];
     replayHost?: ReplayHostInfo;
@@ -46,10 +54,12 @@ export class LaunchApplicationPanel {
     public static createOrShow(
         context: vscode.ExtensionContext,
         initialForm: LaunchFormState,
+      initialCaptureTrigger: LaunchCaptureTriggerState,
         handlers: {
             onLaunch: (form: LaunchFormState) => Promise<void>;
             onAttach: () => Promise<void>;
-            onCapture: () => Promise<void>;
+        onCapture: (trigger: LaunchCaptureTriggerState) => Promise<void>;
+        onCaptureTriggerChanged: (trigger: LaunchCaptureTriggerState) => Promise<void>;
             onDisconnect: () => Promise<void>;
             onBrowseExecutable: () => Promise<string | undefined>;
             onBrowseAndroidPackage: (value: string) => Promise<string | undefined>;
@@ -62,7 +72,7 @@ export class LaunchApplicationPanel {
         const column = vscode.ViewColumn.Beside;
         if (LaunchApplicationPanel.currentPanel) {
             LaunchApplicationPanel.currentPanel.panel.reveal(column, true);
-            LaunchApplicationPanel.currentPanel.updateState({ form: initialForm });
+          LaunchApplicationPanel.currentPanel.updateState({ form: initialForm, captureTrigger: initialCaptureTrigger });
             return LaunchApplicationPanel.currentPanel;
         }
 
@@ -73,17 +83,19 @@ export class LaunchApplicationPanel {
             { enableScripts: true, retainContextWhenHidden: true },
         );
 
-        LaunchApplicationPanel.currentPanel = new LaunchApplicationPanel(panel, initialForm, handlers);
+        LaunchApplicationPanel.currentPanel = new LaunchApplicationPanel(panel, initialForm, initialCaptureTrigger, handlers);
         return LaunchApplicationPanel.currentPanel;
     }
 
     private constructor(
         panel: vscode.WebviewPanel,
         initialForm: LaunchFormState,
+        initialCaptureTrigger: LaunchCaptureTriggerState,
         private readonly handlers: {
             onLaunch: (form: LaunchFormState) => Promise<void>;
             onAttach: () => Promise<void>;
-            onCapture: () => Promise<void>;
+          onCapture: (trigger: LaunchCaptureTriggerState) => Promise<void>;
+          onCaptureTriggerChanged: (trigger: LaunchCaptureTriggerState) => Promise<void>;
             onDisconnect: () => Promise<void>;
             onBrowseExecutable: () => Promise<string | undefined>;
             onBrowseAndroidPackage: (value: string) => Promise<string | undefined>;
@@ -97,6 +109,7 @@ export class LaunchApplicationPanel {
         this.state = {
             target: { kind: 'local' },
             form: initialForm,
+          captureTrigger: initialCaptureTrigger,
             recentCaptures: [],
         };
 
@@ -112,6 +125,7 @@ export class LaunchApplicationPanel {
             ...this.state,
             ...partial,
             form: partial.form ?? this.state.form,
+        captureTrigger: partial.captureTrigger ?? this.state.captureTrigger,
             recentCaptures: partial.recentCaptures ?? this.state.recentCaptures,
         };
         void this.pushState();
@@ -148,7 +162,12 @@ export class LaunchApplicationPanel {
                 await this.handlers.onAttach();
                 break;
             case 'capture':
-                await this.handlers.onCapture();
+              this.updateState({ captureTrigger: message.trigger });
+              await this.handlers.onCapture(message.trigger);
+              break;
+            case 'updateCaptureTrigger':
+              this.updateState({ captureTrigger: message.trigger });
+              await this.handlers.onCaptureTriggerChanged(message.trigger);
                 break;
             case 'disconnect':
                 await this.handlers.onDisconnect();
@@ -450,6 +469,55 @@ export class LaunchApplicationPanel {
     .actionGrid {
       grid-template-columns: repeat(2, minmax(0, 1fr));
     }
+    .triggerBlock {
+      display: grid;
+      gap: 12px;
+      margin: 0 0 14px;
+      padding: 14px;
+      border: 1px solid rgba(133, 152, 173, 0.16);
+      border-radius: 14px;
+      background: rgba(12, 16, 21, 0.36);
+    }
+    .triggerGrid {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 10px;
+    }
+    .triggerChoice {
+      min-height: 0;
+      padding: 12px 14px;
+      display: grid;
+      gap: 6px;
+      align-content: start;
+      text-align: left;
+      background: rgba(133, 152, 173, 0.06);
+      border-color: rgba(133, 152, 173, 0.18);
+      color: #eff4f8;
+    }
+    .triggerChoice.active {
+      background: rgba(112, 208, 198, 0.16);
+      border-color: rgba(112, 208, 198, 0.36);
+      box-shadow: inset 0 0 0 1px rgba(112, 208, 198, 0.08);
+    }
+    .triggerChoiceTitle {
+      font-size: 13px;
+      font-weight: 700;
+      line-height: 1.25;
+    }
+    .triggerChoiceCopy {
+      font-size: 12px;
+      line-height: 1.45;
+      color: var(--text-dim);
+      font-weight: 500;
+    }
+    .triggerChoice.active .triggerChoiceCopy {
+      color: rgba(239, 251, 248, 0.9);
+    }
+    .triggerInputGrid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 12px;
+    }
     .captureList {
       gap: 10px;
     }
@@ -497,6 +565,10 @@ export class LaunchApplicationPanel {
         grid-column: span 12;
       }
       .actionGrid {
+        grid-template-columns: 1fr;
+      }
+      .triggerGrid,
+      .triggerInputGrid {
         grid-template-columns: 1fr;
       }
       .sectionHeader,
@@ -584,12 +656,44 @@ export class LaunchApplicationPanel {
           <div class="sectionText">Launch or attach on the selected target, then capture a frame when the live session is ready.</div>
         </div>
       </div>
+      <div class="triggerBlock">
+        <div>
+          <div class="summaryLabel">Capture Trigger</div>
+          <div class="fieldNote">Choose when Capture Frame should fire after the live target control connection is ready.</div>
+        </div>
+        <div id="triggerGrid" class="triggerGrid">
+          <button type="button" class="triggerChoice" data-trigger="immediate">
+            <span class="triggerChoiceTitle">Capture Immediately</span>
+            <span class="triggerChoiceCopy">Trigger a capture right after the target control connection is established.</span>
+          </button>
+          <button type="button" class="triggerChoice" data-trigger="frame">
+            <span class="triggerChoiceTitle">Capture On Frame Number</span>
+            <span class="triggerChoiceCopy">Queue a capture for a specific frame number after launch or attach.</span>
+          </button>
+          <button type="button" class="triggerChoice" data-trigger="delay">
+            <span class="triggerChoiceTitle">Capture After Delay</span>
+            <span class="triggerChoiceCopy">Wait a few seconds after launch or attach, then trigger a capture.</span>
+          </button>
+        </div>
+        <div class="triggerInputGrid">
+          <div id="frameNumberRow" class="field hidden">
+            <label for="frameNumber">Frame Number</label>
+            <input id="frameNumber" type="number" min="1" step="1" />
+            <div class="fieldNote">Capture when the connected application reaches this frame number.</div>
+          </div>
+          <div id="delaySecondsRow" class="field hidden">
+            <label for="delaySeconds">Delay Seconds</label>
+            <input id="delaySeconds" type="number" min="0.1" step="0.1" />
+            <div class="fieldNote">Delay capture by this many seconds after launch or attach completes.</div>
+          </div>
+        </div>
+      </div>
       <div id="statusArea"></div>
       <div class="actionGrid">
         <button id="launchButton">Launch Target</button>
-        <button id="attachButton" class="secondary">Attach To Process</button>
-        <button id="captureButton" class="secondary">Capture Frame</button>
-        <button id="disconnectButton" class="secondary danger">Disconnect</button>
+        <button id="attachButton">Attach To Process</button>
+        <button id="captureButton">Capture Frame</button>
+        <button id="disconnectButton" class="danger">Disconnect</button>
       </div>
     </div>
 
@@ -636,6 +740,11 @@ export class LaunchApplicationPanel {
       captureButton: document.getElementById('captureButton'),
       disconnectButton: document.getElementById('disconnectButton'),
       clearSavedCaptures: document.getElementById('clearSavedCaptures'),
+      triggerGrid: document.getElementById('triggerGrid'),
+      frameNumberRow: document.getElementById('frameNumberRow'),
+      delaySecondsRow: document.getElementById('delaySecondsRow'),
+      frameNumber: document.getElementById('frameNumber'),
+      delaySeconds: document.getElementById('delaySeconds'),
       workingDirRow: document.getElementById('workingDirRow'),
       androidRow: document.getElementById('androidRow'),
       statusArea: document.getElementById('statusArea'),
@@ -668,6 +777,71 @@ export class LaunchApplicationPanel {
       };
     }
 
+    let currentCaptureTrigger = {
+      trigger: 'immediate',
+      frameNumber: 1,
+      delaySeconds: 3,
+    };
+
+    function clampPositive(value, fallback, integerOnly) {
+      const parsed = Number(value);
+      if (!Number.isFinite(parsed) || parsed <= 0) {
+        return fallback;
+      }
+      if (integerOnly) {
+        return Math.max(1, Math.round(parsed));
+      }
+      return parsed;
+    }
+
+    function normalizeCaptureTrigger(trigger) {
+      const normalizedTrigger = trigger && ['immediate', 'frame', 'delay'].includes(trigger.trigger)
+        ? trigger.trigger
+        : 'immediate';
+      return {
+        trigger: normalizedTrigger,
+        frameNumber: clampPositive(trigger && trigger.frameNumber, currentCaptureTrigger.frameNumber || 1, true),
+        delaySeconds: clampPositive(trigger && trigger.delaySeconds, currentCaptureTrigger.delaySeconds || 3, false),
+      };
+    }
+
+    function describeCaptureTrigger(trigger) {
+      if (trigger.trigger === 'frame') {
+        return 'Capture Frame will queue a capture for frame ' + trigger.frameNumber + ' once the live session is ready.';
+      }
+      if (trigger.trigger === 'delay') {
+        return 'Capture Frame will trigger ' + trigger.delaySeconds + ' second' + (trigger.delaySeconds === 1 ? '' : 's') + ' after the live session is ready.';
+      }
+      return 'Capture Frame will trigger immediately after the live session is ready.';
+    }
+
+    function postCaptureTriggerUpdate() {
+      currentCaptureTrigger = collectCaptureTrigger();
+      vscode.postMessage({ type: 'updateCaptureTrigger', trigger: currentCaptureTrigger });
+    }
+
+    function collectCaptureTrigger() {
+      return normalizeCaptureTrigger({
+        trigger: currentCaptureTrigger.trigger,
+        frameNumber: el.frameNumber.value,
+        delaySeconds: el.delaySeconds.value,
+      });
+    }
+
+    function applyCaptureTrigger(trigger, notify) {
+      currentCaptureTrigger = normalizeCaptureTrigger(trigger);
+      el.frameNumber.value = String(currentCaptureTrigger.frameNumber);
+      el.delaySeconds.value = String(currentCaptureTrigger.delaySeconds);
+      el.frameNumberRow.classList.toggle('hidden', currentCaptureTrigger.trigger !== 'frame');
+      el.delaySecondsRow.classList.toggle('hidden', currentCaptureTrigger.trigger !== 'delay');
+      el.triggerGrid.querySelectorAll('[data-trigger]').forEach((button) => {
+        button.classList.toggle('active', button.getAttribute('data-trigger') === currentCaptureTrigger.trigger);
+      });
+      if (notify) {
+        postCaptureTriggerUpdate();
+      }
+    }
+
     function bindCaptureButtons() {
       el.capturesList.querySelectorAll('[data-action]').forEach((button) => {
         button.addEventListener('click', () => {
@@ -689,6 +863,7 @@ export class LaunchApplicationPanel {
       const statusNote = typeof payload.statusNote === 'string' ? payload.statusNote : '';
       const bridgeVersion = typeof payload.bridgeVersion === 'string' ? payload.bridgeVersion : '';
       const sessionHint = typeof payload.sessionHint === 'string' ? payload.sessionHint : '';
+      const captureTrigger = normalizeCaptureTrigger(payload.captureTrigger || currentCaptureTrigger);
 
       const isLocal = target.kind === 'local';
       const targetName = isLocal ? 'Local Workspace' : (target.target?.name || target.target?.id || 'Remote Device');
@@ -718,14 +893,16 @@ export class LaunchApplicationPanel {
         el.sessionBadge.className = 'badge';
       }
 
+        applyCaptureTrigger(captureTrigger, false);
+
       el.captureButton.disabled = !liveTarget;
       el.disconnectButton.disabled = !liveTarget;
 
       el.statusArea.innerHTML = statusNote
         ? '<div class="notice">' + escapeHtml(statusNote) + '</div>'
         : '<div class="empty">' + escapeHtml(liveTarget
-            ? 'Capture Frame grabs a frame from the current live session.'
-            : 'Launch or attach first, then Capture Frame becomes available.') + '</div>';
+          ? describeCaptureTrigger(captureTrigger)
+          : 'Choose a capture trigger below. Launch or attach first, then Capture Frame becomes available.') + '</div>';
 
       if (recentCaptures.length) {
         el.capturesList.innerHTML = recentCaptures.map((capture) => {
@@ -766,7 +943,21 @@ export class LaunchApplicationPanel {
     el.browseAndroidPackage.addEventListener('click', () => vscode.postMessage({ type: 'browseAndroidPackage', value: el.executable.value }));
     el.launchButton.addEventListener('click', () => vscode.postMessage({ type: 'launch', form: collectForm() }));
     el.attachButton.addEventListener('click', () => vscode.postMessage({ type: 'attach' }));
-    el.captureButton.addEventListener('click', () => vscode.postMessage({ type: 'capture' }));
+    el.triggerGrid.querySelectorAll('[data-trigger]').forEach((button) => {
+      button.addEventListener('click', () => {
+        applyCaptureTrigger({
+          ...collectCaptureTrigger(),
+          trigger: button.getAttribute('data-trigger'),
+        }, true);
+      });
+    });
+    el.frameNumber.addEventListener('change', () => {
+      applyCaptureTrigger(collectCaptureTrigger(), true);
+    });
+    el.delaySeconds.addEventListener('change', () => {
+      applyCaptureTrigger(collectCaptureTrigger(), true);
+    });
+    el.captureButton.addEventListener('click', () => vscode.postMessage({ type: 'capture', trigger: collectCaptureTrigger() }));
     el.disconnectButton.addEventListener('click', () => vscode.postMessage({ type: 'disconnect' }));
     el.clearSavedCaptures.addEventListener('click', () => vscode.postMessage({ type: 'clearSavedCaptures' }));
 

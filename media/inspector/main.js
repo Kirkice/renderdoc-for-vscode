@@ -171,22 +171,13 @@
     }
 
     function renderMaliAnalysisResult(message) {
-        const outDom = document.getElementById('mali-offline-result');
-        if (!outDom) {
-            return;
+        if (maliModalEl && !maliModalEl.hidden) {
+            renderMaliAnalysisModal();
         }
+    }
 
-        if (message && message.notConfigured) {
-            outDom.classList.add('empty-state');
-            outDom.innerHTML = renderMaliAnalysisPlaceholder(
-                'Mali Offline Compiler is not configured.',
-                message.hint || 'Set renderdoc.maliOfflineCompilerPath in VS Code Settings, then run Mali Analyze again.'
-            );
-            return;
-        }
-
-        outDom.classList.remove('empty-state');
-        outDom.textContent = message && message.error ? message.error : ((message && message.result) || '');
+    function openMaliOfflineSettings() {
+        vscode.postMessage({ type: 'openMaliOfflineSettings' });
     }
 
     function shaderMaliAnalysisKey(eventId, stage, resourceId) {
@@ -234,33 +225,51 @@
     }
 
     function getMaliAnalyzeAvailability(selectedFileIndex, source, eventId, stage, resourceId) {
-        if (getPendingMaliAnalysisForShader(eventId, stage, resourceId)) {
+        const configured = !!state.maliOfflineCompilerConfigured;
+        const pending = !!getPendingMaliAnalysisForShader(eventId, stage, resourceId);
+        if (!configured) {
+            const hint = state.maliOfflineCompilerHint || 'Set renderdoc.maliOfflineCompilerPath in VS Code Settings to enable Mali Offline Compiler analysis.';
             return {
-                disabled: true,
-                title: 'Mali Offline Compiler analysis is already running for this shader stage',
+                configured: false,
+                canAnalyze: false,
+                pending: false,
+                title: hint,
+                reason: hint,
             };
         }
-        if (!state.maliOfflineCompilerConfigured) {
+        if (pending) {
             return {
-                disabled: true,
-                title: state.maliOfflineCompilerHint || 'Set renderdoc.maliOfflineCompilerPath in VS Code Settings to enable Mali Offline Compiler analysis.',
+                configured: true,
+                canAnalyze: false,
+                pending: true,
+                title: 'Mali Offline Compiler analysis is already running for this shader stage',
+                reason: 'Analysis is already running for this shader stage.',
             };
         }
         if (selectedFileIndex === -1) {
             return {
-                disabled: true,
-                title: 'Switch to a source file tab to analyze source code',
+                configured: true,
+                canAnalyze: false,
+                pending: false,
+                title: 'Open Mali Offline Compiler analysis window',
+                reason: 'Switch to a source file tab to analyze source code.',
             };
         }
         if (!source || !source.trim()) {
             return {
-                disabled: true,
-                title: 'No shader source is available to analyze',
+                configured: true,
+                canAnalyze: false,
+                pending: false,
+                title: 'Open Mali Offline Compiler analysis window',
+                reason: 'No shader source is available to analyze.',
             };
         }
         return {
-            disabled: false,
-            title: 'Analyze performance with Mali Offline Compiler',
+            configured: true,
+            canAnalyze: true,
+            pending: false,
+            title: 'Open Mali Offline Compiler analysis window',
+            reason: '',
         };
     }
 
@@ -545,6 +554,269 @@
             signals: signals.filter((signal, index, all) => all.findIndex((entry) => entry.text === signal.text) === index),
             highlights,
         };
+    }
+
+    function getEmptyMaliAnalysisSummary() {
+        return { metrics: [], signals: [], highlights: [] };
+    }
+
+    function getActiveMaliAnalysisContext() {
+        const context = state.shaderEditorContext;
+        const activeStage = state.activeShaderStage;
+        if (!context || !activeStage) {
+            return null;
+        }
+        return {
+            eventId: state.eventId,
+            stage: activeStage,
+            resourceId: String(context.resourceId || ''),
+            source: String(context.currentCode || ''),
+            filename: context.currentFileName || (activeStage + '-shader'),
+            selectedFileIndex: typeof context.selectedFileIndex === 'number' ? context.selectedFileIndex : 0,
+        };
+    }
+
+    function buildMaliAnalysisPresentation(context) {
+        const availability = context
+            ? getMaliAnalyzeAvailability(
+                context.selectedFileIndex,
+                context.source,
+                context.eventId,
+                context.stage,
+                context.resourceId,
+            )
+            : {
+                configured: !!state.maliOfflineCompilerConfigured,
+                canAnalyze: false,
+                pending: false,
+                title: state.maliOfflineCompilerConfigured
+                    ? 'Open Mali Offline Compiler analysis window'
+                    : (state.maliOfflineCompilerHint || 'Set renderdoc.maliOfflineCompilerPath in VS Code Settings to enable Mali Offline Compiler analysis.'),
+                reason: state.maliOfflineCompilerConfigured
+                    ? 'Select an event and a source file in the Shaders tab to analyze it with Mali Offline Compiler.'
+                    : (state.maliOfflineCompilerHint || 'Set renderdoc.maliOfflineCompilerPath in VS Code Settings to enable Mali Offline Compiler analysis.'),
+            };
+
+        const pendingMaliAnalysis = context
+            ? getPendingMaliAnalysisForShader(context.eventId, context.stage, context.resourceId)
+            : null;
+        const maliRecord = context
+            ? getShaderMaliAnalysisRecord(context.eventId, context.stage, context.resourceId)
+            : null;
+        const maliIsStale = !!(maliRecord && context && maliRecord.source !== context.source);
+        const maliOutputText = getMaliAnalysisOutputText(maliRecord);
+        const maliSummary = maliOutputText ? parseMaliAnalysisSummary(maliOutputText) : getEmptyMaliAnalysisSummary();
+        const maliOutputLineCount = maliOutputText ? maliOutputText.split(/\r?\n/).length : 0;
+        const sourceMetrics = getShaderTextMetrics(context ? context.source : '');
+        const analysisSnapshotValue = context
+            ? (context.filename || (context.stage + '-shader'))
+            : 'No shader selected';
+
+        let analysisTone = 'neutral';
+        let analysisTitle = 'Ready to analyze';
+        let analysisCopy = 'Run Mali Analyze to populate static performance-oriented findings for this source snapshot.';
+        let analysisStatusValue = 'Ready';
+        let analysisPills = [{ text: 'Mali Offline Compiler', tone: 'info' }];
+        let analysisLines = [];
+        let analysisMetrics = [
+            {
+                label: 'Status',
+                value: analysisStatusValue,
+                meta: 'Static source analysis',
+            },
+            {
+                label: 'Snapshot',
+                value: analysisSnapshotValue,
+                meta: sourceMetrics.lines > 0 ? (formatCompactNumber(sourceMetrics.lines) + ' current lines') : 'No source text loaded',
+            },
+        ];
+
+        if (!context) {
+            analysisTitle = availability.configured ? 'No shader source selected' : 'Tool not configured';
+            analysisCopy = availability.reason;
+            analysisStatusValue = availability.configured ? 'Idle' : 'Unavailable';
+            if (availability.reason) {
+                analysisLines = [availability.reason];
+            }
+            if (!availability.configured) {
+                analysisPills.push({ text: 'Disabled', tone: 'neutral' });
+            }
+        } else if (!availability.configured) {
+            analysisTitle = 'Tool not configured';
+            analysisCopy = availability.reason;
+            analysisStatusValue = 'Unavailable';
+            analysisPills.push({ text: 'Disabled', tone: 'neutral' });
+        } else if (pendingMaliAnalysis) {
+            analysisTone = 'info';
+            analysisTitle = 'Analysis in progress';
+            analysisCopy = 'Mali Offline Compiler is processing the current source snapshot.';
+            analysisStatusValue = 'Running';
+            analysisPills.push({ text: 'Running', tone: 'info' });
+            analysisLines = ['Results will appear here when the analysis finishes.'];
+        } else if (maliRecord && maliRecord.error) {
+            analysisTone = maliIsStale ? 'warn' : 'danger';
+            analysisTitle = maliIsStale ? 'Last analysis failed and is stale' : 'Analysis failed';
+            analysisCopy = maliIsStale
+                ? 'The current source changed after the last failed Mali analysis run. Re-run the tool to refresh the status.'
+                : 'Mali Offline Compiler returned an error for the latest source snapshot.';
+            analysisStatusValue = maliIsStale ? 'Failed · Stale' : 'Failed';
+            analysisPills.push({ text: 'Failed', tone: 'danger' });
+            if (maliIsStale) analysisPills.push({ text: 'Stale', tone: 'warn' });
+            if (maliSummary.highlights.length === 0) {
+                const firstErrorLine = String(maliRecord.error || maliRecord.result || '').split(/\r?\n/).map((line) => normalizeMaliOutputLine(line)).find(Boolean);
+                if (firstErrorLine) analysisLines = [firstErrorLine];
+            } else {
+                analysisLines = maliSummary.highlights;
+            }
+        } else if (maliRecord) {
+            analysisTone = maliIsStale ? 'warn' : 'good';
+            analysisTitle = maliIsStale ? 'Analysis is stale' : 'Analysis available';
+            analysisCopy = maliIsStale
+                ? 'The current source differs from the snapshot that produced the latest Mali findings. Re-run the analysis to refresh them.'
+                : 'Latest Mali Offline Compiler findings are attached to this source snapshot.';
+            analysisStatusValue = maliIsStale ? 'Stale' : 'Available';
+            analysisPills.push({ text: maliIsStale ? 'Stale' : 'Available', tone: maliIsStale ? 'warn' : 'good' });
+            analysisLines = maliSummary.highlights.length > 0
+                ? maliSummary.highlights
+                : ['Full compiler output is available in this window.'];
+        }
+
+        if (availability.configured && availability.reason && !availability.canAnalyze && !pendingMaliAnalysis) {
+            if (!maliRecord) {
+                analysisTone = 'warn';
+                analysisTitle = 'Analysis unavailable';
+                analysisCopy = availability.reason;
+                analysisStatusValue = 'Blocked';
+                analysisLines = [availability.reason];
+            } else if (!analysisLines.includes(availability.reason)) {
+                analysisLines = [availability.reason].concat(analysisLines).slice(0, 4);
+            }
+        }
+
+        analysisMetrics[0].value = analysisStatusValue;
+        analysisMetrics[1].value = analysisSnapshotValue;
+        if (!pendingMaliAnalysis && maliRecord && maliSummary.signals.length > 0) {
+            analysisPills = analysisPills.concat(maliSummary.signals);
+        }
+        if (!pendingMaliAnalysis && maliRecord && maliSummary.metrics.length > 0) {
+            analysisMetrics = analysisMetrics.concat(maliSummary.metrics);
+        } else {
+            analysisMetrics.push({
+                label: 'Highlights',
+                value: formatCompactNumber(analysisLines.length),
+                meta: maliRecord ? 'Summary lines extracted from latest result' : 'Awaiting tool output',
+            });
+        }
+
+        const outputTone = pendingMaliAnalysis
+            ? 'info'
+            : (maliRecord && maliRecord.error)
+                ? (maliIsStale ? 'warn' : 'danger')
+                : (maliIsStale ? 'warn' : 'neutral');
+        const outputTitle = pendingMaliAnalysis
+            ? 'Compiler output pending'
+            : (maliRecord && maliRecord.error)
+                ? 'Compiler error output'
+                : maliRecord
+                    ? 'Complete compiler report'
+                    : 'No compiler output yet';
+        const outputCopy = pendingMaliAnalysis
+            ? 'Full stdout/stderr from Mali Offline Compiler will appear here when the current run completes.'
+            : maliRecord
+                ? 'This is the verbatim output captured from Mali Offline Compiler for the analyzed shader snapshot.'
+                : availability.configured
+                    ? 'Run analysis to capture the full compiler stdout/stderr for this shader snapshot.'
+                    : availability.reason;
+        const outputMetrics = maliOutputText
+            ? [
+                {
+                    label: 'Output Lines',
+                    value: formatCompactNumber(maliOutputLineCount),
+                    meta: 'Verbatim compiler stdout/stderr',
+                },
+                {
+                    label: 'Characters',
+                    value: formatCompactNumber(maliOutputText.length),
+                    meta: 'Captured report size',
+                },
+            ]
+            : [];
+        const outputText = pendingMaliAnalysis
+            ? 'Waiting for Mali Offline Compiler output…'
+            : (maliOutputText || (availability.configured ? 'No analysis output yet.' : availability.reason));
+
+        return {
+            context,
+            availability,
+            pendingMaliAnalysis,
+            maliRecord,
+            maliIsStale,
+            analysisTone,
+            analysisTitle,
+            analysisCopy,
+            analysisPills,
+            analysisMetrics,
+            analysisLines,
+            outputTone,
+            outputTitle,
+            outputCopy,
+            outputMetrics,
+            outputText,
+        };
+    }
+
+    function shouldAutoRunMaliAnalysis(presentation) {
+        return !!(
+            presentation
+            && presentation.context
+            && presentation.availability.configured
+            && presentation.availability.canAnalyze
+            && !presentation.pendingMaliAnalysis
+            && (!presentation.maliRecord || presentation.maliIsStale || presentation.maliRecord.error)
+        );
+    }
+
+    function startMaliAnalysisForContext(context) {
+        if (!context) return false;
+
+        const availability = getMaliAnalyzeAvailability(
+            context.selectedFileIndex,
+            context.source,
+            context.eventId,
+            context.stage,
+            context.resourceId,
+        );
+
+        if (!availability.configured) {
+            openMaliOfflineSettings();
+            return false;
+        }
+        if (!availability.canAnalyze || availability.pending) {
+            return false;
+        }
+
+        state.pendingMaliAnalysis = {
+            eventId: context.eventId,
+            stage: context.stage,
+            resourceId: context.resourceId,
+            filename: context.filename,
+            source: context.source,
+            startedAt: Date.now(),
+        };
+
+        if (state.activeTab === 'shaders') {
+            renderShaders();
+        }
+        if (maliModalEl && !maliModalEl.hidden) {
+            renderMaliAnalysisModal();
+        }
+
+        vscode.postMessage({
+            type: 'analyzeMaliOffline',
+            source: context.source,
+            stage: context.stage,
+        });
+        return true;
     }
 
     function getShaderStageLookupAliases(stageKey) {
@@ -1299,6 +1571,7 @@
                 rtPreviewPending.clear();
                 resetCurrentRTPreviewView();
                 render();
+                if (maliModalEl && !maliModalEl.hidden) renderMaliAnalysisModal();
                 break;
             case 'replayStatus':
                 state.replayStatus = {
@@ -1314,6 +1587,7 @@
                 state.maliOfflineCompilerConfigured = !!m.configured;
                 state.maliOfflineCompilerHint = m.hint || null;
                 if (state.activeTab === 'shaders') renderShaders();
+                if (maliModalEl && !maliModalEl.hidden) renderMaliAnalysisModal();
                 break;
             case 'eventChanged':
                 {
@@ -1345,6 +1619,7 @@
                     }
                     updateHeader();
                     render();
+                    if (maliModalEl && !maliModalEl.hidden) renderMaliAnalysisModal();
                     if (state.modalResource) {
                         textureModalPreviewEl.innerHTML = '<div class="muted">Loading…</div>';
                         requestTexture();
@@ -1356,6 +1631,7 @@
                     state.shaders = m.data;
                     applyPendingShaderSelection();
                     if (state.activeTab === 'shaders') renderShaders();
+                    if (maliModalEl && !maliModalEl.hidden) renderMaliAnalysisModal();
                 }
                 break;
             case 'shaderEditResult':
@@ -1373,12 +1649,15 @@
                     clearShaderDraftsForStage(m.stage);
                     clearShaderReplayViews();
                     render();
+                    if (maliModalEl && !maliModalEl.hidden) renderMaliAnalysisModal();
                     if (state.modalResource) {
                         textureModalPreviewEl.innerHTML = '<div class="muted">Loading…</div>';
                         requestTexture();
                     }
                 } else if (state.activeTab === 'shaders') {
                     renderShaders();
+                } else if (maliModalEl && !maliModalEl.hidden) {
+                    renderMaliAnalysisModal();
                 }
                 break;
             case 'syncShaderSelection':
@@ -1441,6 +1720,7 @@
                 storePendingMaliAnalysisResult(m);
                 renderMaliAnalysisResult(m);
                 if (state.activeTab === 'shaders') renderShaders();
+                if (maliModalEl && !maliModalEl.hidden) renderMaliAnalysisModal();
                 break;
             case 'timingsLoaded':
                 state.timings = m.timings || {};
@@ -3634,27 +3914,19 @@
         editorActions.appendChild(revertBtn);
 
         const analyzeBtn = document.createElement('button');
-        analyzeBtn.className = 'icon-btn';
-        analyzeBtn.textContent = 'Mali Analyze';
+        analyzeBtn.className = 'icon-btn mali-analyze-btn';
         const maliAnalyzeState = getMaliAnalyzeAvailability(cur, currentCode, state.eventId, activeStage, shaderResourceKey);
+        analyzeBtn.classList.toggle('configured', maliAnalyzeState.configured);
+        analyzeBtn.classList.toggle('unconfigured', !maliAnalyzeState.configured);
+        analyzeBtn.classList.toggle('pending', maliAnalyzeState.pending);
+        analyzeBtn.textContent = maliAnalyzeState.pending ? 'Mali Running' : 'Mali Analyze';
         analyzeBtn.title = maliAnalyzeState.title;
-        analyzeBtn.disabled = maliAnalyzeState.disabled;
         analyzeBtn.addEventListener('click', () => {
-            if (analyzeBtn.disabled) return;
-            state.pendingMaliAnalysis = {
-                eventId: state.eventId,
-                stage: activeStage,
-                resourceId: shaderResourceKey,
-                filename: currentFileName || (activeStage + '-shader'),
-                source: currentCode,
-                startedAt: Date.now(),
-            };
-            renderShaders();
-            vscode.postMessage({
-                type: 'analyzeMaliOffline',
-                source: currentCode,
-                stage: activeStage,
-            });
+            if (!maliAnalyzeState.configured) {
+                openMaliOfflineSettings();
+                return;
+            }
+            openMaliAnalysisModal({ autoAnalyze: true });
         });
         analysisActions.appendChild(analyzeBtn);
 
@@ -4017,16 +4289,6 @@
                     { label: 'View Mode', value: shaderModeLabel },
                 ],
             })
-            + renderShaderStatusCard({
-                tone: analysisTone,
-                label: 'Analysis Summary',
-                title: analysisTitle,
-                copy: analysisCopy,
-                pills: analysisPills,
-                metrics: analysisMetrics,
-                lines: analysisLines,
-            })
-            + maliOutputCard
             + '</div>';
 
         syncLinkedShaderEditor({
@@ -4042,6 +4304,9 @@
 
         renderShaderEditStatus();
         renderShaderDiagnostics();
+        if (maliModalEl && !maliModalEl.hidden) {
+            renderMaliAnalysisModal();
+        }
 
         const pendingJump = state.shaderDiagnosticJump;
         if (pendingJump && pendingJump.stage === activeStage && pendingJump.fileIndex === cur) {
@@ -5037,6 +5302,116 @@
     document.getElementById('tex-modal-export').addEventListener('click', () => {
         if (state.modalResource) vscode.postMessage({ type: 'exportTexture', resourceId: state.modalResource.resourceId, label: state.modalResource.name });
     });
+
+    // ── Mali analysis modal ───────────────────────────────────────
+    const maliModalEl = document.getElementById('mali-modal');
+    const maliModalBodyEl = document.getElementById('mali-modal-body');
+    const maliModalTitleEl = document.getElementById('mali-modal-title');
+    const maliModalSubtitleEl = document.getElementById('mali-modal-subtitle');
+    const maliModalSettingsEl = document.getElementById('mali-modal-settings');
+    const maliModalRerunEl = document.getElementById('mali-modal-rerun');
+
+    function closeMaliAnalysisModal() {
+        if (!maliModalEl) return;
+        maliModalEl.hidden = true;
+    }
+
+    function renderMaliAnalysisModal() {
+        if (!maliModalEl || maliModalEl.hidden) return;
+
+        const presentation = buildMaliAnalysisPresentation(getActiveMaliAnalysisContext());
+        const context = presentation.context;
+
+        if (maliModalTitleEl) {
+            maliModalTitleEl.textContent = 'Mali Offline Compiler';
+        }
+        if (maliModalSubtitleEl) {
+            maliModalSubtitleEl.textContent = context
+                ? [
+                    formatShaderStageLabel(context.stage),
+                    context.filename,
+                    context.resourceId ? ('Resource ' + context.resourceId) : '',
+                    context.eventId != null ? ('EID ' + context.eventId) : '',
+                ].filter(Boolean).join(' · ')
+                : 'Static shader analysis for the currently selected shader source snapshot.';
+        }
+        if (maliModalSettingsEl) {
+            maliModalSettingsEl.textContent = presentation.availability.configured ? 'Configure Path' : 'Set Path';
+            maliModalSettingsEl.title = state.maliOfflineCompilerHint || 'Open the renderdoc.maliOfflineCompilerPath setting.';
+        }
+        if (maliModalRerunEl) {
+            maliModalRerunEl.textContent = presentation.pendingMaliAnalysis
+                ? 'Running…'
+                : (presentation.maliRecord ? 'Re-run Analysis' : 'Run Analysis');
+            maliModalRerunEl.disabled = !presentation.availability.configured
+                || !presentation.availability.canAnalyze
+                || !!presentation.pendingMaliAnalysis;
+            maliModalRerunEl.title = presentation.pendingMaliAnalysis
+                ? 'Mali Offline Compiler analysis is already running for this shader stage.'
+                : (presentation.availability.canAnalyze
+                    ? 'Run Mali Offline Compiler on the current shader source snapshot.'
+                    : (presentation.availability.reason || 'Mali analysis is unavailable for the current selection.'));
+        }
+        if (maliModalBodyEl) {
+            maliModalBodyEl.innerHTML = '<div class="mali-modal-grid">'
+                + renderShaderStatusCard({
+                    tone: presentation.analysisTone,
+                    label: 'Analysis Summary',
+                    title: presentation.analysisTitle,
+                    copy: presentation.analysisCopy,
+                    pills: presentation.analysisPills,
+                    metrics: presentation.analysisMetrics,
+                    lines: presentation.analysisLines,
+                })
+                + renderShaderStatusCard({
+                    tone: presentation.outputTone,
+                    className: 'mali-modal-output-card',
+                    label: 'Raw Mali Output',
+                    title: presentation.outputTitle,
+                    copy: presentation.outputCopy,
+                    metrics: presentation.outputMetrics,
+                    preformatted: presentation.outputText,
+                })
+                + '</div>';
+        }
+    }
+
+    function openMaliAnalysisModal(options) {
+        if (!state.maliOfflineCompilerConfigured) {
+            openMaliOfflineSettings();
+            return;
+        }
+
+        if (maliModalEl) {
+            maliModalEl.hidden = false;
+        }
+        renderMaliAnalysisModal();
+
+        if (options && options.autoAnalyze) {
+            const presentation = buildMaliAnalysisPresentation(getActiveMaliAnalysisContext());
+            if (shouldAutoRunMaliAnalysis(presentation)) {
+                startMaliAnalysisForContext(presentation.context);
+            }
+        }
+    }
+
+    if (maliModalSettingsEl) {
+        maliModalSettingsEl.addEventListener('click', openMaliOfflineSettings);
+    }
+    if (maliModalRerunEl) {
+        maliModalRerunEl.addEventListener('click', () => {
+            const presentation = buildMaliAnalysisPresentation(getActiveMaliAnalysisContext());
+            if (!presentation.availability.configured) {
+                openMaliOfflineSettings();
+                return;
+            }
+            if (presentation.context) {
+                startMaliAnalysisForContext(presentation.context);
+            }
+        });
+    }
+    document.getElementById('mali-modal-close').addEventListener('click', closeMaliAnalysisModal);
+    document.querySelector('#mali-modal .modal-backdrop').addEventListener('click', closeMaliAnalysisModal);
 
     // ── Events tree ────────────────────────────────────────────────
     function renderEvents() {

@@ -228,6 +228,24 @@ export function buildInspectorHtml(
                 <div class="modal-resize-handle" aria-hidden="true"></div>
             </div>
         </div>
+
+        <div id="mali-modal" class="modal" hidden>
+            <div class="modal-backdrop"></div>
+            <div class="modal-panel mali-modal-panel">
+                <div class="modal-header">
+                    <div class="modal-title-stack">
+                        <span id="mali-modal-title" class="modal-title">Mali Offline Compiler</span>
+                        <span id="mali-modal-subtitle" class="modal-subtitle">Static shader analysis for the current source snapshot.</span>
+                    </div>
+                    <div class="modal-actions">
+                        <button id="mali-modal-settings" class="icon-btn">Configure Path</button>
+                        <button id="mali-modal-rerun" class="icon-btn">Run Analysis</button>
+                        <button id="mali-modal-close" class="icon-btn">✕</button>
+                    </div>
+                </div>
+                <div id="mali-modal-body" class="modal-body mali-modal-body"></div>
+            </div>
+        </div>
     </div>
     <script nonce="${nonce}" src="${scriptUri}"></script>
 </body>

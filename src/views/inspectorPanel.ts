@@ -1077,6 +1077,9 @@ export class InspectorPanel {
                 this.analyzeMaliOffline(msg.source, msg.stage);
                 break;
             }
+            case 'openMaliOfflineSettings':
+                void vscode.commands.executeCommand('workbench.action.openSettings', 'renderdoc.maliOfflineCompilerPath');
+                break;
             case 'compileShaderEdit':
                 void this.compileShaderEdit(msg);
                 break;

@@ -47,6 +47,127 @@ extern "C" __declspec(dllexport) int renderdoc__replay__marker = 0;
 
 using json = nlohmann::json;
 
+static std::string currentWorkingDirectoryString()
+{
+    try
+    {
+        return std::filesystem::current_path().u8string();
+    }
+    catch(const std::exception &e)
+    {
+        return std::string("<error: ") + e.what() + ">";
+    }
+    catch(...)
+    {
+        return "<error>";
+    }
+}
+
+static std::string directorySnapshot(const std::filesystem::path &dir, size_t limit = 64)
+{
+    try
+    {
+        if(!std::filesystem::exists(dir)) return "<missing>";
+        if(!std::filesystem::is_directory(dir)) return "<not-a-directory>";
+
+        std::vector<std::string> entries;
+        for(const auto &entry : std::filesystem::directory_iterator(dir))
+        {
+            std::string name = entry.path().filename().u8string();
+            if(entry.is_directory()) name += "/";
+            entries.push_back(name);
+        }
+
+        std::sort(entries.begin(), entries.end());
+        if(entries.empty()) return "<empty>";
+        if(entries.size() > limit)
+        {
+            std::ostringstream oss;
+            for(size_t i = 0; i < limit; ++i)
+            {
+                if(i > 0) oss << ", ";
+                oss << entries[i];
+            }
+            oss << " ... (+" << (entries.size() - limit) << " more)";
+            return oss.str();
+        }
+
+        std::ostringstream oss;
+        for(size_t i = 0; i < entries.size(); ++i)
+        {
+            if(i > 0) oss << ", ";
+            oss << entries[i];
+        }
+        return oss.str();
+    }
+    catch(const std::exception &e)
+    {
+        return std::string("<error: ") + e.what() + ">";
+    }
+    catch(...)
+    {
+        return "<error>";
+    }
+}
+
+static void logRuntimeDiagnostics(const char *phase, const std::string &runtimeDir)
+{
+    const std::filesystem::path base(runtimeDir);
+    const std::filesystem::path plugins = base / "plugins";
+    const std::filesystem::path gles = plugins / "gles";
+    fprintf(stderr, "[bridge] %s cwd=%s\n", phase, currentWorkingDirectoryString().c_str());
+    fprintf(stderr, "[bridge] %s runtimeDir=%s\n", phase, runtimeDir.c_str());
+    fprintf(stderr, "[bridge] %s runtimeEntries=%s\n", phase, directorySnapshot(base).c_str());
+    fprintf(stderr, "[bridge] %s pluginsEntries=%s\n", phase, directorySnapshot(plugins).c_str());
+    fprintf(stderr, "[bridge] %s pluginsGlesEntries=%s\n", phase, directorySnapshot(gles).c_str());
+}
+
+#ifdef _WIN32
+static void logStructuredExceptionDetails(PEXCEPTION_POINTERS exceptionInfo)
+{
+    if(!exceptionInfo || !exceptionInfo->ExceptionRecord)
+    {
+        fprintf(stderr, "[bridge] tryReplay crashed: exception record unavailable\n");
+        fflush(stderr);
+        return;
+    }
+
+    const EXCEPTION_RECORD *record = exceptionInfo->ExceptionRecord;
+    fprintf(stderr,
+            "[bridge] tryReplay crashed: exceptionCode=0x%08lX exceptionAddress=%p flags=0x%08lX\n",
+            (unsigned long)record->ExceptionCode,
+            record->ExceptionAddress,
+            (unsigned long)record->ExceptionFlags);
+
+    if(record->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && record->NumberParameters >= 2)
+    {
+        const char *accessType = "unknown";
+        switch(record->ExceptionInformation[0])
+        {
+            case 0: accessType = "read"; break;
+            case 1: accessType = "write"; break;
+            case 8: accessType = "execute"; break;
+        }
+
+        fprintf(stderr,
+                "[bridge] tryReplay access violation: type=%s targetAddress=0x%p\n",
+                accessType,
+                reinterpret_cast<void *>(record->ExceptionInformation[1]));
+    }
+    else if(record->NumberParameters > 0)
+    {
+        std::ostringstream oss;
+        for(DWORD i = 0; i < record->NumberParameters; ++i)
+        {
+            if(i > 0) oss << ", ";
+            oss << "0x" << std::hex << std::uppercase << record->ExceptionInformation[i];
+        }
+        fprintf(stderr, "[bridge] tryReplay exception parameters: %s\n", oss.str().c_str());
+    }
+    fflush(stderr);
+}
+#endif
+
 // ── Global state ────────────────────────────────────────────────────────────
 static DllLoader         g_dll;
 static ICaptureFile     *g_capFile    = nullptr;
@@ -678,6 +799,7 @@ static std::atomic<bool> g_replayRemoteKeepAlive{false};
 static std::thread       g_replayRemotePingThread;
 static std::string       g_replayRemoteUrl;
 static std::string       g_replayRemoteCapturePath;
+static std::atomic<bool> g_replayRemoteHealthy{false};
 
 static void stopRemoteKeepAlive(std::atomic<bool> &keepRemoteAlive,
                                 std::thread &remotePingThread);
@@ -760,6 +882,16 @@ static void emitStatusNote(const std::string &message) {
     writeJsonLine({
         {"method", "launchCaptureStatus"},
         {"params", {{"message", message}}},
+    });
+}
+
+static void emitReplayHostDisconnected(const std::string &url, const std::string &errorMessage) {
+    writeJsonLine({
+        {"method", "replayHostDisconnected"},
+        {"params", {
+            {"url", url},
+            {"error", errorMessage},
+        }},
     });
 }
 
@@ -897,6 +1029,7 @@ static bool reconnectReplayRemote(std::string &errorMessage) {
         g_replayRemote = nullptr;
     }
     g_replayRemoteCapturePath.clear();
+    g_replayRemoteHealthy.store(false, std::memory_order_release);
 
     IRemoteServer *remote = nullptr;
     if (!connectRemoteServer(g_replayRemoteUrl, &remote, errorMessage)) {
@@ -904,6 +1037,7 @@ static bool reconnectReplayRemote(std::string &errorMessage) {
     }
 
     g_replayRemote = remote;
+    g_replayRemoteHealthy.store(true, std::memory_order_release);
     return true;
 }
 
@@ -926,18 +1060,33 @@ static ITargetControl *waitForTargetControl(const std::string &url, uint32_t ide
 static void startRemoteKeepAlive(IRemoteServer *remote,
                                  std::atomic<bool> &keepRemoteAlive,
                                  std::thread &remotePingThread,
-                                 const char *connectionLabel) {
+                                 const char *connectionLabel,
+                                 std::atomic<bool> *connectionHealthy = nullptr,
+                                 const std::string *connectionUrl = nullptr) {
     if (!remote) return;
     keepRemoteAlive.store(true, std::memory_order_release);
-    remotePingThread = std::thread([remote, &keepRemoteAlive, connectionLabel]() {
+    if (connectionHealthy) {
+        connectionHealthy->store(true, std::memory_order_release);
+    }
+    const bool notifyDisconnect = connectionUrl != nullptr;
+    const std::string disconnectUrl = connectionUrl ? *connectionUrl : std::string();
+    remotePingThread = std::thread([remote, &keepRemoteAlive, connectionLabel, connectionHealthy, notifyDisconnect, disconnectUrl]() {
         while (keepRemoteAlive.load(std::memory_order_acquire)) {
             const ResultDetails ping = remote->Ping();
             if (ping.code != ResultCode::Succeeded) {
+                const std::string pingMessage = resultMessage(ping);
                 fprintf(stderr,
                         "[bridge] %s keep-alive ping failed: %s\n",
                         connectionLabel,
-                        resultMessage(ping).c_str());
+                        pingMessage.c_str());
                 fflush(stderr);
+                keepRemoteAlive.store(false, std::memory_order_release);
+                if (connectionHealthy) {
+                    connectionHealthy->store(false, std::memory_order_release);
+                }
+                if (notifyDisconnect) {
+                    emitReplayHostDisconnected(disconnectUrl, pingMessage);
+                }
                 break;
             }
             std::this_thread::sleep_for(std::chrono::seconds(1));
@@ -954,10 +1103,19 @@ static void stopRemoteKeepAlive(std::atomic<bool> &keepRemoteAlive,
 }
 
 static void ensureReplayRemoteKeepAlive() {
-    if (!g_replayRemote || g_replay || g_replayRemoteKeepAlive.load(std::memory_order_acquire)) {
+    if (!g_replayRemote
+        || !g_replayRemoteHealthy.load(std::memory_order_acquire)
+        || g_replay
+        || g_replayRemoteKeepAlive.load(std::memory_order_acquire)) {
         return;
     }
-    startRemoteKeepAlive(g_replayRemote, g_replayRemoteKeepAlive, g_replayRemotePingThread, "replay host");
+    startRemoteKeepAlive(
+        g_replayRemote,
+        g_replayRemoteKeepAlive,
+        g_replayRemotePingThread,
+        "replay host",
+        &g_replayRemoteHealthy,
+        &g_replayRemoteUrl);
 }
 
 static void clearLiveTargetSession() {
@@ -986,6 +1144,7 @@ static void clearReplayRemoteSession() {
         g_replayRemote->ShutdownConnection();
         g_replayRemote = nullptr;
     }
+    g_replayRemoteHealthy.store(false, std::memory_order_release);
     g_replayRemoteUrl.clear();
     g_replayRemoteCapturePath.clear();
 }
@@ -1008,17 +1167,24 @@ static json currentReplayHostJson() {
         return {{"connected", false}};
     }
 
+    const bool connected = g_replayRemoteHealthy.load(std::memory_order_acquire);
+
     json result = {
-        {"connected", true},
+        {"connected", connected},
         {"url", g_replayRemoteUrl},
-        {"localProxies", json::array()},
-        {"remoteSupportedReplays", json::array()},
     };
 
     const std::string protocol = protocolFromUrl(g_replayRemoteUrl);
     if (!protocol.empty()) {
         result["protocol"] = protocol;
     }
+
+    if (!connected) {
+        return result;
+    }
+
+    result["localProxies"] = json::array();
+    result["remoteSupportedReplays"] = json::array();
 
     for (const rdcstr &proxy : g_replayRemote->LocalProxies()) {
         result["localProxies"].push_back(rdcToStr(proxy));
@@ -1936,6 +2102,8 @@ static json handleInit(int id, const json &params) {
     }
 #endif
 
+    logRuntimeDiagnostics("init", rdocPath);
+
     if (!g_dll.load(rdocPath))
         return makeError(id, -2, "Failed to load renderdoc.dll from: " + rdocPath);
 
@@ -1981,6 +2149,8 @@ static json handleOpenCapture(int id, const json &params) {
         return makeError(id, -3, "RENDERDOC_OpenCaptureFile returned null");
 
     g_capturePath = path;
+
+    fprintf(stderr, "[bridge] openCapture cwd before OpenFile: %s\n", currentWorkingDirectoryString().c_str());
 
     rdcstr filename(path.c_str());
     rdcstr filetype;  // empty = auto-detect
@@ -2076,7 +2246,9 @@ static json handleSetReplayHost(int id, const json &params) {
     if (url.empty())
         return makeError(id, -2, "url is required");
 
-    if (g_replayRemote && g_replayRemoteUrl == url) {
+    if (g_replayRemote
+        && g_replayRemoteUrl == url
+        && g_replayRemoteHealthy.load(std::memory_order_acquire)) {
         return makeResult(id, currentReplayHostJson());
     }
 
@@ -2090,11 +2262,35 @@ static json handleSetReplayHost(int id, const json &params) {
 
     g_replayRemote = remote;
     g_replayRemoteUrl = url;
-    startRemoteKeepAlive(g_replayRemote, g_replayRemoteKeepAlive, g_replayRemotePingThread, "replay host");
+    startRemoteKeepAlive(
+        g_replayRemote,
+        g_replayRemoteKeepAlive,
+        g_replayRemotePingThread,
+        "replay host",
+        &g_replayRemoteHealthy,
+        &g_replayRemoteUrl);
     return makeResult(id, currentReplayHostJson());
 }
 
 static json handleGetReplayHost(int id) {
+    return makeResult(id, currentReplayHostJson());
+}
+
+static json handlePingReplayHost(int id) {
+    if (!g_replayRemote) {
+        return makeResult(id, currentReplayHostJson());
+    }
+
+    const ResultDetails ping = g_replayRemote->Ping();
+    if (ping.code != ResultCode::Succeeded) {
+        const bool wasHealthy = g_replayRemoteHealthy.exchange(false, std::memory_order_acq_rel);
+        if (wasHealthy) {
+            emitReplayHostDisconnected(g_replayRemoteUrl, resultMessage(ping));
+        }
+        return makeResult(id, currentReplayHostJson());
+    }
+
+    g_replayRemoteHealthy.store(true, std::memory_order_release);
     return makeResult(id, currentReplayHostJson());
 }
 
@@ -2259,8 +2455,9 @@ static json handleTryReplay(int id) {
 #ifdef _WIN32
     // Override RenderDoc's crash handler to prevent Bug Reporter dialog.
     // If OpenCapture crashes, the process exits with code 0xDEAD instead.
-    SetUnhandledExceptionFilter([](PEXCEPTION_POINTERS) -> LONG {
-        fprintf(stderr, "[bridge] tryReplay crashed (access violation). Exiting silently.\n");
+    SetUnhandledExceptionFilter([](PEXCEPTION_POINTERS exceptionInfo) -> LONG {
+        logStructuredExceptionDetails(exceptionInfo);
+        fprintf(stderr, "[bridge] tryReplay crashed. Exiting silently.\n");
         fflush(stderr);
         TerminateProcess(GetCurrentProcess(), 0xDEAD);
         return EXCEPTION_EXECUTE_HANDLER;
@@ -7350,6 +7547,7 @@ static json dispatch(const json &req) {
         if (method == "closeCapture")       return handleCloseCapture(id);
         if (method == "setReplayHost")     return handleSetReplayHost(id, params);
         if (method == "getReplayHost")     return handleGetReplayHost(id);
+        if (method == "pingReplayHost")    return handlePingReplayHost(id);
         if (method == "disconnectReplayHost") return handleDisconnectReplayHost(id);
         if (method == "tryReplay")          return handleTryReplay(id);
         if (method == "setFrameEvent")      return handleSetFrameEvent(id, params);

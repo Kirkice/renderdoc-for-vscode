@@ -474,7 +474,7 @@ export class LaunchTargetViewProvider implements vscode.WebviewViewProvider {
                 + '<div class="panelTitleWrap">'
                 + '<div class="panelTag">Capture Target</div>'
                 + '<div class="panelTitle">Target Environment</div>'
-                + '<div class="panelMeta">Choose the Command Target for launch and attach. Use Launch Application for capture and session actions.</div>'
+                + '<div class="panelMeta">Choose the Command Target for launch and attach. Use Launch Panel for capture and session actions.</div>'
                 + '</div>'
                 + '<div class="panelTools">' + messageButton('Refresh', 'refreshCaptureTargets', 'ghost') + '</div>'
                 + '</div>'
@@ -490,7 +490,7 @@ export class LaunchTargetViewProvider implements vscode.WebviewViewProvider {
                 + '<div class="targetGroup"><div class="groupLabel">Devices</div><div class="targetGrid' + (devices.length <= 1 ? ' fill' : '') + '">' + deviceCards + '</div></div>'
                 + '</div>'
                 + '<div class="launchRow">'
-                + messageButton('Open Launch Application', 'openLaunchApplication', 'primary')
+                + messageButton('Open Launch Panel', 'openLaunchApplication', 'primary')
                 + '</div>'
                 + '</div>';
 

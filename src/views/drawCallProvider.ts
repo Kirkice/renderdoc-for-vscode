@@ -1,6 +1,10 @@
 import * as vscode from 'vscode';
 import { DrawCall } from '../types';
 
+function normalizeFilterText(value: string | undefined): string {
+    return (value ?? '').trim().toLowerCase();
+}
+
 function computeEidRange(dc: DrawCall): { min: number; max: number } {
     let min = dc.eventId;
     let max = dc.eventId;
@@ -20,47 +24,176 @@ function formatDuration(us: number): string {
     return `${us.toFixed(1)} µs`;
 }
 
-export class DrawCallProvider implements vscode.TreeDataProvider<DrawCallItem> {
-    private _onDidChangeTreeData = new vscode.EventEmitter<DrawCallItem | undefined>();
+export class DrawCallProvider implements vscode.TreeDataProvider<DrawCall> {
+    private _onDidChangeTreeData = new vscode.EventEmitter<DrawCall | undefined>();
     readonly onDidChangeTreeData = this._onDidChangeTreeData.event;
 
     private drawCalls: DrawCall[] = [];
+    private visibleDrawCalls: DrawCall[] = [];
+    private filterText = '';
+    private filteredChildren = new WeakMap<DrawCall, DrawCall[]>();
+    private matchCount = 0;
 
     update(drawCalls: DrawCall[]) {
         this.drawCalls = drawCalls;
+        this.rebuildVisibleTree();
         this._onDidChangeTreeData.fire(undefined);
     }
 
-    getTreeItem(element: DrawCallItem): vscode.TreeItem {
-        return element;
+    getFilterText(): string {
+        return this.filterText;
     }
 
-    getChildren(element?: DrawCallItem): DrawCallItem[] {
+    hasActiveFilter(): boolean {
+        return this.filterText.length > 0;
+    }
+
+    getSearchMatchCount(): number {
+        return this.matchCount;
+    }
+
+    setFilterText(filterText: string): boolean {
+        const nextFilterText = (filterText ?? '').trim();
+        if (nextFilterText === this.filterText) {
+            return false;
+        }
+
+        this.filterText = nextFilterText;
+        this.rebuildVisibleTree();
+        this._onDidChangeTreeData.fire(undefined);
+        return true;
+    }
+
+    clearFilter(): boolean {
+        return this.setFilterText('');
+    }
+
+    getFirstSearchResult(): DrawCall | undefined {
+        if (!this.hasActiveFilter()) {
+            return undefined;
+        }
+        return this.findFirstSearchResult(this.visibleDrawCalls);
+    }
+
+    getTreeItem(element: DrawCall): vscode.TreeItem {
+        return this.toItem(element);
+    }
+
+    getChildren(element?: DrawCall): DrawCall[] {
         if (!element) {
-            return this.drawCalls.map(dc => this.toItem(dc));
+            return this.visibleDrawCalls;
         }
-        if (element.drawCall.children && element.drawCall.children.length > 0) {
-            return element.drawCall.children.map(dc => this.toItem(dc));
-        }
-        return [];
+        return this.getVisibleChildren(element);
     }
 
     private toItem(dc: DrawCall): DrawCallItem {
-        const hasChildren = dc.children && dc.children.length > 0;
+        const visibleChildren = this.getVisibleChildren(dc);
+        const hasChildren = visibleChildren.length > 0;
         const state = hasChildren
-            ? vscode.TreeItemCollapsibleState.Collapsed
+            ? (this.hasActiveFilter()
+                ? vscode.TreeItemCollapsibleState.Expanded
+                : vscode.TreeItemCollapsibleState.Collapsed)
             : vscode.TreeItemCollapsibleState.None;
 
-        return new DrawCallItem(dc, state);
+        return new DrawCallItem(dc, state, this.filterText);
+    }
+
+    private getVisibleChildren(dc: DrawCall): DrawCall[] {
+        if (!this.hasActiveFilter()) {
+            return dc.children ?? [];
+        }
+        return this.filteredChildren.get(dc) ?? [];
+    }
+
+    private rebuildVisibleTree(): void {
+        this.filteredChildren = new WeakMap<DrawCall, DrawCall[]>();
+        this.matchCount = 0;
+
+        if (!this.hasActiveFilter()) {
+            this.visibleDrawCalls = this.drawCalls;
+            return;
+        }
+
+        const filteredRoots: DrawCall[] = [];
+        for (const drawCall of this.drawCalls) {
+            if (this.filterDrawCall(drawCall)) {
+                filteredRoots.push(drawCall);
+            }
+        }
+        this.visibleDrawCalls = filteredRoots;
+    }
+
+    private filterDrawCall(dc: DrawCall): boolean {
+        const children = dc.children ?? [];
+        const filteredChildren: DrawCall[] = [];
+
+        for (const child of children) {
+            if (this.filterDrawCall(child)) {
+                filteredChildren.push(child);
+            }
+        }
+
+        const matchesSelf = this.matchesFilter(dc);
+        if (matchesSelf) {
+            this.matchCount += 1;
+            if (children.length > 0) {
+                this.filteredChildren.set(dc, children);
+            }
+            return true;
+        }
+
+        if (filteredChildren.length > 0) {
+            this.filteredChildren.set(dc, filteredChildren);
+            return true;
+        }
+
+        return false;
+    }
+
+    private matchesFilter(dc: DrawCall): boolean {
+        const filterText = normalizeFilterText(this.filterText);
+        if (!filterText) {
+            return true;
+        }
+
+        return dc.name.toLowerCase().includes(filterText)
+            || String(dc.eventId).includes(filterText)
+            || String(dc.drawIndex).includes(filterText);
+    }
+
+    private findFirstSearchResult(drawCalls: DrawCall[]): DrawCall | undefined {
+        for (const drawCall of drawCalls) {
+            if (this.matchesFilter(drawCall)) {
+                return drawCall;
+            }
+
+            const childResult = this.findFirstSearchResult(this.getVisibleChildren(drawCall));
+            if (childResult) {
+                return childResult;
+            }
+        }
+
+        return undefined;
     }
 }
 
 class DrawCallItem extends vscode.TreeItem {
     constructor(
         public readonly drawCall: DrawCall,
-        public readonly collapsibleState: vscode.TreeItemCollapsibleState
+        public readonly collapsibleState: vscode.TreeItemCollapsibleState,
+        filterText: string
     ) {
         super(DrawCallItem.buildLabel(drawCall), collapsibleState);
+
+        const label = DrawCallItem.buildLabel(drawCall);
+        const normalizedFilter = normalizeFilterText(filterText);
+        const highlightOffset = normalizedFilter ? label.toLowerCase().indexOf(normalizedFilter) : -1;
+        if (highlightOffset >= 0) {
+            this.label = {
+                label,
+                highlights: [[highlightOffset, highlightOffset + normalizedFilter.length]],
+            };
+        }
 
         this.tooltip = this.buildTooltip();
         this.iconPath = this.pickIcon();
