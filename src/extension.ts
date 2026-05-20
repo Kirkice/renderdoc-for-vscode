@@ -19,7 +19,7 @@ import {
 } from './types';
 import { LaunchTargetState } from './launchTargetState';
 import { CaptureInfoProvider } from './views/captureInfoProvider';
-import { EventBrowserViewProvider } from './views/eventBrowserView';
+import { DrawCallProvider } from './views/drawCallProvider';
 import { ApiInspectorProvider } from './views/apiInspectorProvider';
 import { LaunchTargetViewProvider } from './views/launchTargetView';
 import {
@@ -57,10 +57,11 @@ import {
 let bridge: RenderDocBridge;
 let captureCache: CaptureCache;
 let captureInfoProvider: CaptureInfoProvider;
-let eventBrowserViewProvider: EventBrowserViewProvider;
+let drawCallProvider: DrawCallProvider;
 let apiInspectorProvider: ApiInspectorProvider;
 let resourceProvider: ResourceProvider;
 let launchTargetState: LaunchTargetState;
+let drawCallTreeView: vscode.TreeView<DrawCall> | undefined;
 let currentCapturePath: string | undefined;
 let currentCaptureSuggestsRemote = false;
 let currentReplayMode: 'none' | 'local' | 'remote' = 'none';
@@ -73,6 +74,7 @@ let currentSelectedResource: any | undefined;
 let currentDrawCalls: DrawCall[] = [];
 let currentResources: ResourceInfo[] = [];
 let shaderAliasScanGeneration = 0;
+let suppressDrawCallSelectionSync = false;
 let pendingAutoLoadCapturePath: string | undefined;
 interface RenderDocCaptureResolution {
     captureLoaded: boolean;
@@ -555,28 +557,66 @@ function normalizeSelectedDrawCall(drawCall: DrawCall | undefined): DrawCall | u
 }
 
 function updateDrawCallTree(drawCalls: DrawCall[]) {
-    eventBrowserViewProvider.update(drawCalls);
+    suppressDrawCallSelectionSync = true;
+    drawCallProvider.update(drawCalls);
+    updateDrawCallSearchUi();
+    void delay(0).then(() => {
+        suppressDrawCallSelectionSync = false;
+    });
 }
 
-async function activateDrawCallFromEventBrowser(context: vscode.ExtensionContext, drawCall: DrawCall): Promise<void> {
-    const selectedDrawCall = normalizeSelectedDrawCall(drawCall)
-        ?? normalizeSelectedDrawCall(findDrawCallByEventId(drawCall.eventId))
-        ?? drawCall;
+function updateDrawCallSearchUi(): void {
+    const hasActiveFilter = drawCallProvider.hasActiveFilter();
+    void vscode.commands.executeCommand('setContext', 'renderdoc.drawCallSearchActive', hasActiveFilter);
 
-    currentSelectedDrawCall = selectedDrawCall;
-    eventBrowserViewProvider.setSelectedEvent(selectedDrawCall.eventId);
-
-    const label = selectedDrawCall.name || drawCall.name;
-    apiInspectorProvider.setEvent(selectedDrawCall.eventId, label).catch(() => {});
-    if (DrawOverlayPanel.currentPanel) {
-        DrawOverlayPanel.currentPanel.showEvent(selectedDrawCall.eventId, label).catch(() => {});
+    if (!drawCallTreeView) {
+        return;
     }
 
-    await showDrawCallDetails(context, {
-        eventId: drawCall.eventId,
-        drawCall,
-        label: drawCall.name,
+    if (!hasActiveFilter) {
+        drawCallTreeView.message = undefined;
+        return;
+    }
+
+    const filterText = drawCallProvider.getFilterText();
+    const matchCount = drawCallProvider.getSearchMatchCount();
+    drawCallTreeView.message = matchCount > 0
+        ? `Filter: "${filterText}" (${matchCount} match${matchCount === 1 ? '' : 'es'})`
+        : `No events match "${filterText}"`;
+}
+
+async function searchDrawCalls(): Promise<void> {
+    const currentFilter = drawCallProvider.getFilterText();
+    const value = await vscode.window.showInputBox({
+        title: 'Search Event Browser',
+        prompt: 'Filter events by name, event ID, or draw index. Leave empty to clear the filter.',
+        placeHolder: 'Examples: ShadowPass, 751, 42',
+        value: currentFilter,
+        ignoreFocusOut: true,
     });
+
+    if (value === undefined) {
+        return;
+    }
+
+    drawCallProvider.setFilterText(value);
+    updateDrawCallSearchUi();
+
+    const firstMatch = drawCallProvider.getFirstSearchResult();
+    if (firstMatch && drawCallTreeView) {
+        await drawCallTreeView.reveal(firstMatch, {
+            expand: true,
+            focus: true,
+            select: false,
+        });
+    }
+}
+
+function clearDrawCallSearch(): void {
+    if (!drawCallProvider.clearFilter()) {
+        return;
+    }
+    updateDrawCallSearchUi();
 }
 
 type ExclusiveRenderDocPanel = 'thumbnail' | 'inspector' | 'captureResult';
@@ -1697,16 +1737,12 @@ export async function activate(context: vscode.ExtensionContext) {
 
     // Register TreeView providers
     captureInfoProvider = new CaptureInfoProvider();
+    drawCallProvider = new DrawCallProvider();
     apiInspectorProvider = new ApiInspectorProvider(bridge);
     resourceProvider = new ResourceProvider();
     const launchTargetViewProvider = new LaunchTargetViewProvider(
         launchTargetState,
         async () => { await launchTargetState.refresh(bridge); },
-    );
-    eventBrowserViewProvider = new EventBrowserViewProvider(
-        async (drawCall) => activateDrawCallFromEventBrowser(context, drawCall),
-        async (drawCall) => viewShaderSource(context, { eventId: drawCall.eventId, drawCall }),
-        async (drawCall) => viewPipelineState(context, { eventId: drawCall.eventId, drawCall }),
     );
 
     context.subscriptions.push({
@@ -1715,9 +1751,37 @@ export async function activate(context: vscode.ExtensionContext) {
         }),
     });
 
+    drawCallTreeView = vscode.window.createTreeView('renderdoc-drawCalls', {
+        treeDataProvider: drawCallProvider,
+        showCollapseAll: true,
+    });
     const resourceTreeView = vscode.window.createTreeView('renderdoc-resources', {
         treeDataProvider: resourceProvider,
         showCollapseAll: true,
+    });
+    updateDrawCallSearchUi();
+
+    drawCallTreeView.onDidChangeSelection(e => {
+        if (suppressDrawCallSelectionSync) {
+            return;
+        }
+        if (e.selection.length > 0) {
+            const item = e.selection[0];
+            const selectedDrawCall = normalizeSelectedDrawCall(item)
+                ?? normalizeSelectedDrawCall(findDrawCallByEventId(item.eventId));
+            currentSelectedDrawCall = selectedDrawCall ?? item;
+            if (InspectorPanel.currentPanel && typeof currentSelectedDrawCall?.eventId === 'number') {
+                InspectorPanel.currentPanel.setEvent(currentSelectedDrawCall.eventId, currentSelectedDrawCall);
+            }
+            if (typeof currentSelectedDrawCall?.eventId === 'number') {
+                const label = currentSelectedDrawCall.name || item.name;
+                apiInspectorProvider.setEvent(currentSelectedDrawCall.eventId, label).catch(() => {});
+            }
+            if (DrawOverlayPanel.currentPanel && typeof currentSelectedDrawCall?.eventId === 'number') {
+                const label = currentSelectedDrawCall.name || item.name;
+                DrawOverlayPanel.currentPanel.showEvent(currentSelectedDrawCall.eventId, label).catch(() => {});
+            }
+        }
     });
     resourceTreeView.onDidChangeSelection(e => {
         if (e.selection.length > 0) {
@@ -1734,12 +1798,12 @@ export async function activate(context: vscode.ExtensionContext) {
     context.subscriptions.push(
         vscode.window.registerTreeDataProvider('renderdoc-captureInfo', captureInfoProvider),
         vscode.window.registerTreeDataProvider('renderdoc-apiInspector', apiInspectorProvider),
-        vscode.window.registerWebviewViewProvider('renderdoc-drawCalls', eventBrowserViewProvider),
         vscode.window.registerWebviewViewProvider('renderdoc-launchTarget', launchTargetViewProvider),
         launchTargetState.onDidChange(() => {
             void vscode.commands.executeCommand('setContext', 'renderdoc.liveTargetActive', !!launchTargetState.getLiveTarget());
             syncLaunchApplicationPanelState();
         }),
+        drawCallTreeView,
         resourceTreeView
     );
 
@@ -1773,6 +1837,8 @@ export async function activate(context: vscode.ExtensionContext) {
         vscode.commands.registerCommand('renderdoc.disconnectLiveTarget', () => disconnectLiveTarget()),
         vscode.commands.registerCommand('renderdoc.selectLocalCaptureTarget', () => selectLocalCaptureTarget()),
         vscode.commands.registerCommand('renderdoc.selectCaptureTargetByUrl', (url) => selectCaptureTargetByUrl(String(url ?? ''))),
+        vscode.commands.registerCommand('renderdoc.searchDrawCalls', () => searchDrawCalls()),
+        vscode.commands.registerCommand('renderdoc.clearDrawCallSearch', () => clearDrawCallSearch()),
         vscode.commands.registerCommand('renderdoc.clearSavedCaptures', () => clearSavedCaptures(context)),
         vscode.commands.registerCommand('renderdoc.refreshCaptureTargets', async () => {
             await launchTargetState.refresh(bridge);
@@ -2268,7 +2334,8 @@ function closeCapture() {
     currentDrawCalls = [];
     currentResources = [];
     shaderAliasScanGeneration += 1;
-    eventBrowserViewProvider.setSelectedEvent(undefined);
+    drawCallProvider.clearFilter();
+    updateDrawCallSearchUi();
 
     // Shut down the bridge to cleanly release all memory and file locks
     console.log('[RenderDoc] User requested close capture; killing bridge.');
@@ -2778,12 +2845,16 @@ async function loadCapture(context: vscode.ExtensionContext, filePath: string, s
             }
 
             if (replayErr && !silent) {
-                vscode.window.showWarningMessage(
+                const action = await vscode.window.showWarningMessage(
                     `RenderDoc: this capture cannot be inspected without an active local replay. ` +
                     `Draw calls, resources, shader source and pipeline state are unavailable. ` +
                     `(${replayErr.message})`,
-                    { modal: true }
+                    { modal: true },
+                    'Try Replay'
                 );
+                if (action === 'Try Replay') {
+                    void tryLocalReplay();
+                }
             } else if (!silent) {
                 vscode.window.showInformationMessage(`RenderDoc: Loaded ${filePath}`);
             }
@@ -2914,7 +2985,6 @@ async function showDrawCallDetails(context: vscode.ExtensionContext, item: any) 
     const normalizedDrawCall = normalizeSelectedDrawCall(item.drawCall)
         ?? normalizeSelectedDrawCall(findDrawCallByEventId(item.eventId));
     const resolvedEventId = normalizedDrawCall?.eventId ?? item.eventId;
-    eventBrowserViewProvider.setSelectedEvent(resolvedEventId);
 
     closeExclusiveRenderDocPanels('inspector');
 

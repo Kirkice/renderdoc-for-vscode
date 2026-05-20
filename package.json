@@ -611,6 +611,18 @@
         "icon": "$(clock)"
       },
       {
+        "command": "renderdoc.searchDrawCalls",
+        "title": "Search Event Browser",
+        "category": "RenderDoc",
+        "icon": "$(search)"
+      },
+      {
+        "command": "renderdoc.clearDrawCallSearch",
+        "title": "Clear Event Browser Search",
+        "category": "RenderDoc",
+        "icon": "$(close)"
+      },
+      {
         "command": "renderdoc.showDrawCallDetails",
         "title": "Show Draw Call Details",
         "category": "RenderDoc"
@@ -795,8 +807,7 @@
         },
         {
           "id": "renderdoc-drawCalls",
-          "name": "Event Browser",
-          "type": "webview"
+          "name": "Event Browser"
         },
         {
           "id": "renderdoc-apiInspector",
@@ -906,14 +917,24 @@
           "group": "navigation@1"
         },
         {
-          "command": "renderdoc.fetchTimings",
+          "command": "renderdoc.searchDrawCalls",
           "when": "view == renderdoc-drawCalls",
           "group": "navigation@2"
         },
         {
+          "command": "renderdoc.clearDrawCallSearch",
+          "when": "view == renderdoc-drawCalls && renderdoc.drawCallSearchActive",
+          "group": "navigation@3"
+        },
+        {
+          "command": "renderdoc.fetchTimings",
+          "when": "view == renderdoc-drawCalls",
+          "group": "navigation@4"
+        },
+        {
           "command": "renderdoc.viewAllShaders",
           "when": "view == renderdoc-drawCalls",
-          "group": "navigation@3"
+          "group": "navigation@5"
         }
       ],
       "explorer/context": [
@@ -924,6 +945,26 @@
         }
       ],
       "view/item/context": [
+        {
+          "command": "renderdoc.viewShaderSource",
+          "when": "view == renderdoc-drawCalls && viewItem == drawcall",
+          "group": "inline@1"
+        },
+        {
+          "command": "renderdoc.viewPipelineState",
+          "when": "view == renderdoc-drawCalls && viewItem == drawcall",
+          "group": "inline@2"
+        },
+        {
+          "command": "renderdoc.viewShaderSource",
+          "when": "view == renderdoc-drawCalls && viewItem == drawcall",
+          "group": "renderdoc@1"
+        },
+        {
+          "command": "renderdoc.viewPipelineState",
+          "when": "view == renderdoc-drawCalls && viewItem == drawcall",
+          "group": "renderdoc@2"
+        },
         {
           "command": "renderdoc.previewTexture",
           "when": "view == renderdoc-resources && viewItem == texture",
