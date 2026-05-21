@@ -1864,14 +1864,13 @@ function buildFrameAnalysis(info: CaptureInfo, drawCalls: DrawCall[], resources:
             totalTextureMemory: totalTextureBytes,
             totalBufferMemory: totalBufferBytes,
         },
-        potentialIssues: detectIssues(dcSummary, textures, buffers),
+        potentialIssues: detectIssues(dcSummary, textures),
     };
 }
 
 function detectIssues(
     drawCalls: DrawCallSummary,
     textures: ResourceInfo[],
-    buffers: ResourceInfo[],
 ): string[] {
     const issues: string[] = [];
 
@@ -2398,29 +2397,3 @@ export class GetBufferContentsTool implements vscode.LanguageModelTool<GetBuffer
     }
 }
 
-// ─── Registration ───────────────────────────────────────────────────────────
-export function registerAllTools(context: vscode.ExtensionContext) {
-    context.subscriptions.push(
-        vscode.lm.registerTool('renderdoc_openCapture', new OpenCaptureTool()),
-        vscode.lm.registerTool('renderdoc_getCaptureInfo', new GetCaptureInfoTool()),
-        vscode.lm.registerTool('renderdoc_getDrawCalls', new GetDrawCallsTool()),
-        vscode.lm.registerTool('renderdoc_getActionTimings', new GetActionTimingsTool()),
-        vscode.lm.registerTool('renderdoc_getResources', new GetResourcesTool()),
-        vscode.lm.registerTool('renderdoc_getResourceDetail', new GetResourceDetailTool()),
-        vscode.lm.registerTool('renderdoc_getEventDetails', new GetEventDetailsTool()),
-        vscode.lm.registerTool('renderdoc_getPipelineState', new GetPipelineStateTool()),
-        vscode.lm.registerTool('renderdoc_getShaderSource', new GetShaderSourceTool()),
-        vscode.lm.registerTool('renderdoc_getShaderInfo', new GetShaderInfoTool()),
-        vscode.lm.registerTool('renderdoc_findProjectImplementation', new FindProjectImplementationTool()),
-        vscode.lm.registerTool('renderdoc_getTextureInfo', new GetTextureInfoTool()),
-        vscode.lm.registerTool('renderdoc_analyzeFrame', new AnalyzeFrameTool()),
-        vscode.lm.registerTool('renderdoc_getSelectionContext', new GetSelectionContextTool()),
-        vscode.lm.registerTool('renderdoc_getMeshData', new GetMeshDataTool()),
-        vscode.lm.registerTool('renderdoc_getFrameSummary', new GetFrameSummaryTool()),
-        vscode.lm.registerTool('renderdoc_findDrawsByShader', new FindDrawsByShaderTool()),
-        vscode.lm.registerTool('renderdoc_findDrawsByTexture', new FindDrawsByTextureTool()),
-        vscode.lm.registerTool('renderdoc_findDrawsByResourceId', new FindDrawsByResourceIdTool()),
-        vscode.lm.registerTool('renderdoc_getTextureData', new GetTextureDataTool()),
-        vscode.lm.registerTool('renderdoc_getBufferContents', new GetBufferContentsTool()),
-    );
-}

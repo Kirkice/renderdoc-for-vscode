@@ -1,5 +1,9 @@
 {
     "servers": {
+        "renderdoc-for-vscode": {
+            "type": "http",
+            "url": "http://127.0.0.1:38967/mcp"
+        },
         "gemini-image": {
             "command": "node",
             "args": [

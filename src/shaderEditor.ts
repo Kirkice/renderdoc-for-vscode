@@ -81,7 +81,7 @@ function sanitizeSegment(value: string): string {
         .replace(/[<>:"/\\|?*]+/g, '_')
         .replace(/\s+/g, '_')
         .replace(/_+/g, '_')
-        .replace(/^[_\.]+|[_\.]+$/g, '');
+        .replace(/^[_.]+|[_.]+$/g, '');
     return cleaned || 'shader';
 }
 

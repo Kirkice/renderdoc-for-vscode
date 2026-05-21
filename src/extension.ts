@@ -9,7 +9,6 @@ import {
     CaptureInfo,
     CaptureLaunchTarget,
     DrawCall,
-    LiveTargetInfo,
     LaunchCaptureOptions,
     LaunchCaptureResult,
     ResourceInfo,
@@ -32,7 +31,8 @@ import { ResourceProvider } from './views/resourceProvider';
 import { ThumbnailPanel } from './views/thumbnailPanel';
 import { InspectorPanel } from './views/inspectorPanel';
 import { DrawOverlayPanel } from './views/drawOverlayPanel';
-import { initTools, registerAllTools } from './copilot/tools';
+import { initTools } from './copilot/tools';
+import { registerAllTools } from './copilot/toolRegistry';
 import { initChatParticipant, registerChatParticipant } from './copilot/chatParticipant';
 import {
     ensureBundledCopilotCustomizationsInstalled,
@@ -53,6 +53,7 @@ import {
     getTexturePreviewHtml,
     getResourceDetailHtml,
 } from './views/panelHtml';
+import { RenderDocMcpServer } from './mcp/server';
 
 let bridge: RenderDocBridge;
 let captureCache: CaptureCache;
@@ -72,7 +73,6 @@ let remoteReplayKeepAliveInFlight = false;
 let currentSelectedDrawCall: any | undefined;
 let currentSelectedResource: any | undefined;
 let currentDrawCalls: DrawCall[] = [];
-let currentResources: ResourceInfo[] = [];
 let shaderAliasScanGeneration = 0;
 let suppressDrawCallSelectionSync = false;
 let pendingAutoLoadCapturePath: string | undefined;
@@ -478,7 +478,6 @@ function clearReplayDerivedState(): void {
     currentSelectedDrawCall = undefined;
     currentSelectedResource = undefined;
     currentDrawCalls = [];
-    currentResources = [];
     shaderAliasScanGeneration += 1;
 }
 
@@ -760,11 +759,6 @@ type StoredAttachCaptureState = {
 
 const LAST_TRIGGER_CAPTURE_STATE_KEY = 'renderdoc.lastTriggerCaptureState';
 
-type CaptureDispositionResult = {
-    finalPath?: string;
-    saved: boolean;
-};
-
 function delay(ms: number): Promise<void> {
     return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -852,11 +846,6 @@ function execFileText(file: string, args: readonly string[]): Promise<string> {
             resolve(stdout);
         });
     });
-}
-
-function isAndroidLikeTarget(target: CaptureLaunchTarget): boolean {
-    const probe = `${target.protocol} ${target.url} ${target.id} ${target.name}`.toLowerCase();
-    return probe.includes('adb') || probe.includes('android');
 }
 
 async function findAdbExecutable(): Promise<string | undefined> {
@@ -1085,20 +1074,6 @@ async function promptForCaptureTrigger(initial?: {
         frameNumber,
         delaySeconds,
     };
-}
-
-async function promptForCaptureOutputDir(executable: string, storedDir?: string): Promise<string | undefined> {
-    const outputDir = await vscode.window.showInputBox({
-        title: 'Capture Output Directory',
-        prompt: 'Directory where the captured .rdc file should be stored locally',
-        value: getDefaultCaptureOutputDir(executable, storedDir),
-        validateInput: (input) => input.trim() ? undefined : 'Enter a directory path.',
-    });
-    if (outputDir === undefined) {
-        return undefined;
-    }
-    await fs.promises.mkdir(outputDir, { recursive: true });
-    return outputDir;
 }
 
 function getLiveCaptureTempDir(context: vscode.ExtensionContext): string {
@@ -1518,42 +1493,6 @@ async function maybePromptForSuggestedRemoteReplay(filePath: string, nativeResul
     return reopened;
 }
 
-async function promptForCaptureDisposition(context: vscode.ExtensionContext, capturePath: string): Promise<CaptureDispositionResult> {
-    closeExclusiveRenderDocPanels('captureResult');
-    const choice = await CaptureResultPanel.show(capturePath);
-
-    if (choice === 'delete') {
-        await fs.promises.rm(capturePath, { force: true });
-        return { finalPath: undefined, saved: false };
-    }
-
-    if (choice === 'save') {
-        const uri = await vscode.window.showSaveDialog({
-            title: 'Save Captured Frame',
-            defaultUri: vscode.Uri.file(capturePath),
-            filters: { 'RenderDoc Capture': ['rdc'] },
-        });
-        if (!uri) {
-            return { finalPath: capturePath, saved: false };
-        }
-        await fs.promises.mkdir(path.dirname(uri.fsPath), { recursive: true });
-        try {
-            await fs.promises.rename(capturePath, uri.fsPath);
-        } catch {
-            await fs.promises.copyFile(capturePath, uri.fsPath);
-            await fs.promises.rm(capturePath, { force: true });
-        }
-        await rememberSavedCapturePath(context, uri.fsPath);
-        return { finalPath: uri.fsPath, saved: true };
-    }
-
-    if (choice === 'dismiss') {
-        return { finalPath: undefined, saved: false };
-    }
-
-    return { finalPath: capturePath, saved: false };
-}
-
 async function captureFromLiveTarget(context: vscode.ExtensionContext, presetTrigger?: CaptureTriggerOptions) {
     try {
         const liveTarget = launchTargetState.getLiveTarget();
@@ -1828,6 +1767,26 @@ export async function activate(context: vscode.ExtensionContext) {
         return recoverReplayForCurrentCapture(reason);
     };
 
+    const getCapturePath = () => currentCapturePath;
+    const getSelectionContext = () => ({
+        selectedDrawCall: currentSelectedDrawCall,
+        selectedResource: currentSelectedResource,
+    });
+
+    initTools(
+        bridge,
+        getCapturePath,
+        getSelectionContext,
+        () => currentDrawCalls,
+        (filePath) => openCaptureForChatTool(context, filePath),
+    );
+
+    const renderDocMcpServer = new RenderDocMcpServer(
+        context.extension.packageJSON.version,
+        getCapturePath,
+    );
+    context.subscriptions.push(renderDocMcpServer);
+
     // Register commands
     context.subscriptions.push(
         vscode.commands.registerCommand('renderdoc.openCapture', (input) => openCapture(context, input)),
@@ -1874,6 +1833,7 @@ export async function activate(context: vscode.ExtensionContext) {
             }
         }),
         vscode.commands.registerCommand('renderdoc.showCopilotToolStatus', () => showCopilotToolStatus()),
+        vscode.commands.registerCommand('renderdoc.showMcpServerInfo', () => renderDocMcpServer.showConnectionInfo()),
         vscode.commands.registerCommand('renderdoc.downloadNativeBridge', async () => {
             // Clear the "don't ask again" flag so the picker shows again.
             await context.globalState.update('renderdoc.skipBridgePrompt', false);
@@ -1889,22 +1849,12 @@ export async function activate(context: vscode.ExtensionContext) {
             }
         }),
         vscode.commands.registerCommand('renderdoc.fetchTimings', () => fetchTimings()),
-    );    // ── Copilot integration (non-critical, disabled when copilot-chat is not installed) ──
+    );
+
+    // ── Copilot integration (non-critical, disabled when copilot-chat is not installed) ──
     const copilotExtension = vscode.extensions.getExtension('github.copilot-chat');
     if (copilotExtension) {
         try {
-            const getCapturePath = () => currentCapturePath;
-            const getSelectionContext = () => ({
-                selectedDrawCall: currentSelectedDrawCall,
-                selectedResource: currentSelectedResource,
-            });
-            initTools(
-                bridge,
-                getCapturePath,
-                getSelectionContext,
-                () => currentDrawCalls,
-                (filePath) => openCaptureForChatTool(context, filePath),
-            );
             initChatParticipant(bridge, getCapturePath, getSelectionContext);
             registerAllTools(context);
             registerChatParticipant(context);
@@ -1913,6 +1863,17 @@ export async function activate(context: vscode.ExtensionContext) {
         }
     } else {
         console.info('[RenderDoc] GitHub Copilot Chat not found — AI features disabled.');
+    }
+
+    try {
+        const mcpStatus = await renderDocMcpServer.startIfEnabled();
+        if (mcpStatus.running && mcpStatus.url) {
+            console.log('[RenderDoc] RenderDoc For VSCode MCP listening on', mcpStatus.url);
+        } else if (mcpStatus.enabled && mcpStatus.lastError) {
+            console.warn('[RenderDoc] RenderDoc For VSCode MCP failed to start (non-critical):', mcpStatus.lastError);
+        }
+    } catch (error: any) {
+        console.warn('[RenderDoc] RenderDoc For VSCode MCP bootstrap failed (non-critical):', error?.message ?? String(error));
     }
 
     // Update status bar
@@ -1928,6 +1889,16 @@ export async function activate(context: vscode.ExtensionContext) {
         vscode.window.registerWebviewPanelSerializer('renderdoc-inspector', {
             async deserializeWebviewPanel(panel: vscode.WebviewPanel, _state: any) {
                 InspectorPanel.revive(panel, context, bridge);
+            }
+        }),
+        vscode.workspace.onDidChangeConfiguration((event) => {
+            if (event.affectsConfiguration('renderdoc.mcpServer.enabled')
+                || event.affectsConfiguration('renderdoc.mcpServer.port')) {
+                void renderDocMcpServer.restart().then((status) => {
+                    if (status.enabled && !status.running && status.lastError) {
+                        console.warn('[RenderDoc] RenderDoc For VSCode MCP reconfigure failed:', status.lastError);
+                    }
+                });
             }
         }),
         vscode.workspace.onDidOpenTextDocument((document) => {
@@ -1987,24 +1958,6 @@ async function openCapture(context: vscode.ExtensionContext, input?: vscode.Uri 
     }
 
     await loadCapture(context, filePath);
-}
-
-function getDefaultCaptureOutputDir(executable: string, storedDir?: string): string {
-    if (storedDir?.trim()) {
-        return storedDir.trim();
-    }
-
-    const workspaceDir = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
-    if (workspaceDir) {
-        return path.join(workspaceDir, '.renderdoc-captures');
-    }
-
-    const exeDir = executable ? path.dirname(executable) : '';
-    if (exeDir && exeDir !== '.') {
-        return path.join(exeDir, 'captures');
-    }
-
-    return path.join(process.env.TEMP || process.cwd(), 'renderdoc-captures');
 }
 
 function buildCaptureStem(value: string): string {
@@ -2332,7 +2285,6 @@ function closeCapture() {
     currentSelectedDrawCall = undefined;
     currentSelectedResource = undefined;
     currentDrawCalls = [];
-    currentResources = [];
     shaderAliasScanGeneration += 1;
     drawCallProvider.clearFilter();
     updateDrawCallSearchUi();
@@ -2422,7 +2374,6 @@ async function startShaderAliasScan(captureInfo: CaptureInfo, drawCalls: DrawCal
             return;
         }
 
-        currentResources = resources;
         resourceProvider.update(resources);
         if (InspectorPanel.currentPanel) {
             InspectorPanel.currentPanel.setCapture(captureInfo, drawCalls, resources);
@@ -2478,7 +2429,6 @@ async function loadCapture(context: vscode.ExtensionContext, filePath: string, s
         console.log('[RenderDoc] loadCapture: cache hit, populating UI instantly.');
         captureInfoProvider.update(cached.captureInfo);
         currentDrawCalls = cached.drawCalls;
-        currentResources = cached.resources;
         updateDrawCallTree(cached.drawCalls);
         resourceProvider.update(cached.resources);
         apiInspectorProvider.clear();
@@ -2782,7 +2732,6 @@ async function loadCapture(context: vscode.ExtensionContext, filePath: string, s
                 drawCalls = cached.drawCalls;
                 resources = cached.resources;
                 currentDrawCalls = drawCalls;
-                currentResources = resources;
                 progress.report({ message: 'Loading draw calls & resources... (done from cache)', increment: 20 });
             } else {
                 try {
@@ -2796,7 +2745,6 @@ async function loadCapture(context: vscode.ExtensionContext, filePath: string, s
                     if (token.isCancellationRequested) { return; }
                     progress.report({ message: 'Loading resources...', increment: 10 });
                     resources = replayData.resources;
-                    currentResources = resources;
                     resourceProvider.update(resources);
                 } catch (err: any) {
                     replayErr = err;
@@ -2887,7 +2835,6 @@ async function reloadCaptureData(filePath: string, recoveryReason: string): Prom
     updateDrawCallTree(drawCalls);
 
     const resources = replayData.resources;
-    currentResources = resources;
     resourceProvider.update(resources);
 
     await enrichCaptureInfoWithStatistics(captureInfo);

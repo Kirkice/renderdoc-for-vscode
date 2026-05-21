@@ -286,6 +286,8 @@ Navigation:
 
 Open VS Code Chat (`Ctrl+Alt+I`). Use `@renderdoc` when you want the most deterministic RenderDoc-specific behavior, or ask plain Copilot in this repo to let the workspace skill route into the same local `renderdoc_*` tools.
 
+If you want another AI client in VS Code to connect to this extension, use the workspace MCP registration in `.vscode/mcp.json` or run **RenderDoc: Show RenderDoc For VSCode MCP Info** to copy a VS Code `mcp.json` snippet. The extension exposes a local **RenderDoc For VSCode MCP** HTTP endpoint on `127.0.0.1:38967`, backed by the current capture loaded in this window. The extension's own chat flows still use the built-in local `renderdoc_*` tools directly.
+
 Typical `@renderdoc` prompts:
 
 ```text
@@ -307,7 +309,7 @@ Typical default-Copilot prompts in this workspace:
 
 Both flows can use your **active Inspector selection** (focused EID, draw call, sidebar resource), so natural references like *"this draw"* or *"the current event"* resolve automatically.
 
-In this repository, default Copilot is guided by both the workspace skills and `.github/copilot-instructions.md`, so it prefers the local `renderdoc_*` tools over an external RenderDoc MCP path when equivalent local capture data is available.
+In this repository, default Copilot is guided by both the workspace skills and `.github/copilot-instructions.md`, so it uses the local `renderdoc_*` tools directly. The local MCP endpoint is a separate compatibility surface for other clients, not the path used by the extension itself.
 
 Available tools (also invokable via `#toolReferenceName`):
 

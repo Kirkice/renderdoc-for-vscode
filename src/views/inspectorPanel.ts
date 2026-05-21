@@ -1,4 +1,8 @@
-﻿import * as vscode from 'vscode';
+﻿import { exec } from 'child_process';
+import * as fs from 'fs';
+import * as os from 'os';
+import * as path from 'path';
+import * as vscode from 'vscode';
 import { RenderDocBridge } from '../renderdocBridge';
 import { DrawCall, ResourceInfo, CaptureInfo, TextureOverlayMode } from '../types';
 import { withTimeout } from '../util/async';
@@ -1502,11 +1506,6 @@ export class InspectorPanel {
                 return;
             }
 
-            const fs = require('fs');
-            const path = require('path');
-            const os = require('os');
-            const { exec } = require('child_process');
-            
             let finalMaliPath = maliocPath;
             // 如果用户填写的只是一个目录，自动加上 malioc.exe
             if (fs.existsSync(finalMaliPath) && fs.statSync(finalMaliPath).isDirectory()) {

@@ -9,7 +9,7 @@
  * standalone media bundle it will also import from this module.
  */
 
-import type { CaptureInfo, DrawCall, ResourceInfo, TextureOverlayMode } from '../types';
+import type { CaptureInfo, DrawCall, TextureOverlayMode } from '../types';
 
 // ───────────────────────────── Webview → Extension ─────────────────────────────
 

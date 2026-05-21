@@ -22,7 +22,6 @@ import {
     TriggerCaptureResult,
 } from './types';
 import { parseRdcFile, parseRdcThumbnail } from './rdcParser';
-import { withTimeout } from './util/async';
 import {
     logRenderDocDiagnostic,
     logRenderDocError,
@@ -31,7 +30,6 @@ import {
 } from './util/diagnostics';
 import {
     InitResponse,
-    GetRootActionsResponse,
     GetVersionResponse,
     GetResourcesResponse,
     GetTexturesResponse,
@@ -42,21 +40,16 @@ import {
     TriggerCaptureResponse,
     GetShaderEntryPointsResponse,
     GetShaderSourceResponse,
-    GetShaderSourceForEventResponse,
     ApplyShaderEditResponse,
     CompileShaderEditResponse,
     RevertShaderEditResponse,
-    GetPipelineStateResponse,
     GetPipelineConstantBufferContentsResponse,
-    GetTexturePreviewResponse,
     OpenCaptureResponse,
     ReplayHostInfoResponse,
     TryReplayResponse,
     GetTimingsResponse,
     validateResponse,
-    type TGetRootActionsResponse,
     type TGetVersionResponse,
-    type TGetResourcesResponse,
     type TGetTexturesResponse,
     type TGetCaptureStatisticsResponse,
     type TLiveTargetInfoResponse,
@@ -65,13 +58,10 @@ import {
     type TTriggerCaptureResponse,
     type TGetShaderEntryPointsResponse,
     type TGetShaderSourceResponse,
-    type TGetShaderSourceForEventResponse,
     type TApplyShaderEditResponse,
     type TCompileShaderEditResponse,
     type TRevertShaderEditResponse,
-    type TGetPipelineStateResponse,
     type TGetPipelineConstantBufferContentsResponse,
-    type TGetTexturePreviewResponse,
     type TOpenCaptureResponse,
     type TReplayHostInfoResponse,
     type TTryReplayResponse,
@@ -841,7 +831,9 @@ export class RenderDocBridge {
             };
         } finally {
             // Clean up temp file
-            try { await fs.promises.unlink(tmpFile); } catch {}
+            try { await fs.promises.unlink(tmpFile); } catch {
+                // Best-effort cleanup for temp preview files.
+            }
         }
     }
 

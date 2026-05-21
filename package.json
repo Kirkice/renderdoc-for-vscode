@@ -168,7 +168,9 @@
           "properties": {
             "eventIds": {
               "type": "array",
-              "items": { "type": "number" },
+              "items": {
+                "type": "number"
+              },
               "description": "Optional list of specific event IDs to query"
             },
             "markerFilter": {
@@ -177,7 +179,9 @@
             },
             "excludeMarkers": {
               "type": "array",
-              "items": { "type": "string" },
+              "items": {
+                "type": "string"
+              },
               "description": "Exclude actions inside marker groups whose names contain any of these strings"
             },
             "onlyDrawCalls": {
@@ -363,7 +367,9 @@
             },
             "additionalTerms": {
               "type": "array",
-              "items": { "type": "string" },
+              "items": {
+                "type": "string"
+              },
               "description": "Additional search terms to include in project lookup"
             },
             "limit": {
@@ -405,6 +411,39 @@
         }
       },
       {
+        "name": "renderdoc_getMeshData",
+        "displayName": "Get Mesh Data",
+        "toolReferenceName": "meshData",
+        "canBeReferencedInPrompt": true,
+        "icon": "$(symbol-array)",
+        "modelDescription": "Get mesh data for a specific draw event and stage, including topology, vertex attributes, and a bounded sample of rows. Use this after a hot event has been identified to inspect geometry pressure, vertex input layout, or post-VS output.",
+        "userDescription": "Reads mesh data for a specific event.",
+        "inputSchema": {
+          "type": "object",
+          "required": [
+            "eventId"
+          ],
+          "properties": {
+            "eventId": {
+              "type": "number",
+              "description": "The event ID to inspect"
+            },
+            "stage": {
+              "type": "string",
+              "description": "Mesh stage: vsin, vsout, or gsout"
+            },
+            "maxVertices": {
+              "type": "number",
+              "description": "Maximum vertices to return in the sampled rows. Default: 32"
+            },
+            "instance": {
+              "type": "number",
+              "description": "Instance index for instanced draws. Default: 0"
+            }
+          }
+        }
+      },
+      {
         "name": "renderdoc_getFrameSummary",
         "displayName": "Get Frame Summary",
         "toolReferenceName": "frameSummary",
@@ -427,7 +466,9 @@
         "userDescription": "Reverse-searches draws by bound shader name.",
         "inputSchema": {
           "type": "object",
-          "required": ["shaderName"],
+          "required": [
+            "shaderName"
+          ],
           "properties": {
             "shaderName": {
               "type": "string",
@@ -446,7 +487,9 @@
         "userDescription": "Reverse-searches draws by bound texture name.",
         "inputSchema": {
           "type": "object",
-          "required": ["textureName"],
+          "required": [
+            "textureName"
+          ],
           "properties": {
             "textureName": {
               "type": "string",
@@ -465,7 +508,9 @@
         "userDescription": "Reverse-searches draws by resource ID.",
         "inputSchema": {
           "type": "object",
-          "required": ["resourceId"],
+          "required": [
+            "resourceId"
+          ],
           "properties": {
             "resourceId": {
               "type": "string",
@@ -484,7 +529,9 @@
         "userDescription": "Reads texture pixel data as a base64 PNG.",
         "inputSchema": {
           "type": "object",
-          "required": ["textureId"],
+          "required": [
+            "textureId"
+          ],
           "properties": {
             "textureId": {
               "type": "string",
@@ -515,7 +562,9 @@
         "userDescription": "Reads raw bytes from a GPU buffer resource.",
         "inputSchema": {
           "type": "object",
-          "required": ["resourceId"],
+          "required": [
+            "resourceId"
+          ],
           "properties": {
             "resourceId": {
               "type": "string",
@@ -691,6 +740,12 @@
         "title": "Show Copilot Tool Status",
         "category": "RenderDoc",
         "icon": "$(tools)"
+      },
+      {
+        "command": "renderdoc.showMcpServerInfo",
+        "title": "Show RenderDoc For VSCode MCP Info",
+        "category": "RenderDoc",
+        "icon": "$(hubot)"
       },
       {
         "command": "renderdoc.showDiagnosticsLog",
@@ -1048,6 +1103,16 @@
           "type": "string",
           "default": "",
           "description": "Optional path to the Mali Offline Compiler executable (malioc.exe). Configure only if you want Mali shader analysis."
+        },
+        "renderdoc.mcpServer.enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Expose the optional local RenderDoc For VSCode MCP endpoint for other VS Code AI clients. The extension itself uses its built-in RenderDoc tools directly."
+        },
+        "renderdoc.mcpServer.port": {
+          "type": "number",
+          "default": 38967,
+          "description": "TCP port used by the local RenderDoc For VSCode MCP server. Change this only if the default port conflicts with another process."
         }
       }
     }
@@ -1059,15 +1124,23 @@
     "package": "npm run typecheck && node esbuild.js --production",
     "typecheck": "tsc -p ./ --noEmit",
     "lint": "eslint src --ext ts",
-    "test:rdc-parser": "node scripts/test-rdc-parser.js"
+    "test:mcp-tool-parity": "node scripts/test-mcp-tool-parity.js",
+    "test:rdc-parser": "node scripts/test-rdc-parser.js",
+    "test:mcp-runtime": "node scripts/test-mcp-runtime.js"
   },
   "devDependencies": {
+    "@typescript-eslint/eslint-plugin": "^8.59.4",
+    "@typescript-eslint/parser": "^8.59.4",
     "@types/node": "^20.11.0",
     "@types/vscode": "^1.95.0",
+    "eslint": "^8.57.1",
     "esbuild": "^0.28.0",
     "typescript": "^5.3.0"
   },
   "dependencies": {
+    "@cfworker/json-schema": "4.1.1",
+    "@modelcontextprotocol/node": "2.0.0-alpha.2",
+    "@modelcontextprotocol/server": "2.0.0-alpha.2",
     "zod": "^4.3.6"
   }
 }

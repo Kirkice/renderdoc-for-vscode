@@ -100,8 +100,7 @@ export interface ReplayHostInfo {
     remoteSupportedReplays?: string[];
 }
 
-export interface LaunchCaptureResult extends LiveTargetInfo {
-}
+export type LaunchCaptureResult = LiveTargetInfo;
 
 export interface TriggerCaptureResult extends LiveTargetInfo {
     capturePath: string;
