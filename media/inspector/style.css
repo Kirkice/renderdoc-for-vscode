@@ -1931,6 +1931,48 @@
             font-family: var(--vscode-editor-font-family);
         }
         .modal-actions { display: flex; gap: 6px; align-items: center; }
+        .mali-modal-panel .modal-actions {
+            flex-wrap: wrap;
+            justify-content: flex-end;
+        }
+        .mali-device-picker {
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            min-height: 28px;
+            padding: 0 10px;
+            border: 1px solid var(--vscode-input-border, var(--vscode-panel-border));
+            border-radius: 6px;
+            background: var(--vscode-dropdown-background, var(--vscode-input-background));
+        }
+        .mali-device-picker-label {
+            color: var(--rd-text-dim);
+            font-size: 0.75em;
+            line-height: 1;
+            letter-spacing: 0.04em;
+            text-transform: uppercase;
+        }
+        .mali-device-select {
+            min-width: 140px;
+            border: none;
+            background: transparent;
+            color: var(--vscode-dropdown-foreground, var(--vscode-input-foreground));
+            font: inherit;
+            outline: none;
+            padding: 0;
+        }
+        .mali-device-select option {
+            background: var(--vscode-dropdown-background, var(--vscode-input-background));
+            color: var(--vscode-dropdown-foreground, var(--vscode-input-foreground));
+        }
+        .mali-device-select option:checked {
+            background: var(--vscode-list-activeSelectionBackground);
+            color: var(--vscode-list-activeSelectionForeground);
+        }
+        .mali-device-select:disabled {
+            opacity: 0.65;
+            cursor: not-allowed;
+        }
         .modal-body { flex: 1; display: flex; overflow: hidden; }
         .mali-modal-panel {
             width: min(92vw, 1120px);

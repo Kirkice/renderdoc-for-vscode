@@ -21,6 +21,14 @@ import {
     openShaderSourceDocument,
 } from '../shaderEditor';
 import { buildInspectorHtml } from './inspector/html';
+import { normalizeMaliOfflineCompilerDevice } from './inspector/maliDevices';
+
+interface LatestMaliAnalysisResult {
+    source: string;
+    stage: string;
+    result: string;
+    device?: string;
+}
 
 /**
  * RenderDoc-style unified Inspector WebView.
@@ -87,7 +95,7 @@ export class InspectorPanel {
     private timingCapturePath: string | undefined;
     private timingsLoadingForPath: string | undefined;
 
-    private latestMaliAnalysis?: { source: string, stage: string, result: string };
+    private latestMaliAnalysis?: LatestMaliAnalysisResult;
     private replayStatus: MsgReplayStatus = {
         type: 'replayStatus',
         status: 'none',
@@ -465,7 +473,7 @@ export class InspectorPanel {
         return this.currentDrawCall;
     }
 
-    public getLatestMaliAnalysisResult(): { source: string, stage: string, result: string } | undefined {
+    public getLatestMaliAnalysisResult(): LatestMaliAnalysisResult | undefined {
         return this.latestMaliAnalysis;
     }
 
@@ -1078,7 +1086,7 @@ export class InspectorPanel {
                 break;
             }
             case 'analyzeMaliOffline': {
-                this.analyzeMaliOffline(msg.source, msg.stage);
+                this.analyzeMaliOffline(msg.source, msg.stage, msg.device);
                 break;
             }
             case 'openMaliOfflineSettings':
@@ -1491,7 +1499,8 @@ export class InspectorPanel {
         }
     }
 
-    private async analyzeMaliOffline(source: string, stage: string) {
+    private async analyzeMaliOffline(source: string, stage: string, device?: string) {
+        const selectedDevice = normalizeMaliOfflineCompilerDevice(device);
         try {
             const maliConfig = this.getMaliOfflineCompilerConfig();
             const maliocPath = maliConfig.path;
@@ -1523,11 +1532,12 @@ export class InspectorPanel {
 
             const tempFile = path.join(os.tmpdir(), `mali_analyze_${Date.now()}${ext}`);
             fs.writeFileSync(tempFile, source);
+            const deviceArg = selectedDevice ? ` -c "${selectedDevice}"` : '';
 
             // 在 Windows 下加 chcp 65001 强制控制台输出 UTF-8，防止中文系统的报错变成乱码
             const cmd = process.platform === 'win32' 
-                ? `chcp 65001 >nul & "${finalMaliPath}" "${tempFile}"` 
-                : `"${finalMaliPath}" "${tempFile}"`;
+                ? `chcp 65001 >nul & "${finalMaliPath}" "${tempFile}"${deviceArg}` 
+                : `"${finalMaliPath}" "${tempFile}"${deviceArg}`;
 
             exec(cmd, { timeout: 30000 }, (error: any, stdout: string, stderr: string) => {
                 if (fs.existsSync(tempFile)) fs.unlinkSync(tempFile); // cleanup
@@ -1545,7 +1555,8 @@ export class InspectorPanel {
                 this.latestMaliAnalysis = {
                     source: source,
                     stage: stage,
-                    result: errStr ? `Error: ${errStr}\nOutput: ${finalResult}` : finalResult
+                    result: errStr ? `Error: ${errStr}\nOutput: ${finalResult}` : finalResult,
+                    ...(selectedDevice ? { device: selectedDevice } : {}),
                 };
 
                 this.panel.webview.postMessage({
@@ -1559,7 +1570,8 @@ export class InspectorPanel {
             this.latestMaliAnalysis = {
                 source: source,
                 stage: stage,
-                result: `Failed to run Mali Offline Compiler: ${e.message}`
+                result: `Failed to run Mali Offline Compiler: ${e.message}`,
+                ...(selectedDevice ? { device: selectedDevice } : {}),
             };
             this.panel.webview.postMessage({
                 type: 'maliAnalysisResult',

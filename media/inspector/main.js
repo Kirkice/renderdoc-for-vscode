@@ -76,6 +76,7 @@
         maliOfflineCompilerHint: null,
         maliAnalysisByShader: {},
         pendingMaliAnalysis: null,
+        maliSelectedDevice: '',
     };
 
     // Build resourceId -> resource info lookup (strings for consistent key match)
@@ -180,8 +181,22 @@
         vscode.postMessage({ type: 'openMaliOfflineSettings' });
     }
 
-    function shaderMaliAnalysisKey(eventId, stage, resourceId) {
-        return [String(eventId ?? ''), String(stage ?? ''), String(resourceId ?? '')].join('|');
+    function getCurrentMaliDevice() {
+        return String(state.maliSelectedDevice || '').trim();
+    }
+
+    function getMaliDeviceLabel(device) {
+        const normalized = String(device || '').trim();
+        return normalized || 'Default profile';
+    }
+
+    function shaderMaliAnalysisKey(eventId, stage, resourceId, device) {
+        return [
+            String(eventId ?? ''),
+            String(stage ?? ''),
+            String(resourceId ?? ''),
+            String(device ?? ''),
+        ].join('|');
     }
 
     function clearMaliAnalysisState() {
@@ -189,16 +204,17 @@
         state.pendingMaliAnalysis = null;
     }
 
-    function getPendingMaliAnalysisForShader(eventId, stage, resourceId) {
+    function getPendingMaliAnalysisForShader(eventId, stage, resourceId, device) {
         const pending = state.pendingMaliAnalysis;
         if (!pending) return null;
         if (pending.eventId !== eventId || pending.stage !== stage) return null;
         if (String(pending.resourceId || '') !== String(resourceId || '')) return null;
+        if (String(pending.device || '') !== String(device || '')) return null;
         return pending;
     }
 
-    function getShaderMaliAnalysisRecord(eventId, stage, resourceId) {
-        return state.maliAnalysisByShader[shaderMaliAnalysisKey(eventId, stage, resourceId)] || null;
+    function getShaderMaliAnalysisRecord(eventId, stage, resourceId, device) {
+        return state.maliAnalysisByShader[shaderMaliAnalysisKey(eventId, stage, resourceId, device)] || null;
     }
 
     function storePendingMaliAnalysisResult(message) {
@@ -212,6 +228,7 @@
             eventId: pending.eventId,
             stage: pending.stage,
             resourceId: pending.resourceId,
+            device: pending.device || '',
             filename: pending.filename,
             source: pending.source,
             result: typeof message.result === 'string' ? message.result : '',
@@ -220,19 +237,21 @@
             completedAt: Date.now(),
         };
 
-        state.maliAnalysisByShader[shaderMaliAnalysisKey(record.eventId, record.stage, record.resourceId)] = record;
+        state.maliAnalysisByShader[shaderMaliAnalysisKey(record.eventId, record.stage, record.resourceId, record.device)] = record;
         return record;
     }
 
-    function getMaliAnalyzeAvailability(selectedFileIndex, source, eventId, stage, resourceId) {
+    function getMaliAnalyzeAvailability(selectedFileIndex, source, eventId, stage, resourceId, device) {
         const configured = !!state.maliOfflineCompilerConfigured;
-        const pending = !!getPendingMaliAnalysisForShader(eventId, stage, resourceId);
+        const pending = !!getPendingMaliAnalysisForShader(eventId, stage, resourceId, device);
+        const busy = !!state.pendingMaliAnalysis;
         if (!configured) {
             const hint = state.maliOfflineCompilerHint || 'Set renderdoc.maliOfflineCompilerPath in VS Code Settings to enable Mali Offline Compiler analysis.';
             return {
                 configured: false,
                 canAnalyze: false,
                 pending: false,
+                busy: false,
                 title: hint,
                 reason: hint,
             };
@@ -242,8 +261,19 @@
                 configured: true,
                 canAnalyze: false,
                 pending: true,
+                busy: true,
                 title: 'Mali Offline Compiler analysis is already running for this shader stage',
                 reason: 'Analysis is already running for this shader stage.',
+            };
+        }
+        if (busy) {
+            return {
+                configured: true,
+                canAnalyze: false,
+                pending: false,
+                busy: true,
+                title: 'Mali Offline Compiler is already running',
+                reason: 'Wait for the current Mali Offline Compiler run to finish before starting another analysis.',
             };
         }
         if (selectedFileIndex === -1) {
@@ -251,6 +281,7 @@
                 configured: true,
                 canAnalyze: false,
                 pending: false,
+                busy: false,
                 title: 'Open Mali Offline Compiler analysis window',
                 reason: 'Switch to a source file tab to analyze source code.',
             };
@@ -260,6 +291,7 @@
                 configured: true,
                 canAnalyze: false,
                 pending: false,
+                busy: false,
                 title: 'Open Mali Offline Compiler analysis window',
                 reason: 'No shader source is available to analyze.',
             };
@@ -268,6 +300,7 @@
             configured: true,
             canAnalyze: true,
             pending: false,
+            busy: false,
             title: 'Open Mali Offline Compiler analysis window',
             reason: '',
         };
@@ -570,6 +603,7 @@
             eventId: state.eventId,
             stage: activeStage,
             resourceId: String(context.resourceId || ''),
+            device: getCurrentMaliDevice(),
             source: String(context.currentCode || ''),
             filename: context.currentFileName || (activeStage + '-shader'),
             selectedFileIndex: typeof context.selectedFileIndex === 'number' ? context.selectedFileIndex : 0,
@@ -584,11 +618,13 @@
                 context.eventId,
                 context.stage,
                 context.resourceId,
+                context.device,
             )
             : {
                 configured: !!state.maliOfflineCompilerConfigured,
                 canAnalyze: false,
                 pending: false,
+                busy: !!state.pendingMaliAnalysis,
                 title: state.maliOfflineCompilerConfigured
                     ? 'Open Mali Offline Compiler analysis window'
                     : (state.maliOfflineCompilerHint || 'Set renderdoc.maliOfflineCompilerPath in VS Code Settings to enable Mali Offline Compiler analysis.'),
@@ -596,12 +632,13 @@
                     ? 'Select an event and a source file in the Shaders tab to analyze it with Mali Offline Compiler.'
                     : (state.maliOfflineCompilerHint || 'Set renderdoc.maliOfflineCompilerPath in VS Code Settings to enable Mali Offline Compiler analysis.'),
             };
+        const selectedDeviceLabel = getMaliDeviceLabel(context ? context.device : getCurrentMaliDevice());
 
         const pendingMaliAnalysis = context
-            ? getPendingMaliAnalysisForShader(context.eventId, context.stage, context.resourceId)
+            ? getPendingMaliAnalysisForShader(context.eventId, context.stage, context.resourceId, context.device)
             : null;
         const maliRecord = context
-            ? getShaderMaliAnalysisRecord(context.eventId, context.stage, context.resourceId)
+            ? getShaderMaliAnalysisRecord(context.eventId, context.stage, context.resourceId, context.device)
             : null;
         const maliIsStale = !!(maliRecord && context && maliRecord.source !== context.source);
         const maliOutputText = getMaliAnalysisOutputText(maliRecord);
@@ -623,6 +660,13 @@
                 label: 'Status',
                 value: analysisStatusValue,
                 meta: 'Static source analysis',
+            },
+            {
+                label: 'Device',
+                value: selectedDeviceLabel,
+                meta: context && context.device
+                    ? 'Selected target GPU profile'
+                    : 'Using malioc default device profile',
             },
             {
                 label: 'Snapshot',
@@ -771,6 +815,7 @@
             && presentation.context
             && presentation.availability.configured
             && presentation.availability.canAnalyze
+            && !presentation.availability.busy
             && !presentation.pendingMaliAnalysis
             && (!presentation.maliRecord || presentation.maliIsStale || presentation.maliRecord.error)
         );
@@ -785,6 +830,7 @@
             context.eventId,
             context.stage,
             context.resourceId,
+            context.device,
         );
 
         if (!availability.configured) {
@@ -799,6 +845,7 @@
             eventId: context.eventId,
             stage: context.stage,
             resourceId: context.resourceId,
+            device: context.device || '',
             filename: context.filename,
             source: context.source,
             startedAt: Date.now(),
@@ -815,6 +862,7 @@
             type: 'analyzeMaliOffline',
             source: context.source,
             stage: context.stage,
+            device: context.device || undefined,
         });
         return true;
     }
@@ -3915,7 +3963,14 @@
 
         const analyzeBtn = document.createElement('button');
         analyzeBtn.className = 'icon-btn mali-analyze-btn';
-        const maliAnalyzeState = getMaliAnalyzeAvailability(cur, currentCode, state.eventId, activeStage, shaderResourceKey);
+        const maliAnalyzeState = getMaliAnalyzeAvailability(
+            cur,
+            currentCode,
+            state.eventId,
+            activeStage,
+            shaderResourceKey,
+            getCurrentMaliDevice(),
+        );
         analyzeBtn.classList.toggle('configured', maliAnalyzeState.configured);
         analyzeBtn.classList.toggle('unconfigured', !maliAnalyzeState.configured);
         analyzeBtn.classList.toggle('pending', maliAnalyzeState.pending);
@@ -4059,8 +4114,10 @@
             buildStatusValue = 'Dirty';
         }
 
-        const pendingMaliAnalysis = getPendingMaliAnalysisForShader(state.eventId, activeStage, shaderResourceKey);
-        const maliRecord = getShaderMaliAnalysisRecord(state.eventId, activeStage, shaderResourceKey);
+        const selectedMaliDevice = getCurrentMaliDevice();
+        const selectedMaliDeviceLabel = getMaliDeviceLabel(selectedMaliDevice);
+        const pendingMaliAnalysis = getPendingMaliAnalysisForShader(state.eventId, activeStage, shaderResourceKey, selectedMaliDevice);
+        const maliRecord = getShaderMaliAnalysisRecord(state.eventId, activeStage, shaderResourceKey, selectedMaliDevice);
         const maliIsStale = !!(maliRecord && maliRecord.source !== currentCode);
         const maliOutputText = getMaliAnalysisOutputText(maliRecord);
         const maliSummary = maliOutputText ? parseMaliAnalysisSummary(maliOutputText) : { metrics: [], signals: [], highlights: [] };
@@ -4092,6 +4149,13 @@
                 label: 'Status',
                 value: analysisStatusValue,
                 meta: 'Static source analysis',
+            },
+            {
+                label: 'Device',
+                value: selectedMaliDeviceLabel,
+                meta: selectedMaliDevice
+                    ? 'Selected target GPU profile'
+                    : 'Using malioc default device profile',
             },
             {
                 label: 'Snapshot',
@@ -4144,7 +4208,8 @@
         }
 
         analysisMetrics[0].value = analysisStatusValue;
-        analysisMetrics[1].value = analysisSnapshotValue;
+        analysisMetrics[1].value = selectedMaliDeviceLabel;
+        analysisMetrics[2].value = analysisSnapshotValue;
         if (!pendingMaliAnalysis && maliRecord && maliSummary.signals.length > 0) {
             analysisPills = analysisPills.concat(maliSummary.signals);
         }
@@ -5310,6 +5375,7 @@
     const maliModalSubtitleEl = document.getElementById('mali-modal-subtitle');
     const maliModalSettingsEl = document.getElementById('mali-modal-settings');
     const maliModalRerunEl = document.getElementById('mali-modal-rerun');
+    const maliModalDeviceSelectEl = document.getElementById('mali-modal-device');
 
     function closeMaliAnalysisModal() {
         if (!maliModalEl) return;
@@ -5321,6 +5387,7 @@
 
         const presentation = buildMaliAnalysisPresentation(getActiveMaliAnalysisContext());
         const context = presentation.context;
+        const selectedDeviceLabel = getMaliDeviceLabel(context ? context.device : getCurrentMaliDevice());
 
         if (maliModalTitleEl) {
             maliModalTitleEl.textContent = 'Mali Offline Compiler';
@@ -5332,8 +5399,16 @@
                     context.filename,
                     context.resourceId ? ('Resource ' + context.resourceId) : '',
                     context.eventId != null ? ('EID ' + context.eventId) : '',
+                    selectedDeviceLabel,
                 ].filter(Boolean).join(' · ')
-                : 'Static shader analysis for the currently selected shader source snapshot.';
+                : ('Static shader analysis for the currently selected shader source snapshot. Device: ' + selectedDeviceLabel + '.');
+        }
+        if (maliModalDeviceSelectEl) {
+            maliModalDeviceSelectEl.value = getCurrentMaliDevice();
+            maliModalDeviceSelectEl.disabled = !!state.pendingMaliAnalysis;
+            maliModalDeviceSelectEl.title = getCurrentMaliDevice()
+                ? ('Analyze for ' + getCurrentMaliDevice())
+                : 'Use malioc default device profile';
         }
         if (maliModalSettingsEl) {
             maliModalSettingsEl.textContent = presentation.availability.configured ? 'Configure Path' : 'Set Path';
@@ -5345,9 +5420,11 @@
                 : (presentation.maliRecord ? 'Re-run Analysis' : 'Run Analysis');
             maliModalRerunEl.disabled = !presentation.availability.configured
                 || !presentation.availability.canAnalyze
-                || !!presentation.pendingMaliAnalysis;
+                || !!presentation.availability.busy;
             maliModalRerunEl.title = presentation.pendingMaliAnalysis
                 ? 'Mali Offline Compiler analysis is already running for this shader stage.'
+                : presentation.availability.busy
+                    ? 'Wait for the current Mali Offline Compiler run to finish before starting another one.'
                 : (presentation.availability.canAnalyze
                     ? 'Run Mali Offline Compiler on the current shader source snapshot.'
                     : (presentation.availability.reason || 'Mali analysis is unavailable for the current selection.'));
@@ -5397,6 +5474,18 @@
 
     if (maliModalSettingsEl) {
         maliModalSettingsEl.addEventListener('click', openMaliOfflineSettings);
+    }
+    if (maliModalDeviceSelectEl) {
+        state.maliSelectedDevice = String(maliModalDeviceSelectEl.value || '').trim();
+        maliModalDeviceSelectEl.addEventListener('change', () => {
+            state.maliSelectedDevice = String(maliModalDeviceSelectEl.value || '').trim();
+            if (state.activeTab === 'shaders') {
+                renderShaders();
+            }
+            if (maliModalEl && !maliModalEl.hidden) {
+                renderMaliAnalysisModal();
+            }
+        });
     }
     if (maliModalRerunEl) {
         maliModalRerunEl.addEventListener('click', () => {

@@ -63,6 +63,7 @@ export interface MsgAnalyzeMaliOffline {
     type: 'analyzeMaliOffline';
     source: string;
     stage: string;
+    device?: string;
 }
 
 export interface MsgOpenMaliOfflineSettings {

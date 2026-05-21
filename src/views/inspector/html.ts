@@ -1,4 +1,5 @@
 import * as vscode from 'vscode';
+import { MALI_OFFLINE_COMPILER_DEVICES } from './maliDevices';
 
 /** Produce a CSP nonce for the inlined client script. */
 export function generateNonce(): string {
@@ -31,6 +32,10 @@ export function buildInspectorHtml(
     const scriptUri = webview.asWebviewUri(
         vscode.Uri.joinPath(extensionUri, 'media', 'inspector', 'main.js'),
     );
+    const maliDeviceOptions = [
+        '<option value="">Default profile</option>',
+        ...MALI_OFFLINE_COMPILER_DEVICES.map((device) => `<option value="${device}">${device}</option>`),
+    ].join('');
 
     const csp = [
         `default-src 'none'`,
@@ -238,6 +243,10 @@ export function buildInspectorHtml(
                         <span id="mali-modal-subtitle" class="modal-subtitle">Static shader analysis for the current source snapshot.</span>
                     </div>
                     <div class="modal-actions">
+                        <label class="mali-device-picker" title="Choose the target Mali GPU profile. Leave this on the default option to let malioc use its own default device profile.">
+                            <span class="mali-device-picker-label">Device</span>
+                            <select id="mali-modal-device" class="mali-device-select">${maliDeviceOptions}</select>
+                        </label>
                         <button id="mali-modal-settings" class="icon-btn">Configure Path</button>
                         <button id="mali-modal-rerun" class="icon-btn">Run Analysis</button>
                         <button id="mali-modal-close" class="icon-btn">✕</button>

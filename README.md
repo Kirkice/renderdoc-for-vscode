@@ -17,7 +17,7 @@
 
 ## Overview
 
-**RenderDoc for VS Code** brings the full power of the RenderDoc graphics debugger into Visual Studio Code. Open any `.rdc` capture file and get an instant, first-class inspection experience — hierarchical draw call timelines, live shader source, full pipeline state, texture and buffer inspection, GPU timing profiling, project-source mapping, Mali shader analysis, and an AI-powered frame analyzer via GitHub Copilot Chat.
+**RenderDoc for VS Code** brings the full power of the RenderDoc graphics debugger into Visual Studio Code. Open any `.rdc` capture file and get an instant, first-class inspection experience — hierarchical draw call timelines, live shader source, full pipeline state, texture and buffer inspection, GPU timing profiling, project-source mapping, Mali shader analysis, GitHub Copilot Chat integration, and an optional local MCP endpoint for other AI clients.
 
 No context switching. No external viewers. Just your capture, your editor, and your agent.
 
@@ -74,7 +74,7 @@ A C++ bridge (`renderdoc_bridge.exe`) links directly to RenderDoc's replay DLL �
 <td width="50%" valign="top">
 
 ### AI-Powered Frame Analysis (`@renderdoc`)
-Ask `@renderdoc` anything about your capture. The Copilot participant reads your current Inspector selection and dispatches 19 specialized language-model tools — including on-demand action timings, shader and constant-buffer inspection, resource reverse lookups, project-source mapping, and Mali shader analysis results.
+Ask `@renderdoc` anything about your capture. The Copilot participant reads your current Inspector selection and dispatches 21 specialized language-model tools — including on-demand action timings, shader and constant-buffer inspection, resource reverse lookups, project-source mapping, and Mali shader analysis results.
 
 </td>
 <td width="50%" valign="top">
@@ -95,13 +95,13 @@ Analyze any shader directly from the Inspector's Shaders tab using the **Mali Of
     ·
     <a href="#inspector-views"><b>Inspector Views</b></a>
     ·
-    <a href="#copilot-workflow"><b>Copilot Workflow</b></a>
+    <a href="#capture-workflow"><b>Capture Workflow</b></a>
     ·
-    <a href="#4--inspector-workflow"><b>Usage Guide</b></a>
+    <a href="#ai--mcp-workflow"><b>AI and MCP Workflow</b></a>
 </p>
 
 <p align="center">
-    A quick visual tour of the extension: capture metadata, inspector tabs, render-flow analysis, resource views, and the Copilot-assisted workflow.
+    Placeholder slots for product screenshots. Replace each placeholder block with the final image when the assets are ready.
 </p>
 
 ### Capture Overview
@@ -109,9 +109,14 @@ Analyze any shader directly from the Inspector's Shaders tab using the **Mali Of
 <table>
 <tr>
 <td width="50%" valign="top" align="center">
-        <img src="https://raw.githubusercontent.com/Kirkice/renderdoc-for-vscode/main/screenshots/PreView.jpeg" alt="Capture preview" width="96%" />
-    <br />
-    <sub><b>Preview</b> — quick visual confirmation of the captured frame output.</sub>
+    <b>[Placeholder]</b><br />
+    Suggested file: <code>screenshots/capture-overview.png</code><br />
+    <sub><b>Overview</b> — frame thumbnail, API and driver metadata, and capture summary.</sub>
+</td>
+<td width="50%" valign="top" align="center">
+    <b>[Placeholder]</b><br />
+    Suggested file: <code>screenshots/draw-calls-and-resources.png</code><br />
+    <sub><b>Sidebar Views</b> — Draw Calls, Resources, and selection context in the activity bar.</sub>
 </td>
 </tr>
 </table>
@@ -121,65 +126,87 @@ Analyze any shader directly from the Inspector's Shaders tab using the **Mali Of
 <table>
 <tr>
 <td width="33.3%" valign="top" align="center">
-    <img src="https://raw.githubusercontent.com/Kirkice/renderdoc-for-vscode/main/screenshots/PipelineState.jpeg" alt="Pipeline State" width="94%" />
-    <br />
+    <b>[Placeholder]</b><br />
+    Suggested file: <code>screenshots/pipeline-state.png</code><br />
     <sub><b>Pipeline State</b> — inspect bound stages and per-draw graphics state.</sub>
 </td>
 <td width="33.3%" valign="top" align="center">
-    <img src="https://raw.githubusercontent.com/Kirkice/renderdoc-for-vscode/main/screenshots/PipelineGraph01.jpeg" alt="Pipeline Graph overview" width="94%" />
-    <br />
-    <sub><b>PipelineGraph</b> — render-flow visualization derived from the full EventBrowser hierarchy.</sub>
+    <b>[Placeholder]</b><br />
+    Suggested file: <code>screenshots/pipeline-graph-overview.png</code><br />
+    <sub><b>Pipeline Graph</b> — render-flow visualization derived from the full event hierarchy.</sub>
 </td>
 <td width="33.3%" valign="top" align="center">
-    <img src="https://raw.githubusercontent.com/Kirkice/renderdoc-for-vscode/main/screenshots/PipelineGraph02.jpeg" alt="Pipeline Graph detail" width="94%" />
-    <br />
-    <sub><b>PipelineGraph Detail</b> — drill into pass groups, representative commands, and selected-event context.</sub>
+    <b>[Placeholder]</b><br />
+    Suggested file: <code>screenshots/pipeline-graph-detail.png</code><br />
+    <sub><b>Pipeline Graph Detail</b> — drill into pass groups, representative commands, and selected-event context.</sub>
 </td>
 </tr>
 <tr>
 <td width="33.3%" valign="top" align="center">
-    <img src="https://raw.githubusercontent.com/Kirkice/renderdoc-for-vscode/main/screenshots/Shaders.jpeg" alt="Shaders tab" width="94%" />
-    <br />
+    <b>[Placeholder]</b><br />
+    Suggested file: <code>screenshots/shaders.png</code><br />
     <sub><b>Shaders</b> — source, disassembly, and shader-stage analysis in one place.</sub>
 </td>
 <td width="33.3%" valign="top" align="center">
-    <img src="https://raw.githubusercontent.com/Kirkice/renderdoc-for-vscode/main/screenshots/TextureView.jpeg" alt="Texture Viewer" width="94%" />
-    <br />
+    <b>[Placeholder]</b><br />
+    Suggested file: <code>screenshots/texture-view.png</code><br />
     <sub><b>Texture View</b> — inspect render targets and sampled textures for the current draw.</sub>
 </td>
 <td width="33.3%" valign="top" align="center">
-    <img src="https://raw.githubusercontent.com/Kirkice/renderdoc-for-vscode/main/screenshots/TextureInfo.jpeg" alt="Texture Info" width="94%" />
-    <br />
+    <b>[Placeholder]</b><br />
+    Suggested file: <code>screenshots/texture-info.png</code><br />
     <sub><b>Texture Info</b> — zoom into an individual texture with focused metadata.</sub>
 </td>
 </tr>
 <tr>
 <td width="33.3%" valign="top" align="center">
-    <img src="https://raw.githubusercontent.com/Kirkice/renderdoc-for-vscode/main/screenshots/MeshView.jpeg" alt="Mesh View" width="94%" />
-    <br />
+    <b>[Placeholder]</b><br />
+    Suggested file: <code>screenshots/mesh-view.png</code><br />
     <sub><b>Mesh View</b> — inspect vertex/index data and geometry layout at a selected event.</sub>
 </td>
 <td width="33.3%" valign="top" align="center">
-    <img src="https://raw.githubusercontent.com/Kirkice/renderdoc-for-vscode/main/screenshots/ResourceInspector.jpeg" alt="Resource Inspector" width="94%" />
-    <br />
+    <b>[Placeholder]</b><br />
+    Suggested file: <code>screenshots/resource-inspector.png</code><br />
     <sub><b>Resource Inspector</b> — browse textures, buffers, and shader resources across the capture.</sub>
 </td>
 <td width="33.3%" valign="top" align="center">
-    <img src="https://raw.githubusercontent.com/Kirkice/renderdoc-for-vscode/main/screenshots/OverView.jpeg" alt="Frame preview detail" width="94%" />
-    <br />
-    <sub><b>Overview</b> — capture metadata, API/driver details, and frame summary.</sub>
+    <b>[Placeholder]</b><br />
+    Suggested file: <code>screenshots/inspector-overview.png</code><br />
+    <sub><b>Overview</b> — capture metadata, API and driver details, and frame summary.</sub>
 </td>
 </tr>
 </table>
 
-### Copilot Workflow
+### Capture Workflow
 
 <table>
 <tr>
-<td width="100%" valign="top" align="center">
-    <img src="https://raw.githubusercontent.com/Kirkice/renderdoc-for-vscode/main/screenshots/Chat-with-Copilot.jpeg" alt="Chat with Copilot" width="72%" />
-    <br />
-    <sub><b>Chat with Copilot</b> — use <code>@renderdoc</code> to analyze the current frame, draw calls, resources, and shaders.</sub>
+<td width="50%" valign="top" align="center">
+    <b>[Placeholder]</b><br />
+    Suggested file: <code>screenshots/launch-panel.png</code><br />
+    <sub><b>Launch Panel</b> — configure the target executable, arguments, output path, and capture trigger.</sub>
+</td>
+<td width="50%" valign="top" align="center">
+    <b>[Placeholder]</b><br />
+    Suggested file: <code>screenshots/capture-target-view.png</code><br />
+    <sub><b>Capture Target View</b> — switch between local and remote targets, attach, and trigger captures.</sub>
+</td>
+</tr>
+</table>
+
+### AI and MCP Workflow
+
+<table>
+<tr>
+<td width="50%" valign="top" align="center">
+    <b>[Placeholder]</b><br />
+    Suggested file: <code>screenshots/copilot-chat.png</code><br />
+    <sub><b>Copilot Chat</b> — use <code>@renderdoc</code> or plain Copilot to analyze the current frame, draw calls, resources, and shaders.</sub>
+</td>
+<td width="50%" valign="top" align="center">
+    <b>[Placeholder]</b><br />
+    Suggested file: <code>screenshots/mcp-connection-info.png</code><br />
+    <sub><b>MCP Connection Info</b> — copy the local endpoint and client snippets for other MCP-capable tools.</sub>
 </td>
 </tr>
 </table>
@@ -190,14 +217,14 @@ Analyze any shader directly from the Inspector's Shaders tab using the **Mali Of
 
 ```
 1. Install the extension in VS Code 1.95+
-2. Run `RenderDoc: Open Launch Application`, `RenderDoc: Attach On Selected Target`, or open an existing `.rdc`
+2. Run `RenderDoc: Open Launch Panel`, `RenderDoc: Attach On Selected Target`, or open an existing `.rdc`
 3. The RenderDoc sidebar appears automatically
 4. Click any draw call → Inspector opens beside your editor
 5. Run "Fetch GPU Timings" to populate durationUs per draw
-6. Chat with `@renderdoc` or plain Copilot for deep frame analysis
+6. Chat with `@renderdoc`, plain Copilot, or another MCP-capable client connected to the local endpoint
 ```
 
-> **Requires:** A bundled `.renderdoc-runtime` inside the VSIX or a local RenderDoc installation. Packaged VSIX builds can run directly from the bundled runtime and native bridge. When working from source, build `native/build/Release/renderdoc_bridge.exe`; if a packaged install is missing it, run **`RenderDoc: Download Native Bridge…`**.
+> **Requires:** Packaged VSIX releases can run directly from the bundled `.renderdoc-runtime` and native bridge. When working from source, build `native/build/Release/renderdoc_bridge.exe` and use a local RenderDoc install unless your development package also includes `.renderdoc-runtime`. If a packaged install is damaged or incomplete, run **`RenderDoc: Restore Native Bridge…`** to recover the bundled helper from the latest VSIX.
 
 ---
 
@@ -207,9 +234,11 @@ Analyze any shader directly from the Inspector's Shaders tab using the **Mali Of
 
 **Option A — from VSIX (recommended):**
 ```powershell
-code --install-extension renderdoc-for-vscode-0.0.7.vsix
+code --install-extension path/to/renderdoc-for-vscode-<version>.vsix
 ```
 Or: `Extensions` panel → `···` menu → **Install from VSIX…**
+
+GitHub Releases publish a single `.vsix` package for installation. The packaged native bridge and bundled runtime are already included inside that VSIX.
 
 **Option B — from source:** see [Building from Source](#building-from-source).
 
@@ -217,7 +246,9 @@ Or: `Extensions` panel → `···` menu → **Install from VSIX…**
 
 ### 2 · Installing RenderDoc (runtime dependency)
 
-The extension loads RenderDoc's replay library (`renderdoc.dll` / `librenderdoc.so`) at runtime. If your VSIX already bundles a `.renderdoc-runtime` directory, that runtime is used automatically. Otherwise install RenderDoc locally.
+The extension loads RenderDoc's replay library (`renderdoc.dll` / `librenderdoc.so`) at runtime. Packaged VSIX releases already bundle `.renderdoc-runtime` and `renderdoc_bridge.exe`, so no separate bridge download is required for the normal installation path.
+
+If you are developing from source, or using a package without the bundled runtime, install RenderDoc locally.
 
 **[renderdoc.org/builds](https://renderdoc.org/builds)** — any stable version **v1.30 or newer**.
 
@@ -227,14 +258,14 @@ The extension loads RenderDoc's replay library (`renderdoc.dll` / `librenderdoc.
 | Linux    | `/usr/lib/x86_64-linux-gnu/librenderdoc.so` |
 | macOS    | `/Applications/RenderDoc.app/` |
 
-If you are developing from source, also build the native helper in `native/build/Release/renderdoc_bridge.exe`. Packaged VSIX installs include auto-discovery for the bundled runtime and bridge when they are present.
+If you are developing from source, also build the native helper in `native/build/Release/renderdoc_bridge.exe`. Packaged VSIX installs auto-discover both the bundled runtime and the bundled bridge from extension-relative paths.
 
 ---
 
 ### 3 · Opening a Capture
 
 - **File explorer:** right-click a `.rdc` → **Open RDC Capture**
-- **Command palette:** run **RenderDoc: Open Launch Application** to configure and launch a local executable or supported remote target, then auto-open the captured frame
+- **Command palette:** run **RenderDoc: Open Launch Panel** to configure and launch a local executable or supported remote target, then auto-open the captured frame
 - **Capture Target view:** select a process/device, then run **RenderDoc: Attach On Selected Target** to attach to a running process or remote RenderDoc target
 - **Command palette:** `RenderDoc: Open RDC Capture`
 - **Live sessions:** run **RenderDoc: Capture Frame From Live Session** after connecting to a target
@@ -288,7 +319,13 @@ Open VS Code Chat (`Ctrl+Alt+I`). Use `@renderdoc` when you want the most determ
 
 The extension's own UI features do not require Copilot or MCP. If you use GitHub Copilot, the AI flow also works without extra MCP setup because Copilot can call the built-in local `renderdoc_*` tools directly.
 
-If you use another MCP-capable AI client in VS Code, connect that client to the local **RenderDoc For VSCode MCP** endpoint exposed by this extension. The default endpoint is `http://127.0.0.1:38967/mcp`, backed by the current capture loaded in this window. Use the workspace MCP registration in `.vscode/mcp.json`, or run **RenderDoc: Show RenderDoc For VSCode MCP Info** to copy a VS Code `mcp.json` snippet.
+If you use another MCP-capable AI client in VS Code, connect that client to the local **RenderDoc For VSCode MCP** endpoint exposed by this extension. The default endpoint is `http://127.0.0.1:38967/mcp`, backed by the current capture loaded in this window. Use the workspace MCP registration in `.vscode/mcp.json`, or run **RenderDoc: Show RenderDoc For VSCode MCP Info** to copy client snippets for VS Code and generic MCP clients.
+
+Client-specific MCP notes:
+
+- VS Code workspace MCP uses `.vscode/mcp.json` with root `servers` and `type: "http"`.
+- Generic MCP clients use their own config format. For example, Zoo Code uses project `.roo/mcp.json` or global `mcp_settings.json` with root `mcpServers` and `type: "streamable-http"`.
+- For third-party clients, the MCP endpoint reflects the current capture in this VS Code window. If capture state is unknown, the client should call `renderdoc_openCapture` first without `filePath` so the extension can resolve an already loaded or open `.rdc` tab.
 
 For new users, the required setup depends on the AI client:
 
@@ -301,7 +338,6 @@ Automatic setup is only partially possible. This repository can ship a workspace
 Typical `@renderdoc` prompts:
 
 ```text
-@renderdoc 帮我找出当前帧耗时最高的前20个 Draw，带完整层级名称
 @renderdoc Analyze the fragment shader for EID 495 and suggest optimizations
 @renderdoc Find all draw calls rendering to the shadow map
 @renderdoc Show pipeline state diff between EID 300 and EID 355
@@ -327,6 +363,7 @@ Context and overview:
 
 | Tool | Description |
 | ---- | ----------- |
+| `#openCapture` | Resolve the active or open `.rdc` in this VS Code window, or load a specific capture by `filePath` |
 | `#selectionContext` | Current Inspector focus: selected EID, draw call, sidebar resource, replay status, and related context |
 | `#captureInfo` | Capture metadata: API, driver, version, file sections, and capture summary |
 | `#frameSummary` | High-level frame structure: top-level passes/markers, draw counts, and capture stats |
@@ -391,7 +428,7 @@ Use `@renderdoc` when you want the strongest routing guarantees. Use default Cop
 
 | Symptom | Fix |
 | ------- | --- |
-| "Native bridge not available" / empty shaders | If you are running from source, build `native/build/Release/renderdoc_bridge.exe`. If you installed from VSIX and the helper is missing, run **RenderDoc: Download Native Bridge…**. Replay also needs either a bundled `.renderdoc-runtime` or a local RenderDoc install. |
+| "Native bridge not available" / empty shaders | If you are running from source, build `native/build/Release/renderdoc_bridge.exe`. If you installed from VSIX and the helper is missing, run **RenderDoc: Restore Native Bridge…**. Replay also needs either a bundled `.renderdoc-runtime` or a local RenderDoc install. |
 | Inspector stays blank after clicking a draw | `Developer: Reload Window` — auto-recreates the panel |
 | Textures tab shows nothing | The draw has no sampled inputs/RTs, or pipeline is still loading |
 | Mali Offline Compiler button missing | Set `renderdoc.maliOfflineCompilerPath` to the path of `malioc.exe` |
@@ -408,7 +445,7 @@ Use `@renderdoc` when you want the strongest routing guarantees. Use default Cop
 │                        VS Code Extension Host                        │
 │  ┌──────────────┐   ┌──────────────────┐   ┌──────────────────────┐  │
 │  │   Sidebar    │   │    Inspector     │   │  Copilot Participant  │  │
-│  │   Views      │   │    Webview       │   │  + LM Tools (19×)    │  │
+│  │   Views      │   │    Webview       │   │  + LM Tools (21×)    │  │
 │  └──────┬───────┘   └────────┬─────────┘   └──────────┬───────────┘  │
 │         └────────────────────┼────────────────────────┘              │
 │                              ▼                                       │
@@ -425,7 +462,7 @@ Use `@renderdoc` when you want the strongest routing guarantees. Use default Cop
                                │ IReplayController
                                ▼
                    ┌───────────────────────┐
-                   │  renderdoc_replay.dll │
+                   │ renderdoc.dll runtime │
                    └───────────────────────┘
 ```
 
@@ -452,6 +489,7 @@ renderdoc-for-vscode/
 │   ├── 3rdparty/                 # ASTC decoder, stb_image_write
 │   ├── src/                      # main.cpp, dll_loader.cpp, json.hpp
 │   └── CMakeLists.txt
+├── .renderdoc-runtime/           # Bundled RenderDoc runtime for packaged VSIX releases
 ├── media/inspector/              # Webview frontend (JS + CSS)
 ├── package.json
 ├── tsconfig.json
@@ -496,6 +534,8 @@ Press `F5` in VS Code — launches an Extension Development Host with the extens
 | `renderdoc.commandTimeout` | `60000` | Timeout in milliseconds for `renderdoccmd` operations such as thumbnail fallbacks |
 | `renderdoc.alwaysReplayLocally` | `false` | Skip the replay-host prompt and continue locally when a capture suggests remote replay |
 | `renderdoc.maliOfflineCompilerPath` | *(empty)* | Path to `malioc.exe` for shader analysis |
+| `renderdoc.mcpServer.enabled` | `true` | Expose the optional local RenderDoc For VSCode MCP endpoint for other AI clients |
+| `renderdoc.mcpServer.port` | `38967` | TCP port used by the local RenderDoc For VSCode MCP server |
 
 Packaged VSIX installs auto-discover the bundled runtime and native bridge when they are present. Extra setup is typically only needed for source builds or optional Mali analysis.
 
