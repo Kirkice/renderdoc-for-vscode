@@ -110,12 +110,12 @@ Analyze any shader directly from the Inspector's Shaders tab using the **Mali Of
 <tr>
 <td width="50%" valign="top" align="center">
     <b>[Placeholder]</b><br />
-    Suggested file: <code>screenshots/capture-overview.png</code><br />
+    Suggested file: <code>screenshots/capture-overview.jpeg</code><br /> 
     <sub><b>Overview</b> — frame thumbnail, API and driver metadata, and capture summary.</sub>
 </td>
 <td width="50%" valign="top" align="center">
     <b>[Placeholder]</b><br />
-    Suggested file: <code>screenshots/draw-calls-and-resources.png</code><br />
+    Suggested file: <code>screenshots/draw-calls-and-resources.jpeg</code><br />
     <sub><b>Sidebar Views</b> — Draw Calls, Resources, and selection context in the activity bar.</sub>
 </td>
 </tr>
@@ -127,51 +127,51 @@ Analyze any shader directly from the Inspector's Shaders tab using the **Mali Of
 <tr>
 <td width="33.3%" valign="top" align="center">
     <b>[Placeholder]</b><br />
-    Suggested file: <code>screenshots/pipeline-state.png</code><br />
+    Suggested file: <code>screenshots/pipeline-state.jpeg</code><br />
     <sub><b>Pipeline State</b> — inspect bound stages and per-draw graphics state.</sub>
 </td>
 <td width="33.3%" valign="top" align="center">
     <b>[Placeholder]</b><br />
-    Suggested file: <code>screenshots/pipeline-graph-overview.png</code><br />
+    Suggested file: <code>screenshots/pipeline-graph-overview.jpeg</code><br />
     <sub><b>Pipeline Graph</b> — render-flow visualization derived from the full event hierarchy.</sub>
 </td>
 <td width="33.3%" valign="top" align="center">
     <b>[Placeholder]</b><br />
-    Suggested file: <code>screenshots/pipeline-graph-detail.png</code><br />
+    Suggested file: <code>screenshots/pipeline-graph-detail.jpeg</code><br />
     <sub><b>Pipeline Graph Detail</b> — drill into pass groups, representative commands, and selected-event context.</sub>
 </td>
 </tr>
 <tr>
 <td width="33.3%" valign="top" align="center">
     <b>[Placeholder]</b><br />
-    Suggested file: <code>screenshots/shaders.png</code><br />
+    Suggested file: <code>screenshots/shaders.jpeg</code><br />
     <sub><b>Shaders</b> — source, disassembly, and shader-stage analysis in one place.</sub>
 </td>
 <td width="33.3%" valign="top" align="center">
     <b>[Placeholder]</b><br />
-    Suggested file: <code>screenshots/texture-view.png</code><br />
+    Suggested file: <code>screenshots/texture-view.jpeg</code><br />
     <sub><b>Texture View</b> — inspect render targets and sampled textures for the current draw.</sub>
 </td>
 <td width="33.3%" valign="top" align="center">
     <b>[Placeholder]</b><br />
-    Suggested file: <code>screenshots/texture-info.png</code><br />
+    Suggested file: <code>screenshots/texture-info.jpeg</code><br />
     <sub><b>Texture Info</b> — zoom into an individual texture with focused metadata.</sub>
 </td>
 </tr>
 <tr>
 <td width="33.3%" valign="top" align="center">
     <b>[Placeholder]</b><br />
-    Suggested file: <code>screenshots/mesh-view.png</code><br />
+    Suggested file: <code>screenshots/mesh-view.jpeg</code><br />
     <sub><b>Mesh View</b> — inspect vertex/index data and geometry layout at a selected event.</sub>
 </td>
 <td width="33.3%" valign="top" align="center">
     <b>[Placeholder]</b><br />
-    Suggested file: <code>screenshots/resource-inspector.png</code><br />
+    Suggested file: <code>screenshots/resource-inspector.jpeg</code><br />
     <sub><b>Resource Inspector</b> — browse textures, buffers, and shader resources across the capture.</sub>
 </td>
 <td width="33.3%" valign="top" align="center">
     <b>[Placeholder]</b><br />
-    Suggested file: <code>screenshots/inspector-overview.png</code><br />
+    Suggested file: <code>screenshots/inspector-overview.jpeg</code><br />
     <sub><b>Overview</b> — capture metadata, API and driver details, and frame summary.</sub>
 </td>
 </tr>
@@ -183,12 +183,12 @@ Analyze any shader directly from the Inspector's Shaders tab using the **Mali Of
 <tr>
 <td width="50%" valign="top" align="center">
     <b>[Placeholder]</b><br />
-    Suggested file: <code>screenshots/launch-panel.png</code><br />
+    Suggested file: <code>screenshots/launch-panel.jpeg</code><br />
     <sub><b>Launch Panel</b> — configure the target executable, arguments, output path, and capture trigger.</sub>
 </td>
 <td width="50%" valign="top" align="center">
     <b>[Placeholder]</b><br />
-    Suggested file: <code>screenshots/capture-target-view.png</code><br />
+    Suggested file: <code>screenshots/capture-target-view.jpeg</code><br />
     <sub><b>Capture Target View</b> — switch between local and remote targets, attach, and trigger captures.</sub>
 </td>
 </tr>
@@ -200,12 +200,12 @@ Analyze any shader directly from the Inspector's Shaders tab using the **Mali Of
 <tr>
 <td width="50%" valign="top" align="center">
     <b>[Placeholder]</b><br />
-    Suggested file: <code>screenshots/copilot-chat.png</code><br />
+    Suggested file: <code>screenshots/copilot-chat.jpeg</code><br />
     <sub><b>Copilot Chat</b> — use <code>@renderdoc</code> or plain Copilot to analyze the current frame, draw calls, resources, and shaders.</sub>
 </td>
 <td width="50%" valign="top" align="center">
     <b>[Placeholder]</b><br />
-    Suggested file: <code>screenshots/mcp-connection-info.png</code><br />
+    Suggested file: <code>screenshots/mcp-connection-info.jpeg</code><br />
     <sub><b>MCP Connection Info</b> — copy the local endpoint and client snippets for other MCP-capable tools.</sub>
 </td>
 </tr>
