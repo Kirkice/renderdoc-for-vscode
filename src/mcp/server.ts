@@ -149,7 +149,7 @@ function buildGenericConfigSnippet(url: string): string {
         {
             mcpServers: {
                 'renderdoc-for-vscode': {
-                    type: 'streamableHttp',
+                    type: 'streamable-http',
                     url,
                 },
             },
@@ -213,7 +213,8 @@ export class RenderDocMcpServer implements vscode.Disposable {
                 {
                     instructions: [
                         'This RenderDoc For VSCode MCP server exposes RenderDoc capture analysis tools from the active VS Code window.',
-                        'Use renderdoc_openCapture first when no capture is loaded.',
+                        'If capture state is unknown, call renderdoc_openCapture with no filePath first so the server can resolve an already loaded or open .rdc capture from this VS Code window.',
+                        'Only ask the user for filePath when renderdoc_openCapture reports that no open or loaded capture could be resolved in this window.',
                         'Use renderdoc_getSelectionContext for questions about the current selection or focused draw.',
                     ].join(' '),
                 },

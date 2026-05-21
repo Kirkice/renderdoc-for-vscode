@@ -38,7 +38,7 @@ import {
     ensureBundledCopilotCustomizationsInstalled,
     reinstallBundledCopilotCustomizations,
 } from './copilot/skillInstaller';
-import { ensureNativeBridge } from './bridgeInstaller';
+import { BUILD_DOCS_URL, ensureNativeBridge } from './bridgeInstaller';
 import { openShaderSourceDocument } from './shaderEditor';
 import { CaptureCache, formatBytes } from './util/captureCache';
 import {
@@ -3185,14 +3185,18 @@ async function tryLocalReplay() {
     // and re-open the capture before proceeding.
     if (!bridge.hasNativeBridge() || bridgeLoadedCapturePath !== currentCapturePath) {
         if (!bridge.isNativeBridgeInstalled()) {
+            const restoreBridgeAction = 'Restore Native Bridge';
+            const buildFromSourceAction = 'Build from Source';
             const action = await vscode.window.showWarningMessage(
                 'Native bridge binary is not installed. Local replay requires it.',
-                'Download Prebuilt',
-                'Build from Source',
+                restoreBridgeAction,
+                buildFromSourceAction,
             );
-            if (action === 'Download Prebuilt' || action === 'Build from Source') {
+            if (action === restoreBridgeAction) {
                 vscode.commands.executeCommand('renderdoc.downloadNativeBridge')
                     .then(undefined, () => { /* command may not exist */ });
+            } else if (action === buildFromSourceAction) {
+                void vscode.env.openExternal(vscode.Uri.parse(BUILD_DOCS_URL));
             }
             return;
         }

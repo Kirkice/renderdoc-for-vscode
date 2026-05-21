@@ -40,17 +40,11 @@ jobs:
       - name: Package VSIX
         run: npx --yes @vscode/vsce package --skip-license
 
-      - name: Rename bridge asset for release
-        shell: pwsh
-        run: |
-          Copy-Item "native\build\Release\renderdoc_bridge.exe" "renderdoc_bridge-win32-x64.exe"
-
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           files: |
             *.vsix
-            renderdoc_bridge-win32-x64.exe
           generate_release_notes: true
           draft: false
           prerelease: false

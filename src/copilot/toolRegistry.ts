@@ -38,7 +38,7 @@ export const RENDERDOC_TOOL_REGISTRY: readonly RenderDocToolDefinition[] = [
     {
         name: 'renderdoc_openCapture',
         title: 'Resolve Or Open Capture',
-        description: 'Resolve the active RenderDoc capture in this VS Code window, or load a specific .rdc file.',
+        description: 'Resolve the active RenderDoc capture in this VS Code window when called with no filePath, or load a specific .rdc file when filePath is provided.',
         readOnly: false,
         inputSchema: z.object({
             filePath: z.string().optional(),

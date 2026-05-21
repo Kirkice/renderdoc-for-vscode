@@ -36,7 +36,11 @@ export function initTools(
 
 function requireCapturePath(): string {
     const p = _getCurrentCapturePath();
-    if (!p) { throw new Error('No capture file is currently loaded. Use the "RenderDoc: Open RDC Capture" command first.'); }
+    if (!p) {
+        throw new Error(
+            'No capture file is currently loaded. Call renderdoc_openCapture with no filePath to resolve an already open .rdc tab in this VS Code window, or provide filePath to load a specific capture.',
+        );
+    }
     return p;
 }
 

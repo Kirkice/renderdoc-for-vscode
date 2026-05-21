@@ -935,14 +935,6 @@ export class RenderDocBridge {
         return this.findNativeBridge();
     }
 
-    /** Target platform asset name for the bridge binary on the current OS. */
-    static expectedBridgeAssetName(): string {
-        const arch = process.arch === 'arm64' ? 'arm64' : 'x64';
-        if (process.platform === 'win32')  { return `renderdoc_bridge-win32-${arch}.exe`; }
-        if (process.platform === 'darwin') { return `renderdoc_bridge-darwin-${arch}`; }
-        return `renderdoc_bridge-linux-${arch}`;
-    }
-
     /** Try to start the native bridge process */
     tryStartNativeBridge(): void {
         if (this.nativeProcess) { return; }

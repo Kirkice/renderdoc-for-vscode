@@ -286,7 +286,17 @@ Navigation:
 
 Open VS Code Chat (`Ctrl+Alt+I`). Use `@renderdoc` when you want the most deterministic RenderDoc-specific behavior, or ask plain Copilot in this repo to let the workspace skill route into the same local `renderdoc_*` tools.
 
-If you want another AI client in VS Code to connect to this extension, use the workspace MCP registration in `.vscode/mcp.json` or run **RenderDoc: Show RenderDoc For VSCode MCP Info** to copy a VS Code `mcp.json` snippet. The extension exposes a local **RenderDoc For VSCode MCP** HTTP endpoint on `127.0.0.1:38967`, backed by the current capture loaded in this window. The extension's own chat flows still use the built-in local `renderdoc_*` tools directly.
+The extension's own UI features do not require Copilot or MCP. If you use GitHub Copilot, the AI flow also works without extra MCP setup because Copilot can call the built-in local `renderdoc_*` tools directly.
+
+If you use another MCP-capable AI client in VS Code, connect that client to the local **RenderDoc For VSCode MCP** endpoint exposed by this extension. The default endpoint is `http://127.0.0.1:38967/mcp`, backed by the current capture loaded in this window. Use the workspace MCP registration in `.vscode/mcp.json`, or run **RenderDoc: Show RenderDoc For VSCode MCP Info** to copy a VS Code `mcp.json` snippet.
+
+For new users, the required setup depends on the AI client:
+
+- No extra MCP configuration is needed for the extension's normal UI workflow.
+- No extra MCP configuration is needed when using GitHub Copilot in this workspace.
+- A non-Copilot AI client needs one-time MCP client configuration so it can connect to **RenderDoc For VSCode MCP**.
+
+Automatic setup is only partially possible. This repository can ship a workspace `.vscode/mcp.json` entry so compatible VS Code clients can discover the local MCP endpoint automatically after install, but third-party clients still control their own trust, enablement, and per-user MCP configuration. In practice, some clients will work from the shared workspace config, while others still require the user to approve or add the MCP server on their side.
 
 Typical `@renderdoc` prompts:
 
