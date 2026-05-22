@@ -101,7 +101,7 @@ Analyze any shader directly from the Inspector's Shaders tab using the **Mali Of
 </p>
 
 <p align="center">
-    Placeholder slots for product screenshots. Replace each placeholder block with the final image when the assets are ready.
+    Click any screenshot to open it at full size.
 </p>
 
 ### Capture Overview
@@ -109,13 +109,11 @@ Analyze any shader directly from the Inspector's Shaders tab using the **Mali Of
 <table>
 <tr>
 <td width="50%" valign="top" align="center">
-    <b>[Placeholder]</b><br />
-    Suggested file: <code>screenshots/capture-overview.jpeg</code><br /> 
+    <a href="screenshots/capture-overview.jpeg"><img src="screenshots/capture-overview.jpeg" alt="Capture Overview" width="100%" /></a><br />
     <sub><b>Overview</b> — frame thumbnail, API and driver metadata, and capture summary.</sub>
 </td>
 <td width="50%" valign="top" align="center">
-    <b>[Placeholder]</b><br />
-    Suggested file: <code>screenshots/draw-calls-and-resources.jpeg</code><br />
+    <a href="screenshots/draw-calls-and-resources.jpeg"><img src="screenshots/draw-calls-and-resources.jpeg" alt="Draw Calls And Resources" width="100%" /></a><br />
     <sub><b>Sidebar Views</b> — Draw Calls, Resources, and selection context in the activity bar.</sub>
 </td>
 </tr>
@@ -126,53 +124,50 @@ Analyze any shader directly from the Inspector's Shaders tab using the **Mali Of
 <table>
 <tr>
 <td width="33.3%" valign="top" align="center">
-    <b>[Placeholder]</b><br />
-    Suggested file: <code>screenshots/pipeline-state.jpeg</code><br />
+    <a href="screenshots/pipeline-state.jpeg"><img src="screenshots/pipeline-state.jpeg" alt="Pipeline State" width="100%" /></a><br />
     <sub><b>Pipeline State</b> — inspect bound stages and per-draw graphics state.</sub>
 </td>
 <td width="33.3%" valign="top" align="center">
-    <b>[Placeholder]</b><br />
-    Suggested file: <code>screenshots/pipeline-graph-overview.jpeg</code><br />
+    <a href="screenshots/pipeline-graph-overview.jpeg"><img src="screenshots/pipeline-graph-overview.jpeg" alt="Pipeline Graph Overview" width="100%" /></a><br />
     <sub><b>Pipeline Graph</b> — render-flow visualization derived from the full event hierarchy.</sub>
 </td>
 <td width="33.3%" valign="top" align="center">
-    <b>[Placeholder]</b><br />
-    Suggested file: <code>screenshots/pipeline-graph-detail.jpeg</code><br />
+    <a href="screenshots/pipeline-graph-detail.jpeg"><img src="screenshots/pipeline-graph-detail.jpeg" alt="Pipeline Graph Detail" width="100%" /></a><br />
     <sub><b>Pipeline Graph Detail</b> — drill into pass groups, representative commands, and selected-event context.</sub>
 </td>
 </tr>
 <tr>
 <td width="33.3%" valign="top" align="center">
-    <b>[Placeholder]</b><br />
-    Suggested file: <code>screenshots/shaders.jpeg</code><br />
+    <a href="screenshots/shaders.jpeg"><img src="screenshots/shaders.jpeg" alt="Shaders" width="100%" /></a><br />
     <sub><b>Shaders</b> — source, disassembly, and shader-stage analysis in one place.</sub>
 </td>
 <td width="33.3%" valign="top" align="center">
-    <b>[Placeholder]</b><br />
-    Suggested file: <code>screenshots/texture-view.jpeg</code><br />
+    <a href="screenshots/texture-view.jpeg"><img src="screenshots/texture-view.jpeg" alt="Texture View" width="100%" /></a><br />
     <sub><b>Texture View</b> — inspect render targets and sampled textures for the current draw.</sub>
 </td>
 <td width="33.3%" valign="top" align="center">
-    <b>[Placeholder]</b><br />
-    Suggested file: <code>screenshots/texture-info.jpeg</code><br />
+    <a href="screenshots/texture-info.jpeg"><img src="screenshots/texture-info.jpeg" alt="Texture Info" width="100%" /></a><br />
     <sub><b>Texture Info</b> — zoom into an individual texture with focused metadata.</sub>
 </td>
 </tr>
 <tr>
 <td width="33.3%" valign="top" align="center">
-    <b>[Placeholder]</b><br />
-    Suggested file: <code>screenshots/mesh-view.jpeg</code><br />
+    <a href="screenshots/mesh-view.jpeg"><img src="screenshots/mesh-view.jpeg" alt="Mesh View" width="100%" /></a><br />
     <sub><b>Mesh View</b> — inspect vertex/index data and geometry layout at a selected event.</sub>
 </td>
 <td width="33.3%" valign="top" align="center">
-    <b>[Placeholder]</b><br />
-    Suggested file: <code>screenshots/resource-inspector.jpeg</code><br />
+    <a href="screenshots/resource-inspector.jpeg"><img src="screenshots/resource-inspector.jpeg" alt="Resource Inspector" width="100%" /></a><br />
     <sub><b>Resource Inspector</b> — browse textures, buffers, and shader resources across the capture.</sub>
 </td>
 <td width="33.3%" valign="top" align="center">
-    <b>[Placeholder]</b><br />
-    Suggested file: <code>screenshots/inspector-overview.jpeg</code><br />
+    <a href="screenshots/inspector-overview.jpeg"><img src="screenshots/inspector-overview.jpeg" alt="Inspector Overview" width="100%" /></a><br />
     <sub><b>Overview</b> — capture metadata, API and driver details, and frame summary.</sub>
+</td>
+</tr>
+<tr>
+<td colspan="3" valign="top" align="center">
+    <a href="screenshots/mali-offline.jpeg"><img src="screenshots/mali-offline.jpeg" alt="Mali Offline Compiler" width="80%" /></a><br />
+    <sub><b>Mali Offline Compiler</b> — choose a target Mali GPU profile and inspect static shader analysis output.</sub>
 </td>
 </tr>
 </table>
@@ -182,13 +177,11 @@ Analyze any shader directly from the Inspector's Shaders tab using the **Mali Of
 <table>
 <tr>
 <td width="50%" valign="top" align="center">
-    <b>[Placeholder]</b><br />
-    Suggested file: <code>screenshots/launch-panel.jpeg</code><br />
+    <a href="screenshots/launch-panel.jpeg"><img src="screenshots/launch-panel.jpeg" alt="Launch Panel" width="100%" /></a><br />
     <sub><b>Launch Panel</b> — configure the target executable, arguments, output path, and capture trigger.</sub>
 </td>
 <td width="50%" valign="top" align="center">
-    <b>[Placeholder]</b><br />
-    Suggested file: <code>screenshots/capture-target-view.jpeg</code><br />
+    <a href="screenshots/capture-target-view.jpeg"><img src="screenshots/capture-target-view.jpeg" alt="Capture Target View" width="100%" /></a><br />
     <sub><b>Capture Target View</b> — switch between local and remote targets, attach, and trigger captures.</sub>
 </td>
 </tr>
@@ -199,13 +192,11 @@ Analyze any shader directly from the Inspector's Shaders tab using the **Mali Of
 <table>
 <tr>
 <td width="50%" valign="top" align="center">
-    <b>[Placeholder]</b><br />
-    Suggested file: <code>screenshots/copilot-chat.jpeg</code><br />
+    <a href="screenshots/copilot-chat.jpeg"><img src="screenshots/copilot-chat.jpeg" alt="Copilot Chat" width="100%" /></a><br />
     <sub><b>Copilot Chat</b> — use <code>@renderdoc</code> or plain Copilot to analyze the current frame, draw calls, resources, and shaders.</sub>
 </td>
 <td width="50%" valign="top" align="center">
-    <b>[Placeholder]</b><br />
-    Suggested file: <code>screenshots/mcp-connection-info.jpeg</code><br />
+    <a href="screenshots/mcp-connection-info.jpeg"><img src="screenshots/mcp-connection-info.jpeg" alt="MCP Connection Info" width="100%" /></a><br />
     <sub><b>MCP Connection Info</b> — copy the local endpoint and client snippets for other MCP-capable tools.</sub>
 </td>
 </tr>
@@ -319,21 +310,65 @@ Open VS Code Chat (`Ctrl+Alt+I`). Use `@renderdoc` when you want the most determ
 
 The extension's own UI features do not require Copilot or MCP. If you use GitHub Copilot, the AI flow also works without extra MCP setup because Copilot can call the built-in local `renderdoc_*` tools directly.
 
-If you use another MCP-capable AI client in VS Code, connect that client to the local **RenderDoc For VSCode MCP** endpoint exposed by this extension. The default endpoint is `http://127.0.0.1:38967/mcp`, backed by the current capture loaded in this window. Use the workspace MCP registration in `.vscode/mcp.json`, or run **RenderDoc: Show RenderDoc For VSCode MCP Info** to copy client snippets for VS Code and generic MCP clients.
+If you use another MCP-capable AI client in VS Code, connect that client to the local **RenderDoc For VSCode MCP** endpoint exposed by this extension. The default endpoint is `http://127.0.0.1:38967/mcp`, but you should prefer the actual URL shown in the sidebar GUI because the configured port can differ. In the **Capture Target** view, use **Local MCP → One-Click Configure** first. That button enables MCP if needed, starts the local server, and auto-writes workspace config files with the actual current URL. If you need to inspect or copy the final endpoint manually, click **MCP Info** in the same card or run **RenderDoc: Show RenderDoc For VSCode MCP Info**.
 
-Client-specific MCP notes:
+#### External MCP Client Setup
 
-- VS Code workspace MCP uses `.vscode/mcp.json` with root `servers` and `type: "http"`.
-- Generic MCP clients use their own config format. For example, Zoo Code uses project `.roo/mcp.json` or global `mcp_settings.json` with root `mcpServers` and `type: "streamable-http"`.
-- For third-party clients, the MCP endpoint reflects the current capture in this VS Code window. If capture state is unknown, the client should call `renderdoc_openCapture` first without `filePath` so the extension can resolve an already loaded or open `.rdc` tab.
+Use this checklist when helping a teammate connect **Roo Code**, **Zoo Code**, **Claude Code**, **Codex/CodeX**, or another non-Copilot client:
 
-For new users, the required setup depends on the AI client:
+1. Install this extension in VS Code and open the target `.rdc` capture in the same VS Code window.
+2. In the **Capture Target** view, find the **Local MCP** card and click **One-Click Configure**. This enables MCP if needed, starts the server, and updates `.vscode/mcp.json` and `.roo/mcp.json` in the current workspace so VS Code workspace MCP and Roo/Zoo project config both point at the actual current endpoint.
+3. Confirm that the **Local MCP** card now shows the running status and actual port number.
+4. If you need to inspect or copy the final URL manually, click **MCP Info** in that same card or run **RenderDoc: Show RenderDoc For VSCode MCP Info**.
+5. In the external AI client, add one MCP server named `renderdoc-for-vscode` that points to that local URL only if the client does not already read one of those workspace config files.
+6. After the client connects, have it call `renderdoc_openCapture` first without `filePath` if capture state is unknown. That lets the extension resolve the already opened capture from this VS Code window.
 
-- No extra MCP configuration is needed for the extension's normal UI workflow.
-- No extra MCP configuration is needed when using GitHub Copilot in this workspace.
-- A non-Copilot AI client needs one-time MCP client configuration so it can connect to **RenderDoc For VSCode MCP**.
+VS Code workspace MCP uses `.vscode/mcp.json` with root `servers` and `type: "http"`:
 
-Automatic setup is only partially possible. This repository can ship a workspace `.vscode/mcp.json` entry so compatible VS Code clients can discover the local MCP endpoint automatically after install, but third-party clients still control their own trust, enablement, and per-user MCP configuration. In practice, some clients will work from the shared workspace config, while others still require the user to approve or add the MCP server on their side.
+```json
+{
+    "servers": {
+        "renderdoc-for-vscode": {
+            "type": "http",
+            "url": "http://127.0.0.1:38967/mcp"
+        }
+    }
+}
+```
+
+Roo Code, Zoo Code, and most generic MCP clients use a config with root `mcpServers` and `type: "streamable-http"`:
+
+```json
+{
+    "mcpServers": {
+        "renderdoc-for-vscode": {
+            "type": "streamable-http",
+            "url": "http://127.0.0.1:38967/mcp"
+        }
+    }
+}
+```
+
+Client notes:
+
+- `Roo Code` / `Zoo Code`: prefer the sidebar **Local MCP → One-Click Configure** button. It writes project `.roo/mcp.json` for you. If your teammate uses a global `mcp_settings.json` instead, use **MCP Info** and paste the generic snippet there.
+- `Claude Code`: add a remote HTTP MCP server named `renderdoc-for-vscode`. If it asks for a transport, choose `streamable-http` or the equivalent HTTP streaming option. If it accepts raw JSON config, use the generic `mcpServers` snippet above.
+- `Codex` / `CodeX`: use the same generic remote MCP server settings as Claude Code. Choose an HTTP or `streamable-http` transport, not a local `stdio` server.
+- `GitHub Copilot in VS Code`: no extra MCP configuration is required in this repository.
+
+Common gotchas:
+
+- The MCP endpoint reflects the capture opened in this VS Code window, not a global RenderDoc session from some other app.
+- The fastest setup path is the sidebar **Local MCP → One-Click Configure** button. The command-palette workflow is now just a fallback.
+- If the client connects but sees no useful context, open the capture in VS Code first or ask it to call `renderdoc_openCapture` with no `filePath`.
+- If a client offers both `stdio` and HTTP transports, use HTTP / `streamable-http` for this extension.
+- If you changed `renderdoc.mcpServer.port`, update the URL in the client config to match.
+
+Recommended first test prompt for teammates:
+
+```text
+Open the current RenderDoc capture, summarize the top-level passes in this frame, and if capture state is unknown call renderdoc_openCapture first with no filePath.
+```
 
 Typical `@renderdoc` prompts:
 

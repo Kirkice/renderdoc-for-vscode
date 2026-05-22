@@ -749,6 +749,12 @@
         "icon": "$(hubot)"
       },
       {
+        "command": "renderdoc.configureMcpClients",
+        "title": "Configure Workspace MCP Clients",
+        "category": "RenderDoc",
+        "icon": "$(plug)"
+      },
+      {
         "command": "renderdoc.showDiagnosticsLog",
         "title": "Show Diagnostics Log",
         "category": "RenderDoc",

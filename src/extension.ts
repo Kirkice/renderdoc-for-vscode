@@ -53,7 +53,8 @@ import {
     getTexturePreviewHtml,
     getResourceDetailHtml,
 } from './views/panelHtml';
-import { RenderDocMcpServer } from './mcp/server';
+import { RenderDocMcpServer, type RenderDocMcpStatus } from './mcp/server';
+import { syncWorkspaceMcpClientConfigs } from './mcp/clientConfigSync';
 
 let bridge: RenderDocBridge;
 let captureCache: CaptureCache;
@@ -1679,10 +1680,7 @@ export async function activate(context: vscode.ExtensionContext) {
     drawCallProvider = new DrawCallProvider();
     apiInspectorProvider = new ApiInspectorProvider(bridge);
     resourceProvider = new ResourceProvider();
-    const launchTargetViewProvider = new LaunchTargetViewProvider(
-        launchTargetState,
-        async () => { await launchTargetState.refresh(bridge); },
-    );
+    let launchTargetViewProvider: LaunchTargetViewProvider | undefined;
 
     context.subscriptions.push({
         dispose: bridge.onNativeNotification('replayHostDisconnected', (params) => {
@@ -1737,7 +1735,6 @@ export async function activate(context: vscode.ExtensionContext) {
     context.subscriptions.push(
         vscode.window.registerTreeDataProvider('renderdoc-captureInfo', captureInfoProvider),
         vscode.window.registerTreeDataProvider('renderdoc-apiInspector', apiInspectorProvider),
-        vscode.window.registerWebviewViewProvider('renderdoc-launchTarget', launchTargetViewProvider),
         launchTargetState.onDidChange(() => {
             void vscode.commands.executeCommand('setContext', 'renderdoc.liveTargetActive', !!launchTargetState.getLiveTarget());
             syncLaunchApplicationPanelState();
@@ -1787,6 +1784,134 @@ export async function activate(context: vscode.ExtensionContext) {
     );
     context.subscriptions.push(renderDocMcpServer);
 
+    const mcpStatusBarItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 49);
+    mcpStatusBarItem.command = 'renderdoc.showMcpServerInfo';
+    context.subscriptions.push(mcpStatusBarItem);
+
+    const updateMcpStatusBar = (status?: RenderDocMcpStatus) => {
+        const nextStatus = status ?? renderDocMcpServer.getStatus();
+
+        if (!nextStatus.enabled) {
+            mcpStatusBarItem.text = '$(circle-slash) MCP: Off';
+            mcpStatusBarItem.tooltip = 'RenderDoc For VSCode MCP is disabled. Click to inspect MCP status and configuration.';
+            mcpStatusBarItem.show();
+            return;
+        }
+
+        if (nextStatus.running && nextStatus.url) {
+            mcpStatusBarItem.text = `$(hubot) MCP: ${nextStatus.port}`;
+            mcpStatusBarItem.tooltip = [
+                'RenderDoc For VSCode MCP is running.',
+                `Endpoint: ${nextStatus.url}`,
+                'Click to inspect details or copy the endpoint/config snippet.',
+            ].join('\n');
+            mcpStatusBarItem.show();
+            return;
+        }
+
+        mcpStatusBarItem.text = `$(warning) MCP: ${nextStatus.port}`;
+        mcpStatusBarItem.tooltip = [
+            'RenderDoc For VSCode MCP is enabled but not running.',
+            `Configured endpoint: http://${nextStatus.host}:${nextStatus.port}${nextStatus.path}`,
+            nextStatus.lastError ? `Last error: ${nextStatus.lastError}` : 'Click to inspect details or retry startup.',
+        ].join('\n');
+        mcpStatusBarItem.show();
+    };
+
+    const updateMcpUi = (status?: RenderDocMcpStatus) => {
+        updateMcpStatusBar(status);
+        if (launchTargetViewProvider) {
+            void launchTargetViewProvider.refresh();
+        }
+    };
+
+    const setMcpServerEnabled = async (enabled: boolean) => {
+        await vscode.workspace.getConfiguration('renderdoc').update(
+            'mcpServer.enabled',
+            enabled,
+            vscode.ConfigurationTarget.Global,
+        );
+
+        const status = await renderDocMcpServer.restart();
+        updateMcpUi(status);
+
+        if (enabled && !status.running && status.lastError) {
+            void vscode.window.showWarningMessage(`RenderDoc For VSCode MCP failed to start: ${status.lastError}`);
+        }
+    };
+
+    launchTargetViewProvider = new LaunchTargetViewProvider(
+        launchTargetState,
+        async () => { await launchTargetState.refresh(bridge); },
+        () => renderDocMcpServer.getStatus(),
+        async (enabled) => { await setMcpServerEnabled(enabled); },
+        async () => { await vscode.commands.executeCommand('renderdoc.showMcpServerInfo'); },
+        async () => { await vscode.commands.executeCommand('renderdoc.configureMcpClients'); },
+    );
+    context.subscriptions.push(vscode.window.registerWebviewViewProvider('renderdoc-launchTarget', launchTargetViewProvider));
+
+    updateMcpUi(renderDocMcpServer.getStatus());
+
+    const configureWorkspaceMcpClients = async () => {
+        let status = renderDocMcpServer.getStatus();
+        if (!status.enabled) {
+            await setMcpServerEnabled(true);
+            status = renderDocMcpServer.getStatus();
+        } else {
+            status = await renderDocMcpServer.startIfEnabled();
+            updateMcpUi(status);
+        }
+
+        if (!status.running || !status.url) {
+            void vscode.window.showErrorMessage(
+                `RenderDoc For VSCode MCP is not running${status.lastError ? `: ${status.lastError}` : '.'}`,
+            );
+            return;
+        }
+
+        const result = await syncWorkspaceMcpClientConfigs(status.url);
+        if (!result.files.length) {
+            void vscode.window.showWarningMessage('RenderDoc: no workspace folder is open, so no MCP client config files were written.');
+            return;
+        }
+
+        const created = result.files.filter((file) => file.status === 'created').length;
+        const updated = result.files.filter((file) => file.status === 'updated').length;
+        const unchanged = result.files.filter((file) => file.status === 'unchanged').length;
+        const failed = result.files.filter((file) => file.status === 'error');
+        const firstChangedFile = result.files.find((file) => file.status === 'created' || file.status === 'updated');
+
+        const summary = [
+            created > 0 ? `${created} created` : '',
+            updated > 0 ? `${updated} updated` : '',
+            unchanged > 0 ? `${unchanged} unchanged` : '',
+            failed.length > 0 ? `${failed.length} failed` : '',
+        ].filter(Boolean).join(', ');
+
+        const openConfigAction = firstChangedFile ? 'Open Config' : undefined;
+        const showInfoAction = failed.length > 0 ? 'Show Details' : undefined;
+        const actions = [openConfigAction, showInfoAction].filter((action): action is string => !!action);
+
+        const choice = failed.length > 0
+            ? await vscode.window.showWarningMessage(
+                `RenderDoc: workspace MCP client sync finished (${summary}).`,
+                ...actions,
+            )
+            : await vscode.window.showInformationMessage(
+                `RenderDoc: workspace MCP client sync finished (${summary}).`,
+                ...actions,
+            );
+
+        if (choice === openConfigAction && firstChangedFile) {
+            const document = await vscode.workspace.openTextDocument(firstChangedFile.filePath);
+            await vscode.window.showTextDocument(document);
+        }
+        if (choice === showInfoAction) {
+            const detailLines = failed.map((file) => `${file.label}: ${file.error ?? 'Unknown error'}`);
+            void vscode.window.showErrorMessage(detailLines.join(' | '));
+        }
+    };
+
     // Register commands
     context.subscriptions.push(
         vscode.commands.registerCommand('renderdoc.openCapture', (input) => openCapture(context, input)),
@@ -1833,7 +1958,11 @@ export async function activate(context: vscode.ExtensionContext) {
             }
         }),
         vscode.commands.registerCommand('renderdoc.showCopilotToolStatus', () => showCopilotToolStatus()),
-        vscode.commands.registerCommand('renderdoc.showMcpServerInfo', () => renderDocMcpServer.showConnectionInfo()),
+            vscode.commands.registerCommand('renderdoc.showMcpServerInfo', async () => {
+                await renderDocMcpServer.showConnectionInfo();
+            updateMcpUi(renderDocMcpServer.getStatus());
+            }),
+        vscode.commands.registerCommand('renderdoc.configureMcpClients', () => configureWorkspaceMcpClients()),
         vscode.commands.registerCommand('renderdoc.downloadNativeBridge', async () => {
             // Clear the "don't ask again" flag so the picker shows again.
             await context.globalState.update('renderdoc.skipBridgePrompt', false);
@@ -1867,12 +1996,14 @@ export async function activate(context: vscode.ExtensionContext) {
 
     try {
         const mcpStatus = await renderDocMcpServer.startIfEnabled();
+        updateMcpUi(mcpStatus);
         if (mcpStatus.running && mcpStatus.url) {
             console.log('[RenderDoc] RenderDoc For VSCode MCP listening on', mcpStatus.url);
         } else if (mcpStatus.enabled && mcpStatus.lastError) {
             console.warn('[RenderDoc] RenderDoc For VSCode MCP failed to start (non-critical):', mcpStatus.lastError);
         }
     } catch (error: any) {
+        updateMcpUi(renderDocMcpServer.getStatus());
         console.warn('[RenderDoc] RenderDoc For VSCode MCP bootstrap failed (non-critical):', error?.message ?? String(error));
     }
 
@@ -1895,6 +2026,7 @@ export async function activate(context: vscode.ExtensionContext) {
             if (event.affectsConfiguration('renderdoc.mcpServer.enabled')
                 || event.affectsConfiguration('renderdoc.mcpServer.port')) {
                 void renderDocMcpServer.restart().then((status) => {
+                    updateMcpUi(status);
                     if (status.enabled && !status.running && status.lastError) {
                         console.warn('[RenderDoc] RenderDoc For VSCode MCP reconfigure failed:', status.lastError);
                     }

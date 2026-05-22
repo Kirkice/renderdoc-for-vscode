@@ -1,12 +1,16 @@
 import * as vscode from 'vscode';
 import { LaunchTargetState } from '../launchTargetState';
+import type { RenderDocMcpStatus } from '../mcp/server';
 
 type LaunchTargetViewMessage =
     | { type: 'ready' }
     | { type: 'selectLocal' }
     | { type: 'selectDevice'; url: string }
     | { type: 'refreshCaptureTargets' }
-    | { type: 'openLaunchApplication' };
+    | { type: 'openLaunchApplication' }
+    | { type: 'setMcpEnabled'; enabled: boolean }
+    | { type: 'showMcpServerInfo' }
+    | { type: 'configureMcpClients' };
 
 export class LaunchTargetViewProvider implements vscode.WebviewViewProvider {
     private view: vscode.WebviewView | undefined;
@@ -15,10 +19,18 @@ export class LaunchTargetViewProvider implements vscode.WebviewViewProvider {
     constructor(
         private readonly state: LaunchTargetState,
         private readonly onRefresh: () => Promise<void>,
+        private readonly getMcpStatus: () => RenderDocMcpStatus,
+        private readonly onSetMcpEnabled: (enabled: boolean) => Promise<void>,
+        private readonly onShowMcpServerInfo: () => Promise<void>,
+        private readonly onConfigureMcpClients: () => Promise<void>,
     ) {
         this.state.onDidChange(() => {
             void this.pushState();
         });
+    }
+
+    public async refresh(): Promise<void> {
+        await this.pushState();
     }
 
     resolveWebviewView(webviewView: vscode.WebviewView): void | Thenable<void> {
@@ -54,6 +66,18 @@ export class LaunchTargetViewProvider implements vscode.WebviewViewProvider {
             case 'openLaunchApplication':
                 await vscode.commands.executeCommand('renderdoc.launchCapture');
                 break;
+            case 'setMcpEnabled':
+                await this.onSetMcpEnabled(!!message.enabled);
+                await this.pushState();
+                break;
+            case 'showMcpServerInfo':
+                await this.onShowMcpServerInfo();
+                await this.pushState();
+                break;
+            case 'configureMcpClients':
+                await this.onConfigureMcpClients();
+                await this.pushState();
+                break;
         }
     }
 
@@ -70,6 +94,7 @@ export class LaunchTargetViewProvider implements vscode.WebviewViewProvider {
                 devices: this.state.getDevices(),
                 refreshing: this.state.isRefreshing(),
                 refreshError: this.state.getLastRefreshError(),
+                mcp: this.getMcpStatus(),
             });
         } catch (error: any) {
             if (this.view === view) {
@@ -338,6 +363,17 @@ export class LaunchTargetViewProvider implements vscode.WebviewViewProvider {
         .launchRow .actionBtn {
             width: 100%;
         }
+        .sectionSpacer {
+            height: 6px;
+        }
+        .actionRow {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 8px;
+        }
+        .actionRow .actionBtn {
+            flex: 1 1 120px;
+        }
         @media (max-width: 420px) {
             .targetSplit {
                 grid-template-columns: 1fr;
@@ -366,6 +402,10 @@ export class LaunchTargetViewProvider implements vscode.WebviewViewProvider {
 
         function messageButton(label, message, variant) {
             return '<button type="button" class="actionBtn' + (variant ? ' ' + variant : '') + '" data-message="' + message + '">' + escapeHtml(label) + '</button>';
+        }
+
+        function mcpToggleButton(enabled) {
+            return '<button type="button" class="actionBtn' + (enabled ? ' ghost' : ' primary') + '" data-mcp-enabled="' + (enabled ? 'false' : 'true') + '">' + escapeHtml(enabled ? 'Turn Off MCP' : 'Turn On MCP') + '</button>';
         }
 
         function renderTargetCard(title, primaryMeta, secondaryMeta, statusHtml, active, attrs) {
@@ -404,6 +444,13 @@ export class LaunchTargetViewProvider implements vscode.WebviewViewProvider {
                     }
                 });
             });
+
+            root.querySelectorAll('[data-mcp-enabled]').forEach((button) => {
+                button.addEventListener('click', () => {
+                    const enabled = button.getAttribute('data-mcp-enabled') === 'true';
+                    vscode.postMessage({ type: 'setMcpEnabled', enabled });
+                });
+            });
         }
 
         function render(state) {
@@ -418,6 +465,16 @@ export class LaunchTargetViewProvider implements vscode.WebviewViewProvider {
                 : undefined;
             const refreshing = !!state.refreshing;
             const refreshError = typeof state.refreshError === 'string' ? state.refreshError : '';
+            const mcp = state.mcp && typeof state.mcp.enabled === 'boolean'
+                ? state.mcp
+                : {
+                    enabled: false,
+                    running: false,
+                    host: '127.0.0.1',
+                    port: 38967,
+                    path: '/mcp',
+                    toolNames: [],
+                };
 
             const selectionName = selected.kind === 'local'
                 ? 'Local Workspace'
@@ -469,6 +526,28 @@ export class LaunchTargetViewProvider implements vscode.WebviewViewProvider {
                 }).join('')
                 : '<div class="empty">No connected devices.</div>';
 
+            const mcpStatusChip = !mcp.enabled
+                ? chip('Off', 'warn')
+                : (mcp.running
+                    ? chip('Port ' + mcp.port, 'good')
+                    : chip('Unavailable', 'warn'));
+            const mcpTitle = !mcp.enabled
+                ? 'Local MCP Disabled'
+                : (mcp.running ? 'Local MCP Ready' : 'Local MCP Needs Attention');
+            const mcpSummary = !mcp.enabled
+                ? 'Enable MCP to let Roo, Zoo, Claude Code, Codex, and other MCP clients connect to this VS Code window.'
+                : (mcp.running
+                    ? 'External AI clients can connect to the active RenderDoc window through this local MCP endpoint.'
+                    : 'MCP is enabled, but the local server is not currently reachable.');
+            const mcpDetail = mcp.running && mcp.url
+                ? mcp.url
+                : ('Configured endpoint: http://' + escapeHtml(mcp.host) + ':' + escapeHtml(mcp.port) + escapeHtml(mcp.path) + (mcp.lastError ? ' · ' + escapeHtml(mcp.lastError) : ''));
+            const mcpActions = '<div class="actionRow">'
+                + messageButton('One-Click Configure', 'configureMcpClients', 'primary')
+                + mcpToggleButton(!!mcp.enabled)
+                + messageButton('MCP Info', 'showMcpServerInfo', 'ghost')
+                + '</div>';
+
             appEl.innerHTML = '<div class="panel">'
                 + '<div class="panelHeader">'
                 + '<div class="panelTitleWrap">'
@@ -491,6 +570,14 @@ export class LaunchTargetViewProvider implements vscode.WebviewViewProvider {
                 + '</div>'
                 + '<div class="launchRow">'
                 + messageButton('Open Launch Panel', 'openLaunchApplication', 'primary')
+                + '</div>'
+                + '<div class="sectionSpacer" aria-hidden="true"></div>'
+                + '<div class="currentBar">'
+                + '<div class="currentLabel">Local MCP</div>'
+                + '<div class="targetTop"><div class="currentName">' + escapeHtml(mcpTitle) + '</div><div class="panelTools">' + mcpStatusChip + '</div></div>'
+                + '<div class="currentMeta">' + escapeHtml(mcpSummary) + '</div>'
+                + '<div class="metaTight">' + escapeHtml(mcpDetail) + '</div>'
+                + mcpActions
                 + '</div>'
                 + '</div>';
 

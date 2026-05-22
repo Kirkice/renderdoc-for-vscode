@@ -404,11 +404,13 @@ export class RenderDocMcpServer implements vscode.Disposable {
         const copyEndpointAction = 'Copy Endpoint';
         const copyVsCodeConfigAction = 'Copy VS Code Config';
         const copyGenericConfigAction = 'Copy Generic Config';
+        const configureClientsAction = 'Configure Workspace Clients';
         const choice = await vscode.window.showInformationMessage(
             `RenderDoc For VSCode MCP is listening on ${status.url}`,
             copyEndpointAction,
             copyVsCodeConfigAction,
             copyGenericConfigAction,
+            configureClientsAction,
         );
 
         if (choice === copyEndpointAction) {
@@ -419,6 +421,9 @@ export class RenderDocMcpServer implements vscode.Disposable {
         }
         if (choice === copyGenericConfigAction) {
             await vscode.env.clipboard.writeText(buildGenericConfigSnippet(status.url));
+        }
+        if (choice === configureClientsAction) {
+            await vscode.commands.executeCommand('renderdoc.configureMcpClients');
         }
     }
 
