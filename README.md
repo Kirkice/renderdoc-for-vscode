@@ -90,117 +90,79 @@ Analyze any shader directly from the Inspector's Shaders tab using the **Mali Of
 
 ## Screenshots
 
-<p align="center">
-    <a href="#capture-overview"><b>Capture Overview</b></a>
-    ·
-    <a href="#inspector-views"><b>Inspector Views</b></a>
-    ·
-    <a href="#capture-workflow"><b>Capture Workflow</b></a>
-    ·
-    <a href="#ai--mcp-workflow"><b>AI and MCP Workflow</b></a>
-</p>
-
-<p align="center">
-    Click any screenshot to open it at full size.
-</p>
+Click any screenshot to open it at full size.
 
 ### Capture Overview
 
-<table>
-<tr>
-<td width="50%" valign="top" align="center">
-    <a href="screenshots/capture-overview.jpeg"><img src="screenshots/capture-overview.jpeg" alt="Capture Overview" width="100%" /></a><br />
-    <sub><b>Overview</b> — frame thumbnail, API and driver metadata, and capture summary.</sub>
-</td>
-<td width="50%" valign="top" align="center">
-    <a href="screenshots/draw-calls-and-resources.jpeg"><img src="screenshots/draw-calls-and-resources.jpeg" alt="Draw Calls And Resources" width="100%" /></a><br />
-    <sub><b>Sidebar Views</b> — Draw Calls, Resources, and selection context in the activity bar.</sub>
-</td>
-</tr>
-</table>
+[![Capture Overview](screenshots/capture-overview.jpeg)](screenshots/capture-overview.jpeg)
+
+**Overview** — frame thumbnail, API and driver metadata, and capture summary.
+
+[![Draw Calls And Resources](screenshots/draw-calls-and-resources.jpeg)](screenshots/draw-calls-and-resources.jpeg)
+
+**Sidebar Views** — Draw Calls, Resources, and selection context in the activity bar.
 
 ### Inspector Views
 
-<table>
-<tr>
-<td width="33.3%" valign="top" align="center">
-    <a href="screenshots/pipeline-state.jpeg"><img src="screenshots/pipeline-state.jpeg" alt="Pipeline State" width="100%" /></a><br />
-    <sub><b>Pipeline State</b> — inspect bound stages and per-draw graphics state.</sub>
-</td>
-<td width="33.3%" valign="top" align="center">
-    <a href="screenshots/pipeline-graph-overview.jpeg"><img src="screenshots/pipeline-graph-overview.jpeg" alt="Pipeline Graph Overview" width="100%" /></a><br />
-    <sub><b>Pipeline Graph</b> — render-flow visualization derived from the full event hierarchy.</sub>
-</td>
-<td width="33.3%" valign="top" align="center">
-    <a href="screenshots/pipeline-graph-detail.jpeg"><img src="screenshots/pipeline-graph-detail.jpeg" alt="Pipeline Graph Detail" width="100%" /></a><br />
-    <sub><b>Pipeline Graph Detail</b> — drill into pass groups, representative commands, and selected-event context.</sub>
-</td>
-</tr>
-<tr>
-<td width="33.3%" valign="top" align="center">
-    <a href="screenshots/shaders.jpeg"><img src="screenshots/shaders.jpeg" alt="Shaders" width="100%" /></a><br />
-    <sub><b>Shaders</b> — source, disassembly, and shader-stage analysis in one place.</sub>
-</td>
-<td width="33.3%" valign="top" align="center">
-    <a href="screenshots/texture-view.jpeg"><img src="screenshots/texture-view.jpeg" alt="Texture View" width="100%" /></a><br />
-    <sub><b>Texture View</b> — inspect render targets and sampled textures for the current draw.</sub>
-</td>
-<td width="33.3%" valign="top" align="center">
-    <a href="screenshots/texture-info.jpeg"><img src="screenshots/texture-info.jpeg" alt="Texture Info" width="100%" /></a><br />
-    <sub><b>Texture Info</b> — zoom into an individual texture with focused metadata.</sub>
-</td>
-</tr>
-<tr>
-<td width="33.3%" valign="top" align="center">
-    <a href="screenshots/mesh-view.jpeg"><img src="screenshots/mesh-view.jpeg" alt="Mesh View" width="100%" /></a><br />
-    <sub><b>Mesh View</b> — inspect vertex/index data and geometry layout at a selected event.</sub>
-</td>
-<td width="33.3%" valign="top" align="center">
-    <a href="screenshots/resource-inspector.jpeg"><img src="screenshots/resource-inspector.jpeg" alt="Resource Inspector" width="100%" /></a><br />
-    <sub><b>Resource Inspector</b> — browse textures, buffers, and shader resources across the capture.</sub>
-</td>
-<td width="33.3%" valign="top" align="center">
-    <a href="screenshots/inspector-overview.jpeg"><img src="screenshots/inspector-overview.jpeg" alt="Inspector Overview" width="100%" /></a><br />
-    <sub><b>Overview</b> — capture metadata, API and driver details, and frame summary.</sub>
-</td>
-</tr>
-<tr>
-<td colspan="3" valign="top" align="center">
-    <a href="screenshots/mali-offline.jpeg"><img src="screenshots/mali-offline.jpeg" alt="Mali Offline Compiler" width="80%" /></a><br />
-    <sub><b>Mali Offline Compiler</b> — choose a target Mali GPU profile and inspect static shader analysis output.</sub>
-</td>
-</tr>
-</table>
+[![Pipeline State](screenshots/pipeline-state.jpeg)](screenshots/pipeline-state.jpeg)
+
+**Pipeline State** — inspect bound stages and per-draw graphics state.
+
+[![Pipeline Graph Overview](screenshots/pipeline-graph-overview.jpeg)](screenshots/pipeline-graph-overview.jpeg)
+
+**Pipeline Graph** — render-flow visualization derived from the full event hierarchy.
+
+[![Pipeline Graph Detail](screenshots/pipeline-graph-detail.jpeg)](screenshots/pipeline-graph-detail.jpeg)
+
+**Pipeline Graph Detail** — drill into pass groups, representative commands, and selected-event context.
+
+[![Shaders](screenshots/shaders.jpeg)](screenshots/shaders.jpeg)
+
+**Shaders** — source, disassembly, and shader-stage analysis in one place.
+
+[![Texture View](screenshots/texture-view.jpeg)](screenshots/texture-view.jpeg)
+
+**Texture View** — inspect render targets and sampled textures for the current draw.
+
+[![Texture Info](screenshots/texture-info.jpeg)](screenshots/texture-info.jpeg)
+
+**Texture Info** — zoom into an individual texture with focused metadata.
+
+[![Mesh View](screenshots/mesh-view.jpeg)](screenshots/mesh-view.jpeg)
+
+**Mesh View** — inspect vertex/index data and geometry layout at a selected event.
+
+[![Resource Inspector](screenshots/resource-inspector.jpeg)](screenshots/resource-inspector.jpeg)
+
+**Resource Inspector** — browse textures, buffers, and shader resources across the capture.
+
+[![Inspector Overview](screenshots/inspector-overview.jpeg)](screenshots/inspector-overview.jpeg)
+
+**Overview** — capture metadata, API and driver details, and frame summary.
+
+[![Mali Offline Compiler](screenshots/mali-offline.jpeg)](screenshots/mali-offline.jpeg)
+
+**Mali Offline Compiler** — choose a target Mali GPU profile and inspect static shader analysis output.
 
 ### Capture Workflow
 
-<table>
-<tr>
-<td width="50%" valign="top" align="center">
-    <a href="screenshots/launch-panel.jpeg"><img src="screenshots/launch-panel.jpeg" alt="Launch Panel" width="100%" /></a><br />
-    <sub><b>Launch Panel</b> — configure the target executable, arguments, output path, and capture trigger.</sub>
-</td>
-<td width="50%" valign="top" align="center">
-    <a href="screenshots/capture-target-view.jpeg"><img src="screenshots/capture-target-view.jpeg" alt="Capture Target View" width="100%" /></a><br />
-    <sub><b>Capture Target View</b> — switch between local and remote targets, attach, and trigger captures.</sub>
-</td>
-</tr>
-</table>
+[![Launch Panel](screenshots/launch-panel.jpeg)](screenshots/launch-panel.jpeg)
+
+**Launch Panel** — configure the target executable, arguments, output path, and capture trigger.
+
+[![Capture Target View](screenshots/capture-target-view.jpeg)](screenshots/capture-target-view.jpeg)
+
+**Capture Target View** — switch between local and remote targets, attach, and trigger captures.
 
 ### AI and MCP Workflow
 
-<table>
-<tr>
-<td width="50%" valign="top" align="center">
-    <a href="screenshots/copilot-chat.jpeg"><img src="screenshots/copilot-chat.jpeg" alt="Copilot Chat" width="100%" /></a><br />
-    <sub><b>Copilot Chat</b> — use <code>@renderdoc</code> or plain Copilot to analyze the current frame, draw calls, resources, and shaders.</sub>
-</td>
-<td width="50%" valign="top" align="center">
-    <a href="screenshots/mcp-connection-info.jpeg"><img src="screenshots/mcp-connection-info.jpeg" alt="MCP Connection Info" width="100%" /></a><br />
-    <sub><b>MCP Connection Info</b> — copy the local endpoint and client snippets for other MCP-capable tools.</sub>
-</td>
-</tr>
-</table>
+[![Copilot Chat](screenshots/copilot-chat.jpeg)](screenshots/copilot-chat.jpeg)
+
+**Copilot Chat** — use `@renderdoc` or plain Copilot to analyze the current frame, draw calls, resources, and shaders.
+
+[![MCP Connection Info](screenshots/mcp-connection-info.jpeg)](screenshots/mcp-connection-info.jpeg)
+
+**MCP Connection Info** — copy the local endpoint and client snippets for other MCP-capable tools.
 
 ---
 
