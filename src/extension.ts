@@ -32,12 +32,6 @@ import { ThumbnailPanel } from './views/thumbnailPanel';
 import { InspectorPanel } from './views/inspectorPanel';
 import { DrawOverlayPanel } from './views/drawOverlayPanel';
 import { initTools } from './copilot/tools';
-import { registerAllTools } from './copilot/toolRegistry';
-import { initChatParticipant, registerChatParticipant } from './copilot/chatParticipant';
-import {
-    ensureBundledCopilotCustomizationsInstalled,
-    reinstallBundledCopilotCustomizations,
-} from './copilot/skillInstaller';
 import { BUILD_DOCS_URL, ensureNativeBridge } from './bridgeInstaller';
 import { openShaderSourceDocument } from './shaderEditor';
 import { CaptureCache, formatBytes } from './util/captureCache';
@@ -54,7 +48,6 @@ import {
     getResourceDetailHtml,
 } from './views/panelHtml';
 import { RenderDocMcpServer, type RenderDocMcpStatus } from './mcp/server';
-import { syncWorkspaceMcpClientConfigs } from './mcp/clientConfigSync';
 
 let bridge: RenderDocBridge;
 let captureCache: CaptureCache;
@@ -332,33 +325,6 @@ async function openCaptureForChatTool(
             message: `Failed to load RenderDoc capture ${preferredPath}: ${message}`,
         };
     }
-}
-
-function showCopilotToolStatus(): void {
-    const output = vscode.window.createOutputChannel('RenderDoc Copilot Diagnostics');
-    const copilotChatExtension = vscode.extensions.getExtension('github.copilot-chat');
-    const renderDocTools = vscode.lm.tools
-        .filter((tool) => tool.name.startsWith('renderdoc_'))
-        .map((tool) => tool.name)
-        .sort((left, right) => left.localeCompare(right));
-    const openCapturePaths = getOpenRdcCapturePaths();
-
-    output.clear();
-    output.appendLine('RenderDoc Copilot Diagnostics');
-    output.appendLine('');
-    output.appendLine(`Copilot Chat installed: ${copilotChatExtension ? 'yes' : 'no'}`);
-    output.appendLine(`Copilot Chat active: ${copilotChatExtension?.isActive ? 'yes' : 'no'}`);
-    output.appendLine(`Current capture path: ${currentCapturePath ?? '<none>'}`);
-    output.appendLine(`Pending auto-load capture path: ${pendingAutoLoadCapturePath ?? '<none>'}`);
-    output.appendLine(`Open .rdc candidates in this window: ${openCapturePaths.length}`);
-    for (const capturePath of openCapturePaths) {
-        output.appendLine(`  - ${capturePath}`);
-    }
-    output.appendLine(`Registered renderdoc_* tools: ${renderDocTools.length}`);
-    for (const toolName of renderDocTools) {
-        output.appendLine(`  - ${toolName}`);
-    }
-    output.show(true);
 }
 
 function shouldRecoverReplayError(error: unknown): boolean {
@@ -1640,12 +1606,6 @@ export async function activate(context: vscode.ExtensionContext) {
     captureCache = new CaptureCache(context);
     launchTargetState = new LaunchTargetState(context);
 
-    try {
-        await ensureBundledCopilotCustomizationsInstalled(context);
-    } catch (error: any) {
-        console.warn('[RenderDoc] Failed to install bundled Copilot customizations:', error?.message ?? String(error));
-    }
-
     // Check RenderDoc availability on startup
     const available = await bridge.checkAvailability();
     console.log('[RenderDoc] checkAvailability:', available);
@@ -1793,23 +1753,39 @@ export async function activate(context: vscode.ExtensionContext) {
 
         if (!nextStatus.enabled) {
             mcpStatusBarItem.text = '$(circle-slash) MCP: Off';
+            mcpStatusBarItem.backgroundColor = new vscode.ThemeColor('statusBarItem.errorBackground');
             mcpStatusBarItem.tooltip = 'RenderDoc For VSCode MCP is disabled. Click to inspect MCP status and configuration.';
             mcpStatusBarItem.show();
             return;
         }
 
         if (nextStatus.running && nextStatus.url) {
-            mcpStatusBarItem.text = `$(hubot) MCP: ${nextStatus.port}`;
-            mcpStatusBarItem.tooltip = [
-                'RenderDoc For VSCode MCP is running.',
-                `Endpoint: ${nextStatus.url}`,
-                'Click to inspect details or copy the endpoint/config snippet.',
-            ].join('\n');
+            if (nextStatus.connected) {
+                mcpStatusBarItem.text = `$(pass-filled) MCP: ${nextStatus.port}`;
+                mcpStatusBarItem.backgroundColor = undefined;
+                mcpStatusBarItem.color = new vscode.ThemeColor('testing.iconPassed');
+                mcpStatusBarItem.tooltip = [
+                    'RenderDoc For VSCode MCP is running and a client is connected.',
+                    `Endpoint: ${nextStatus.url}`,
+                    'Click to inspect details or copy the endpoint/config snippet.',
+                ].join('\n');
+            } else {
+                mcpStatusBarItem.text = `$(hubot) MCP: ${nextStatus.port}`;
+                mcpStatusBarItem.backgroundColor = undefined;
+                mcpStatusBarItem.color = new vscode.ThemeColor('statusBarItem.prominentForeground');
+                mcpStatusBarItem.tooltip = [
+                    'RenderDoc For VSCode MCP is running. Waiting for client connection.',
+                    `Endpoint: ${nextStatus.url}`,
+                    'Click to inspect details or copy the endpoint/config snippet.',
+                ].join('\n');
+            }
             mcpStatusBarItem.show();
             return;
         }
 
         mcpStatusBarItem.text = `$(warning) MCP: ${nextStatus.port}`;
+        mcpStatusBarItem.backgroundColor = new vscode.ThemeColor('statusBarItem.errorBackground');
+        mcpStatusBarItem.color = undefined;
         mcpStatusBarItem.tooltip = [
             'RenderDoc For VSCode MCP is enabled but not running.',
             `Configured endpoint: http://${nextStatus.host}:${nextStatus.port}${nextStatus.path}`,
@@ -1846,71 +1822,15 @@ export async function activate(context: vscode.ExtensionContext) {
         () => renderDocMcpServer.getStatus(),
         async (enabled) => { await setMcpServerEnabled(enabled); },
         async () => { await vscode.commands.executeCommand('renderdoc.showMcpServerInfo'); },
-        async () => { await vscode.commands.executeCommand('renderdoc.configureMcpClients'); },
     );
     context.subscriptions.push(vscode.window.registerWebviewViewProvider('renderdoc-launchTarget', launchTargetViewProvider));
 
     updateMcpUi(renderDocMcpServer.getStatus());
 
-    const configureWorkspaceMcpClients = async () => {
-        let status = renderDocMcpServer.getStatus();
-        if (!status.enabled) {
-            await setMcpServerEnabled(true);
-            status = renderDocMcpServer.getStatus();
-        } else {
-            status = await renderDocMcpServer.startIfEnabled();
-            updateMcpUi(status);
-        }
-
-        if (!status.running || !status.url) {
-            void vscode.window.showErrorMessage(
-                `RenderDoc For VSCode MCP is not running${status.lastError ? `: ${status.lastError}` : '.'}`,
-            );
-            return;
-        }
-
-        const result = await syncWorkspaceMcpClientConfigs(status.url);
-        if (!result.files.length) {
-            void vscode.window.showWarningMessage('RenderDoc: no workspace folder is open, so no MCP client config files were written.');
-            return;
-        }
-
-        const created = result.files.filter((file) => file.status === 'created').length;
-        const updated = result.files.filter((file) => file.status === 'updated').length;
-        const unchanged = result.files.filter((file) => file.status === 'unchanged').length;
-        const failed = result.files.filter((file) => file.status === 'error');
-        const firstChangedFile = result.files.find((file) => file.status === 'created' || file.status === 'updated');
-
-        const summary = [
-            created > 0 ? `${created} created` : '',
-            updated > 0 ? `${updated} updated` : '',
-            unchanged > 0 ? `${unchanged} unchanged` : '',
-            failed.length > 0 ? `${failed.length} failed` : '',
-        ].filter(Boolean).join(', ');
-
-        const openConfigAction = firstChangedFile ? 'Open Config' : undefined;
-        const showInfoAction = failed.length > 0 ? 'Show Details' : undefined;
-        const actions = [openConfigAction, showInfoAction].filter((action): action is string => !!action);
-
-        const choice = failed.length > 0
-            ? await vscode.window.showWarningMessage(
-                `RenderDoc: workspace MCP client sync finished (${summary}).`,
-                ...actions,
-            )
-            : await vscode.window.showInformationMessage(
-                `RenderDoc: workspace MCP client sync finished (${summary}).`,
-                ...actions,
-            );
-
-        if (choice === openConfigAction && firstChangedFile) {
-            const document = await vscode.workspace.openTextDocument(firstChangedFile.filePath);
-            await vscode.window.showTextDocument(document);
-        }
-        if (choice === showInfoAction) {
-            const detailLines = failed.map((file) => `${file.label}: ${file.error ?? 'Unknown error'}`);
-            void vscode.window.showErrorMessage(detailLines.join(' | '));
-        }
-    };
+    // Auto-refresh the Capture Target panel when an MCP client connects
+    renderDocMcpServer.onClientConnected(() => {
+        updateMcpUi(renderDocMcpServer.getStatus());
+    });
 
     // Register commands
     context.subscriptions.push(
@@ -1948,21 +1868,10 @@ export async function activate(context: vscode.ExtensionContext) {
             const count = await copyRecentRenderDocDiagnosticsToClipboard();
             vscode.window.showInformationMessage(`RenderDoc: copied ${count} diagnostics line(s) to the clipboard.`);
         }),
-        vscode.commands.registerCommand('renderdoc.reinstallCopilotCustomizations', async () => {
-            try {
-                await reinstallBundledCopilotCustomizations(context);
-            } catch (error: any) {
-                const message = error?.message ?? String(error);
-                console.warn('[RenderDoc] Failed to reinstall Copilot customizations:', message);
-                void vscode.window.showErrorMessage(`Failed to reinstall RenderDoc Copilot customizations: ${message}`);
-            }
-        }),
-        vscode.commands.registerCommand('renderdoc.showCopilotToolStatus', () => showCopilotToolStatus()),
-            vscode.commands.registerCommand('renderdoc.showMcpServerInfo', async () => {
+        vscode.commands.registerCommand('renderdoc.showMcpServerInfo', async () => {
                 await renderDocMcpServer.showConnectionInfo();
             updateMcpUi(renderDocMcpServer.getStatus());
             }),
-        vscode.commands.registerCommand('renderdoc.configureMcpClients', () => configureWorkspaceMcpClients()),
         vscode.commands.registerCommand('renderdoc.downloadNativeBridge', async () => {
             // Clear the "don't ask again" flag so the picker shows again.
             await context.globalState.update('renderdoc.skipBridgePrompt', false);
@@ -1979,20 +1888,6 @@ export async function activate(context: vscode.ExtensionContext) {
         }),
         vscode.commands.registerCommand('renderdoc.fetchTimings', () => fetchTimings()),
     );
-
-    // ── Copilot integration (non-critical, disabled when copilot-chat is not installed) ──
-    const copilotExtension = vscode.extensions.getExtension('github.copilot-chat');
-    if (copilotExtension) {
-        try {
-            initChatParticipant(bridge, getCapturePath, getSelectionContext);
-            registerAllTools(context);
-            registerChatParticipant(context);
-        } catch (err: any) {
-            console.warn('[RenderDoc] Copilot integration failed (non-critical):', err.message);
-        }
-    } else {
-        console.info('[RenderDoc] GitHub Copilot Chat not found — AI features disabled.');
-    }
 
     try {
         const mcpStatus = await renderDocMcpServer.startIfEnabled();

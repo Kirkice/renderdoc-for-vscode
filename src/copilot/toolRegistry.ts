@@ -266,9 +266,3 @@ export const RENDERDOC_TOOL_REGISTRY: readonly RenderDocToolDefinition[] = [
         createTool: () => new GetBufferContentsTool(),
     },
 ];
-
-export function registerAllTools(context: vscode.ExtensionContext) {
-    context.subscriptions.push(
-        ...RENDERDOC_TOOL_REGISTRY.map((definition) => vscode.lm.registerTool(definition.name, definition.createTool())),
-    );
-}

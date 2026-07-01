@@ -34,6 +34,8 @@ type McpToolBinding = RenderDocToolDefinition & { tool: vscode.LanguageModelTool
 export interface RenderDocMcpStatus {
     enabled: boolean;
     running: boolean;
+    /** True when at least one MCP client has communicated with the server recently. */
+    connected: boolean;
     host: string;
     port: number;
     path: string;
@@ -181,12 +183,21 @@ export class RenderDocMcpServer implements vscode.Disposable {
     private url: string | undefined;
     private actualPort: number | undefined;
     private lastError: string | undefined;
+    private clientConnected: boolean = false;
     private readonly outputChannel = vscode.window.createOutputChannel('RenderDoc For VSCode MCP');
+    private onClientConnectedCallback: (() => void) | undefined;
 
     constructor(
         private readonly extensionVersion: string,
         private readonly getCurrentCapturePath: () => string | undefined,
     ) {}
+
+    /**
+     * Register a callback to be invoked when an MCP client connects.
+     */
+    onClientConnected(callback: () => void): void {
+        this.onClientConnectedCallback = callback;
+    }
 
     async startIfEnabled(): Promise<RenderDocMcpStatus> {
         const configuration = getRenderDocMcpConfiguration();
@@ -212,11 +223,38 @@ export class RenderDocMcpServer implements vscode.Disposable {
                 },
                 {
                     instructions: [
-                        'This RenderDoc For VSCode MCP server exposes RenderDoc capture analysis tools from the active VS Code window.',
-                        'If capture state is unknown, call renderdoc_openCapture with no filePath first so the server can resolve an already loaded or open .rdc capture from this VS Code window.',
-                        'Only ask the user for filePath when renderdoc_openCapture reports that no open or loaded capture could be resolved in this window.',
-                        'Use renderdoc_getSelectionContext for questions about the current selection or focused draw.',
-                    ].join(' '),
+                        'RenderDoc For VSCode MCP — GPU Capture Analysis Tools',
+                        '',
+                        'Core rules:',
+                        '- All capture facts must come from renderdoc_* tools. Never invent event IDs, resource IDs, shader code, pipeline state, resource bindings, buffer contents, texture contents, or GPU timings.',
+                        '- If capture state is unknown, call renderdoc_openCapture with no filePath first so the server can resolve an already loaded or open .rdc capture from this VS Code window.',
+                        '- Only ask the user for filePath when renderdoc_openCapture reports that no open or loaded capture could be resolved in this window.',
+                        '- For questions about the current selection, focused draw, or "this"/"current"/"selected", call renderdoc_getSelectionContext first.',
+                        '- If no capture is loaded, or a native-only capability is unavailable, say so explicitly instead of implying the data exists.',
+                        '',
+                        'Workflow routing:',
+                        '- Frame overview, pass layout, render flow, or bottleneck questions: start with renderdoc_getFrameSummary. Use renderdoc_getCaptureInfo early if API context matters. If direct GPU timing data may be missing, call renderdoc_getActionTimings.',
+                        '- Performance analysis: identify the hottest passes or leaf draws first, then drill into the hottest EIDs. Do not stop at a flat ranking list.',
+                        '- For each hot draw: inspect geometry pressure next with renderdoc_getEventDetails and renderdoc_getMeshData when needed. Prefer reporting numIndices, numInstances, and topology. Only estimate triangle or face pressure when the topology makes that estimate defensible.',
+                        '- After timing and geometry, inspect shader pressure with renderdoc_getShaderInfo or renderdoc_getPipelineState. Use renderdoc_getShaderSource only when the user explicitly wants code.',
+                        '- Then inspect texture pressure: bound texture count, suspicious texture resources, and the largest relevant textures by size, dimensions, format, byteSize, and mip levels using renderdoc_getResourceDetail or renderdoc_getTextureInfo.',
+                        '- For a specific EID outside a broader performance workflow: start with renderdoc_getEventDetails. Prefer renderdoc_getShaderInfo when the question is about a shader stage together with bindings or constant buffers. Use renderdoc_getPipelineState for broader state, binding, or render-target inspection. Use renderdoc_getMeshData only for geometry, topology, or vertex-layout questions.',
+                        '- For texture or resource tracing: start with renderdoc_getResourceDetail or renderdoc_getTextureInfo. Use renderdoc_findDrawsByTexture, renderdoc_findDrawsByShader, or renderdoc_findDrawsByResourceId for reverse lookups. Keep renderdoc_getTextureData requests narrow with specific eventId, mip, and channel when possible.',
+                        '- Treat overdraw as a separate rasterization follow-up. Only call it confirmed when direct overlay or preview evidence exists; otherwise describe it as a follow-up validation item.',
+                        '- For buffer inspection: identify the exact buffer resource first, fetch a small slice by default, and use offset plus len to paginate larger buffers.',
+                        '- When the user wants the project-side owner of a hot pass, shader, or event, use renderdoc_findProjectImplementation.',
+                        '',
+                        'Response guidelines:',
+                        '- Reference events as EID <n>.',
+                        '- For expensive draws, use the expensiveDraws field when present. Include the full logical marker hierarchy path for costly leaf draws, not just the leaf draw name.',
+                        '- Avoid dumping large JSON blobs; summarize the key fields, anomalies, and likely implications.',
+                        '- For performance analysis, be detailed: include the hottest passes or leaf draws, exact timing evidence, why each hot item is suspicious, and the next most relevant inspection target.',
+                        '- Distinguish clearly between confirmed capture facts, inferred causes, and follow-up hypotheses that still need validation.',
+                        '- If a hot event has shader-, binding-, or constant-buffer relevance, include that drill-down instead of stopping at timing numbers alone.',
+                        '- Mention native bridge limitations when pipeline state, shader source, mesh data, texture data, or buffer contents are unavailable.',
+                        '- When asked for an optimization report, organize it by dimensions: timing evidence, geometry pressure, shader complexity, texture pressure, overdraw or rasterization suspicion, and recommended fixes sorted by likely impact.',
+                        '- Prefer concise findings first, summarize evidence instead of dumping raw JSON.',
+                    ].join('\n'),
                 },
             );
 
@@ -246,6 +284,11 @@ export class RenderDocMcpServer implements vscode.Disposable {
 
             const httpServer = createServer(async (req, res) => {
                 try {
+                    const wasConnected = this.clientConnected;
+                    this.clientConnected = true;
+                    if (!wasConnected && this.onClientConnectedCallback) {
+                        this.onClientConnectedCallback();
+                    }
                     const requestUrl = new URL(req.url ?? '/', `http://${MCP_HOST}`);
                     if (requestUrl.pathname !== MCP_PATH) {
                         res.writeHead(404, { 'Content-Type': 'application/json' });
@@ -317,6 +360,7 @@ export class RenderDocMcpServer implements vscode.Disposable {
         this.server = undefined;
         this.url = undefined;
         this.actualPort = undefined;
+        this.clientConnected = false;
 
         const pending: Array<Promise<unknown>> = [];
 
@@ -347,6 +391,7 @@ export class RenderDocMcpServer implements vscode.Disposable {
         return {
             enabled: configuration.enabled,
             running: !!this.httpServer?.listening && !!this.url,
+            connected: this.clientConnected,
             host: MCP_HOST,
             port: this.actualPort ?? configuration.port,
             path: MCP_PATH,
@@ -404,13 +449,11 @@ export class RenderDocMcpServer implements vscode.Disposable {
         const copyEndpointAction = 'Copy Endpoint';
         const copyVsCodeConfigAction = 'Copy VS Code Config';
         const copyGenericConfigAction = 'Copy Generic Config';
-        const configureClientsAction = 'Configure Workspace Clients';
         const choice = await vscode.window.showInformationMessage(
             `RenderDoc For VSCode MCP is listening on ${status.url}`,
             copyEndpointAction,
             copyVsCodeConfigAction,
             copyGenericConfigAction,
-            configureClientsAction,
         );
 
         if (choice === copyEndpointAction) {
@@ -421,9 +464,6 @@ export class RenderDocMcpServer implements vscode.Disposable {
         }
         if (choice === copyGenericConfigAction) {
             await vscode.env.clipboard.writeText(buildGenericConfigSnippet(status.url));
-        }
-        if (choice === configureClientsAction) {
-            await vscode.commands.executeCommand('renderdoc.configureMcpClients');
         }
     }
 

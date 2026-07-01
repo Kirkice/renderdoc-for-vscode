@@ -6,7 +6,7 @@
 
 [![VS Code](https://img.shields.io/badge/VS%20Code-1.95%2B-007ACC?logo=visualstudiocode&logoColor=white)](https://code.visualstudio.com/)
 [![License](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![Copilot Chat](https://img.shields.io/badge/Copilot%20Chat-Integrated-8A2BE2?logo=github)](https://github.com/features/copilot)
+[![MCP](https://img.shields.io/badge/MCP-Integrated-8A2BE2?logo=modelcontextprotocol)](https://modelcontextprotocol.io/)
 [![APIs](https://img.shields.io/badge/APIs-Vulkan%20%7C%20D3D12%20%7C%20D3D11%20%7C%20OpenGL%20ES-ff6b6b)]()
 
 *A native-backed RenderDoc frontend, reimagined for the modern editor workflow.*
@@ -17,7 +17,7 @@
 
 ## Overview
 
-**RenderDoc for VS Code** brings the full power of the RenderDoc graphics debugger into Visual Studio Code. Open any `.rdc` capture file and get an instant, first-class inspection experience — hierarchical draw call timelines, live shader source, full pipeline state, texture and buffer inspection, GPU timing profiling, project-source mapping, Mali shader analysis, GitHub Copilot Chat integration, and an optional local MCP endpoint for other AI clients.
+**RenderDoc for VS Code** brings the full power of the RenderDoc graphics debugger into Visual Studio Code. Open any `.rdc` capture file and get an instant, first-class inspection experience — hierarchical draw call timelines, live shader source, full pipeline state, texture and buffer inspection, GPU timing profiling, project-source mapping, Mali shader analysis, and a local MCP endpoint for AI-powered analysis via any MCP-capable client.
 
 No context switching. No external viewers. Just your capture, your editor, and your agent.
 
@@ -73,14 +73,14 @@ A C++ bridge (`renderdoc_bridge.exe`) links directly to RenderDoc's replay DLL �
 <tr>
 <td width="50%" valign="top">
 
-### AI-Powered Frame Analysis (`@renderdoc`)
-Ask `@renderdoc` anything about your capture. The Copilot participant reads your current Inspector selection and dispatches 21 specialized language-model tools — including on-demand action timings, shader and constant-buffer inspection, resource reverse lookups, project-source mapping, and Mali shader analysis results.
+### AI-Powered Frame Analysis (MCP)
+Connect any MCP-capable AI client to the local **RenderDoc For VSCode MCP** endpoint. The server exposes 21 specialized tools — including on-demand action timings, shader and constant-buffer inspection, resource reverse lookups, project-source mapping, and Mali shader analysis results.
 
 </td>
 <td width="50%" valign="top">
 
 ### Mali Offline Compiler Integration
-Analyze any shader directly from the Inspector's Shaders tab using the **Mali Offline Compiler** (`malioc`). Results are shown in a resizable side-by-side panel alongside the shader source, and are also exposed to `@renderdoc` for AI-assisted optimization advice.
+Analyze any shader directly from the Inspector's Shaders tab using the **Mali Offline Compiler** (`malioc`). Results are shown in a resizable side-by-side panel alongside the shader source, and are also exposed to MCP clients for AI-assisted optimization advice.
 
 </td>
 </tr>
@@ -154,15 +154,11 @@ Click any screenshot to open it at full size.
 
 **Capture Target View** — switch between local and remote targets, attach, and trigger captures.
 
-### AI and MCP Workflow
-
-[![Copilot Chat](screenshots/copilot-chat.jpeg)](screenshots/copilot-chat.jpeg)
-
-**Copilot Chat** — use `@renderdoc` or plain Copilot to analyze the current frame, draw calls, resources, and shaders.
+### MCP Workflow
 
 [![MCP Connection Info](screenshots/mcp-connection-info.jpeg)](screenshots/mcp-connection-info.jpeg)
 
-**MCP Connection Info** — copy the local endpoint and client snippets for other MCP-capable tools.
+**MCP Connection Info** — copy the local endpoint and client snippets for MCP-capable AI tools.
 
 ---
 
@@ -174,7 +170,7 @@ Click any screenshot to open it at full size.
 3. The RenderDoc sidebar appears automatically
 4. Click any draw call → Inspector opens beside your editor
 5. Run "Fetch GPU Timings" to populate durationUs per draw
-6. Chat with `@renderdoc`, plain Copilot, or another MCP-capable client connected to the local endpoint
+6. Connect an MCP-capable AI client (Cline, Roo Code, Claude Code, etc.) to the local MCP endpoint for AI-powered analysis
 ```
 
 > **Requires:** Packaged VSIX releases can run directly from the bundled `.renderdoc-runtime` and native bridge. When working from source, build `native/build/Release/renderdoc_bridge.exe` and use a local RenderDoc install unless your development package also includes `.renderdoc-runtime`. If a packaged install is damaged or incomplete, run **`RenderDoc: Restore Native Bridge…`** to recover the bundled helper from the latest VSIX.
@@ -252,7 +248,7 @@ Navigation:
 1. Open the **Draw Calls** sidebar.
 2. Click the **Fetch GPU Timings** button (⏱).
 3. Each draw call is annotated with its measured GPU time (`durationUs`).
-4. Ask `@renderdoc` or plain Copilot to rank draws by cost, summarize hot passes, or drill into a specific hot EID.
+4. Use your MCP-capable AI client to rank draws by cost, summarize hot passes, or drill into a specific hot EID.
 
 ---
 
@@ -262,17 +258,13 @@ Navigation:
 2. Set `renderdoc.maliOfflineCompilerPath` to the path of `malioc.exe` in VS Code Settings.
 3. In the Inspector → **Shaders** tab, click **Analyze with Mali Offline Compiler**.
 4. The analysis result appears in a resizable pane beside the shader source.
-5. Ask `@renderdoc` for optimization suggestions — it has access to the Mali analysis output.
+5. Ask your MCP client for optimization suggestions — it has access to the Mali analysis output.
 
 ---
 
-### 7 · Copilot Chat (`@renderdoc` and default Copilot)
+### 7 · AI-Powered Analysis via MCP
 
-Open VS Code Chat (`Ctrl+Alt+I`). Use `@renderdoc` when you want the most deterministic RenderDoc-specific behavior, or ask plain Copilot in this repo to let the workspace skill route into the same local `renderdoc_*` tools.
-
-The extension's own UI features do not require Copilot or MCP. If you use GitHub Copilot, the AI flow also works without extra MCP setup because Copilot can call the built-in local `renderdoc_*` tools directly.
-
-If you use another MCP-capable AI client in VS Code, connect that client to the local **RenderDoc For VSCode MCP** endpoint exposed by this extension. The default endpoint is `http://127.0.0.1:38967/mcp`, but you should prefer the actual URL shown in the sidebar GUI because the configured port can differ. In the **Capture Target** view, use **Local MCP → One-Click Configure** first. That button enables MCP if needed, starts the local server, and auto-writes workspace config files with the actual current URL. If you need to inspect or copy the final endpoint manually, click **MCP Info** in the same card or run **RenderDoc: Show RenderDoc For VSCode MCP Info**.
+Connect any MCP-capable AI client (Cline, Roo Code, Zoo Code, Claude Code, etc.) to the local **RenderDoc For VSCode MCP** endpoint exposed by this extension. The default endpoint is `http://127.0.0.1:38967/mcp`, but you should prefer the actual URL shown in the sidebar GUI because the configured port can differ. In the **Capture Target** view, use **Local MCP → One-Click Configure** first. That button enables MCP if needed, starts the local server, and auto-writes workspace config files with the actual current URL. If you need to inspect or copy the final endpoint manually, click **MCP Info** in the same card or run **RenderDoc: Show RenderDoc For VSCode MCP Info**.
 
 #### External MCP Client Setup
 
@@ -316,8 +308,6 @@ Client notes:
 - `Roo Code` / `Zoo Code`: prefer the sidebar **Local MCP → One-Click Configure** button. It writes project `.roo/mcp.json` for you. If your teammate uses a global `mcp_settings.json` instead, use **MCP Info** and paste the generic snippet there.
 - `Claude Code`: add a remote HTTP MCP server named `renderdoc-for-vscode`. If it asks for a transport, choose `streamable-http` or the equivalent HTTP streaming option. If it accepts raw JSON config, use the generic `mcpServers` snippet above.
 - `Codex` / `CodeX`: use the same generic remote MCP server settings as Claude Code. Choose an HTTP or `streamable-http` transport, not a local `stdio` server.
-- `GitHub Copilot in VS Code`: no extra MCP configuration is required in this repository.
-
 Common gotchas:
 
 - The MCP endpoint reflects the capture opened in this VS Code window, not a global RenderDoc session from some other app.
@@ -332,29 +322,22 @@ Recommended first test prompt for teammates:
 Open the current RenderDoc capture, summarize the top-level passes in this frame, and if capture state is unknown call renderdoc_openCapture first with no filePath.
 ```
 
-Typical `@renderdoc` prompts:
+Typical prompts for your MCP client:
 
 ```text
-@renderdoc Analyze the fragment shader for EID 495 and suggest optimizations
-@renderdoc Find all draw calls rendering to the shadow map
-@renderdoc Show pipeline state diff between EID 300 and EID 355
-@renderdoc Which textures are bound at the currently selected draw?
-```
-
-Typical default-Copilot prompts in this workspace:
-
-```text
+Analyze the fragment shader for EID 495 and suggest optimizations
+Find all draw calls rendering to the shadow map
+Show pipeline state diff between EID 300 and EID 355
+Which textures are bound at the currently selected draw?
 这个帧大概有哪些 pass？先给我一个结构概览。
 当前选中的这个 Draw 绑定了哪些纹理？
 帮我分析 EID 495 的 fragment shader，并看看它在工程里对应哪个 shader/pass 实现。
 这个 ResourceId 对应的 buffer 前 256 字节是什么？
 ```
 
-Both flows can use your **active Inspector selection** (focused EID, draw call, sidebar resource), so natural references like *"this draw"* or *"the current event"* resolve automatically.
+The MCP tools can use your **active Inspector selection** (focused EID, draw call, sidebar resource), so natural references like *"this draw"* or *"the current event"* resolve automatically.
 
-In this repository, default Copilot is guided by both the workspace skills and `.github/copilot-instructions.md`, so it uses the local `renderdoc_*` tools directly. The local MCP endpoint is a separate compatibility surface for other clients, not the path used by the extension itself.
-
-Available tools (also invokable via `#toolReferenceName`):
+Available MCP tools:
 
 Context and overview:
 
@@ -396,21 +379,7 @@ Reverse lookups and source mapping:
 | `#findDrawsByResourceId` | Reverse-search draw calls by exact resource ID |
 | `#projectImplementation` | Search the open workspace for likely shader/pass implementation files related to a capture event |
 
-#### Default Copilot Skill
-
-The workspace also ships a project-scoped skill at `.github/skills/renderdoc-analysis` for the default Copilot chat experience. That skill helps plain Copilot recognize RenderDoc-oriented prompts and route them through the existing `renderdoc_*` tools even when you do not explicitly address `@renderdoc`.
-
-For Unity engineering workspaces, the project also ships `.github/skills/renderdoc-unity-analysis`. That skill reuses the same RenderDoc capture tools for timings, EIDs, shaders, and pipeline facts, then adds Unity-specific routing for URP, HDRP, SRP, RenderGraph, `ScriptableRendererFeature`, `ScriptableRenderPass`, and Unity-side pass/shader implementation lookup.
-
-Responsibility split:
-
-- **Language model tools** are the capability layer. They provide the real capture data: frame summaries, draw calls, timings, pipeline state, shader data, textures, buffers, and reverse lookups.
-- **`renderdoc-analysis` skill** is the workflow layer for default Copilot. It owns question-to-workflow routing, trigger phrases, and generic analysis guidance.
-- **`renderdoc-unity-analysis` skill** is a Unity-specialized workflow layer. It reuses the same capture facts but interprets them in Unity render-pipeline terms and maps suspicious passes or shaders back to Unity project code.
-- **`.github/copilot-instructions.md`** is the always-on workspace guidance layer for default Copilot in this repository. It reinforces that local `renderdoc_*` tools are authoritative when they can answer the question.
-- **`@renderdoc` participant prompt** is the runtime policy layer. It keeps hard rules that must always apply in participant chats, such as resolving missing IDs from selection context, trusting timing data for cost ranking, and surfacing native bridge limitations.
-
-Use `@renderdoc` when you want the strongest routing guarantees. Use default Copilot when you want the same capture tools to combine with broader repository reasoning.
+The MCP server includes built-in workflow instructions that guide AI clients through the optimal analysis path: selection context first, frame overview, performance drill-down, shader/texture/buffer inspection, and project source mapping.
 
 ---
 
@@ -429,7 +398,6 @@ Use `@renderdoc` when you want the strongest routing guarantees. Use default Cop
 | Inspector stays blank after clicking a draw | `Developer: Reload Window` — auto-recreates the panel |
 | Textures tab shows nothing | The draw has no sampled inputs/RTs, or pipeline is still loading |
 | Mali Offline Compiler button missing | Set `renderdoc.maliOfflineCompilerPath` to the path of `malioc.exe` |
-| `@renderdoc` not available in Chat | Ensure GitHub Copilot Chat is signed in and enabled |
 | GPU timings show `N/A` | Click **Fetch GPU Timings** in the Draw Calls sidebar first |
 | Capture recommends a remote replay host | Connect a compatible target, use **RenderDoc: Try Local Replay**, or set `renderdoc.alwaysReplayLocally` if you do not want the prompt |
 
@@ -441,8 +409,8 @@ Use `@renderdoc` when you want the strongest routing guarantees. Use default Cop
 ┌──────────────────────────────────────────────────────────────────────┐
 │                        VS Code Extension Host                        │
 │  ┌──────────────┐   ┌──────────────────┐   ┌──────────────────────┐  │
-│  │   Sidebar    │   │    Inspector     │   │  Copilot Participant  │  │
-│  │   Views      │   │    Webview       │   │  + LM Tools (21×)    │  │
+│  │   Sidebar    │   │    Inspector     │   │    MCP Server        │  │
+│  │   Views      │   │    Webview       │   │  (21 tools, HTTP)    │  │
 │  └──────┬───────┘   └────────┬─────────┘   └──────────┬───────────┘  │
 │         └────────────────────┼────────────────────────┘              │
 │                              ▼                                       │
@@ -479,8 +447,8 @@ renderdoc-for-vscode/
 │   │   ├── inspectorPanel.ts     # Main Inspector panel (IPC, Mali analysis)
 │   │   └── inspector/html.ts     # Inspector HTML template generation
 │   └── copilot/
-│       ├── chatParticipant.ts    # @renderdoc Copilot Chat handler
-│       └── tools.ts              # Language model tool implementations
+│       ├── tools.ts              # MCP tool implementations
+│       └── toolRegistry.ts       # Tool definitions and schemas
 ├── native/
 │   ├── include/                  # RenderDoc public headers (vendored)
 │   ├── 3rdparty/                 # ASTC decoder, stb_image_write

@@ -9,8 +9,7 @@ type LaunchTargetViewMessage =
     | { type: 'refreshCaptureTargets' }
     | { type: 'openLaunchApplication' }
     | { type: 'setMcpEnabled'; enabled: boolean }
-    | { type: 'showMcpServerInfo' }
-    | { type: 'configureMcpClients' };
+    | { type: 'showMcpServerInfo' };
 
 export class LaunchTargetViewProvider implements vscode.WebviewViewProvider {
     private view: vscode.WebviewView | undefined;
@@ -22,7 +21,6 @@ export class LaunchTargetViewProvider implements vscode.WebviewViewProvider {
         private readonly getMcpStatus: () => RenderDocMcpStatus,
         private readonly onSetMcpEnabled: (enabled: boolean) => Promise<void>,
         private readonly onShowMcpServerInfo: () => Promise<void>,
-        private readonly onConfigureMcpClients: () => Promise<void>,
     ) {
         this.state.onDidChange(() => {
             void this.pushState();
@@ -72,10 +70,6 @@ export class LaunchTargetViewProvider implements vscode.WebviewViewProvider {
                 break;
             case 'showMcpServerInfo':
                 await this.onShowMcpServerInfo();
-                await this.pushState();
-                break;
-            case 'configureMcpClients':
-                await this.onConfigureMcpClients();
                 await this.pushState();
                 break;
         }
@@ -310,11 +304,32 @@ export class LaunchTargetViewProvider implements vscode.WebviewViewProvider {
             border-color: rgba(117, 208, 199, 0.3);
             background: rgba(117, 208, 199, 0.12);
         }
+        .chip.connected {
+            color: #d4f5d4;
+            border-color: rgba(76, 175, 80, 0.4);
+            background: rgba(76, 175, 80, 0.16);
+        }
         .chip.warn {
             color: #ffe7ce;
             border-color: rgba(199, 138, 82, 0.34);
             background: rgba(199, 138, 82, 0.14);
         }
+        .chip.error {
+            color: #ffd4d4;
+            border-color: rgba(244, 67, 54, 0.4);
+            background: rgba(244, 67, 54, 0.16);
+        }
+        .mcpDot {
+            display: inline-block;
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            margin-right: 6px;
+            vertical-align: middle;
+        }
+        .mcpDot.blue { background: #4fc3f7; box-shadow: 0 0 6px rgba(79, 195, 247, 0.5); }
+        .mcpDot.red { background: #f44336; box-shadow: 0 0 6px rgba(244, 67, 54, 0.5); }
+        .mcpDot.green { background: #4caf50; box-shadow: 0 0 6px rgba(76, 175, 80, 0.5); }
         .empty,
         .notice {
             padding: 8px 10px;
@@ -526,24 +541,35 @@ export class LaunchTargetViewProvider implements vscode.WebviewViewProvider {
                 }).join('')
                 : '<div class="empty">No connected devices.</div>';
 
-            const mcpStatusChip = !mcp.enabled
-                ? chip('Off', 'warn')
+            const mcpDotClass = !mcp.enabled
+                ? 'red'
                 : (mcp.running
-                    ? chip('Port ' + mcp.port, 'good')
-                    : chip('Unavailable', 'warn'));
+                    ? (mcp.connected ? 'green' : 'blue')
+                    : 'red');
+            const mcpDotHtml = '<span class="mcpDot ' + mcpDotClass + '"></span>';
+            const mcpStatusChip = !mcp.enabled
+                ? chip('Off', 'error')
+                : (mcp.running
+                    ? (mcp.connected
+                        ? chip('Connected · Port ' + mcp.port, 'connected')
+                        : chip('Running · Port ' + mcp.port, 'good'))
+                    : chip('Error', 'error'));
             const mcpTitle = !mcp.enabled
                 ? 'Local MCP Disabled'
-                : (mcp.running ? 'Local MCP Ready' : 'Local MCP Needs Attention');
+                : (mcp.running
+                    ? (mcp.connected ? 'Local MCP Connected' : 'Local MCP Ready')
+                    : 'Local MCP Needs Attention');
             const mcpSummary = !mcp.enabled
                 ? 'Enable MCP to let Roo, Zoo, Claude Code, Codex, and other MCP clients connect to this VS Code window.'
                 : (mcp.running
-                    ? 'External AI clients can connect to the active RenderDoc window through this local MCP endpoint.'
+                    ? (mcp.connected
+                        ? 'An AI client is connected to the local MCP endpoint and can analyze captures.'
+                        : 'External AI clients can connect to the active RenderDoc window through this local MCP endpoint.')
                     : 'MCP is enabled, but the local server is not currently reachable.');
             const mcpDetail = mcp.running && mcp.url
                 ? mcp.url
                 : ('Configured endpoint: http://' + escapeHtml(mcp.host) + ':' + escapeHtml(mcp.port) + escapeHtml(mcp.path) + (mcp.lastError ? ' · ' + escapeHtml(mcp.lastError) : ''));
             const mcpActions = '<div class="actionRow">'
-                + messageButton('One-Click Configure', 'configureMcpClients', 'primary')
                 + mcpToggleButton(!!mcp.enabled)
                 + messageButton('MCP Info', 'showMcpServerInfo', 'ghost')
                 + '</div>';
@@ -574,7 +600,7 @@ export class LaunchTargetViewProvider implements vscode.WebviewViewProvider {
                 + '<div class="sectionSpacer" aria-hidden="true"></div>'
                 + '<div class="currentBar">'
                 + '<div class="currentLabel">Local MCP</div>'
-                + '<div class="targetTop"><div class="currentName">' + escapeHtml(mcpTitle) + '</div><div class="panelTools">' + mcpStatusChip + '</div></div>'
+                + '<div class="targetTop"><div class="currentName">' + mcpDotHtml + escapeHtml(mcpTitle) + '</div><div class="panelTools">' + mcpStatusChip + '</div></div>'
                 + '<div class="currentMeta">' + escapeHtml(mcpSummary) + '</div>'
                 + '<div class="metaTight">' + escapeHtml(mcpDetail) + '</div>'
                 + mcpActions
