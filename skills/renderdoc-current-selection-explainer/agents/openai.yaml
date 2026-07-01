@@ -1,0 +1,4 @@
+interface:
+  display_name: "RenderDoc Current Selection Explainer"
+  short_description: "Explain the selected draw, event, or resource."
+  default_prompt: "Use $renderdoc-current-selection-explainer to explain the currently selected RenderDoc event or resource."

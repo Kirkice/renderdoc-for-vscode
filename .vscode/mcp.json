@@ -5,6 +5,7 @@
             "url": "http://127.0.0.1:38967/mcp"
         },
         "gemini-image": {
+            "type": "stdio",
             "command": "node",
             "args": [
                 "c:\\Users\\admin\\.vscode\\extensions\\marvel-ai.gemini-image-generator-0.2.6\\dist\\server.js"

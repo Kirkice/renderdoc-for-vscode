@@ -1,0 +1,4 @@
+interface:
+  display_name: "RenderDoc Performance Investigation"
+  short_description: "Investigate frame bottlenecks and costly draws."
+  default_prompt: "Use $renderdoc-performance-investigation to find the hottest work in the current RenderDoc capture and explain likely causes."

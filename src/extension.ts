@@ -1736,6 +1736,13 @@ export async function activate(context: vscode.ExtensionContext) {
         getSelectionContext,
         () => currentDrawCalls,
         (filePath) => openCaptureForChatTool(context, filePath),
+        () => ({
+            captureLoaded: !!currentCapturePath,
+            capturePath: currentCapturePath ?? null,
+            replayStatus: captureInfoProvider.getReplayStatus(),
+            replayMode: currentReplayMode,
+            nativeBridgeRunning: bridge.hasNativeBridge(),
+        }),
     );
 
     const renderDocMcpServer = new RenderDocMcpServer(

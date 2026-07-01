@@ -1,0 +1,4 @@
+interface:
+  display_name: "RenderDoc Replay Recovery Helper"
+  short_description: "Recover when capture or replay state is missing."
+  default_prompt: "Use $renderdoc-replay-recovery-helper to recover RenderDoc capture or replay state before analysis."

@@ -1,0 +1,4 @@
+interface:
+  display_name: "RenderDoc Pass To Project Mapping"
+  short_description: "Map capture events back to project source."
+  default_prompt: "Use $renderdoc-pass-to-project-mapping to map a RenderDoc pass or event back to likely project-side shader or render code."

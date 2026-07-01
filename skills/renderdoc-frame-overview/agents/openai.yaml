@@ -1,0 +1,4 @@
+interface:
+  display_name: "RenderDoc Frame Overview"
+  short_description: "Summarize frame structure and major passes."
+  default_prompt: "Use $renderdoc-frame-overview to summarize the current RenderDoc capture and identify its main passes."

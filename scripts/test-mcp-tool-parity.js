@@ -11,55 +11,51 @@ function sorted(values) {
   return [...values].sort((left, right) => left.localeCompare(right));
 }
 
-function diff(left, right) {
-  return sorted([...left].filter((value) => !right.has(value)));
-}
-
-const activationToolNames = new Set(
-  (packageJson.activationEvents || [])
-    .filter((value) => typeof value === 'string' && value.startsWith('onLanguageModelTool:renderdoc_'))
-    .map((value) => value.slice('onLanguageModelTool:'.length)),
+// Extract tool names from the shared registry in toolRegistry.ts
+const registryToolNames = new Set(
+  Array.from(toolRegistrySource.matchAll(/name:\s*'(renderdoc_[^']+)'/g), (match) => match[1]),
 );
 
+// Verify the MCP server imports and uses the shared RENDERDOC_TOOL_REGISTRY
+assert.ok(
+  serverSource.includes('RENDERDOC_TOOL_REGISTRY'),
+  'The MCP server should consume the shared RenderDoc tool registry.',
+);
+
+// Verify no stale contributes.languageModelTools remain in package.json
+// (Copilot integration was removed; all tools are now MCP-only)
 const contributedToolNames = new Set(
   (packageJson.contributes?.languageModelTools || [])
     .map((entry) => entry?.name)
     .filter((value) => typeof value === 'string' && value.startsWith('renderdoc_')),
 );
 
-const registryToolNames = new Set(
-  Array.from(toolRegistrySource.matchAll(/name:\s*'(renderdoc_[^']+)'/g), (match) => match[1]),
+assert.strictEqual(
+  contributedToolNames.size,
+  0,
+  `package.json should not contain contributes.languageModelTools (Copilot removed, MCP-only). Found: ${[...contributedToolNames].join(', ')}`,
 );
 
-const activationMissingFromContributes = diff(activationToolNames, contributedToolNames);
-const contributesMissingFromActivation = diff(contributedToolNames, activationToolNames);
-const contributesMissingFromRegistry = diff(contributedToolNames, registryToolNames);
-const registryMissingFromContributes = diff(registryToolNames, contributedToolNames);
-
-assert.deepStrictEqual(
-  activationMissingFromContributes,
-  [],
-  `Activation events reference tools missing from contributes.languageModelTools: ${activationMissingFromContributes.join(', ')}`,
-);
-assert.deepStrictEqual(
-  contributesMissingFromActivation,
-  [],
-  `contributes.languageModelTools contains tools missing from activationEvents: ${contributesMissingFromActivation.join(', ')}`,
-);
-assert.deepStrictEqual(
-  contributesMissingFromRegistry,
-  [],
-  `Shared tool registry is missing tools from contributes.languageModelTools: ${contributesMissingFromRegistry.join(', ')}`,
-);
-assert.deepStrictEqual(
-  registryMissingFromContributes,
-  [],
-  `Shared tool registry contains tools missing from contributes.languageModelTools: ${registryMissingFromContributes.join(', ')}`,
+// Verify no stale onLanguageModelTool activation events remain
+const activationToolNames = new Set(
+  (packageJson.activationEvents || [])
+    .filter((value) => typeof value === 'string' && value.startsWith('onLanguageModelTool:renderdoc_'))
+    .map((value) => value.slice('onLanguageModelTool:'.length)),
 );
 
-assert.ok(
-  serverSource.includes('RENDERDOC_TOOL_REGISTRY'),
-  'The MCP server should consume the shared RenderDoc tool registry.',
+assert.strictEqual(
+  activationToolNames.size,
+  0,
+  `package.json should not contain onLanguageModelTool activation events (Copilot removed, MCP-only). Found: ${[...activationToolNames].join(', ')}`,
 );
 
-console.log(`MCP tool parity check passed for ${contributedToolNames.size} tools.`);
+// Verify no duplicate tool names in the registry
+const registryToolList = Array.from(toolRegistrySource.matchAll(/name:\s*'(renderdoc_[^']+)'/g), (match) => match[1]);
+const duplicates = registryToolList.filter((name, index) => registryToolList.indexOf(name) !== index);
+assert.deepStrictEqual(
+  duplicates,
+  [],
+  `Duplicate tool names found in toolRegistry.ts: ${[...new Set(duplicates)].join(', ')}`,
+);
+
+console.log(`MCP tool parity check passed for ${registryToolNames.size} tools (MCP-only mode).`);

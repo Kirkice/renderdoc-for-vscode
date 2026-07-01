@@ -1,0 +1,4 @@
+interface:
+  display_name: "RenderDoc Shader Review"
+  short_description: "Review shader behavior, bindings, and issues."
+  default_prompt: "Use $renderdoc-shader-review to review the shader stages for a RenderDoc event and call out issues or optimization opportunities."

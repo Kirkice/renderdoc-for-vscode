@@ -1,0 +1,4 @@
+interface:
+  display_name: "RenderDoc Texture Trace"
+  short_description: "Trace how a texture is produced and used."
+  default_prompt: "Use $renderdoc-texture-trace to trace how a RenderDoc texture is written, sampled, and related to frame passes."

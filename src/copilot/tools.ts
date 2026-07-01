@@ -10,6 +10,15 @@ let _getCurrentCapturePath: () => string | undefined;
 let _getSelectionContext: () => { selectedDrawCall: any; selectedResource: any };
 let _getCurrentDrawCalls: () => DrawCall[];
 let _openCaptureForChat: ((filePath?: string) => Promise<OpenCaptureResult>) | undefined;
+let _getReplayState: (() => ReplayStateInfo) | undefined;
+
+interface ReplayStateInfo {
+    captureLoaded: boolean;
+    capturePath: string | null;
+    replayStatus: 'none' | 'active' | 'failed' | 'unavailable';
+    replayMode: 'none' | 'local' | 'remote';
+    nativeBridgeRunning: boolean;
+}
 
 interface OpenCaptureResult {
     captureLoaded: boolean;
@@ -26,12 +35,14 @@ export function initTools(
     getSelectionContext: () => { selectedDrawCall: any; selectedResource: any },
     getCurrentDrawCalls?: () => DrawCall[],
     openCaptureForChat?: (filePath?: string) => Promise<OpenCaptureResult>,
+    getReplayState?: () => ReplayStateInfo,
 ) {
     _bridge = bridge;
     _getCurrentCapturePath = getCurrentCapturePath;
     _getSelectionContext = getSelectionContext;
     _getCurrentDrawCalls = getCurrentDrawCalls ?? (() => []);
     _openCaptureForChat = openCaptureForChat;
+    _getReplayState = getReplayState;
 }
 
 function requireCapturePath(): string {
@@ -2399,5 +2410,1146 @@ export class GetBufferContentsTool implements vscode.LanguageModelTool<GetBuffer
         const len = options.input?.len ?? 4096;
         return { invocationMessage: `Reading ${len} bytes from buffer ${options.input?.resourceId}…` };
     }
+}
+
+// ─── Tool: Get Replay Status ─────────────────────────────────────────────────
+export class GetReplayStatusTool implements vscode.LanguageModelTool<Record<string, never>> {
+    async invoke(
+        _options: vscode.LanguageModelToolInvocationOptions<Record<string, never>>,
+        _token: vscode.CancellationToken,
+    ): Promise<vscode.LanguageModelToolResult> {
+        const capturePath = _getCurrentCapturePath();
+        const hasNative = _bridge.hasNativeBridge();
+        const replayState = _getReplayState?.();
+
+        const replayActive = replayState?.replayStatus === 'active';
+        const replayMode = replayState?.replayMode ?? 'none';
+
+        const capabilities = {
+            pipelineState: hasNative && replayActive,
+            shaderSource: hasNative && replayActive,
+            shaderInfo: hasNative && replayActive,
+            meshData: hasNative && replayActive,
+            textureData: hasNative && replayActive,
+            bufferContents: hasNative && replayActive,
+            eventChunks: hasNative && replayActive,
+            currentDrawPreview: hasNative && replayActive,
+        };
+
+        let message: string;
+        if (!capturePath) {
+            message = 'No capture is currently loaded.';
+        } else if (!hasNative) {
+            message = 'Capture is loaded but the native bridge is not running. Replay-dependent tools are unavailable.';
+        } else if (!replayActive) {
+            message = `Capture is loaded and native bridge is running, but replay is not active (status: ${replayState?.replayStatus ?? 'unknown'}).`;
+        } else {
+            message = `${replayMode === 'remote' ? 'Remote' : 'Local'} replay is active.`;
+        }
+
+        const result = {
+            captureLoaded: !!capturePath,
+            capturePath: capturePath ?? null,
+            nativeBridgeRunning: hasNative,
+            replayActive,
+            replayMode,
+            capabilities,
+            message,
+        };
+
+        return new vscode.LanguageModelToolResult([
+            new vscode.LanguageModelTextPart(JSON.stringify(result, null, 2)),
+        ]);
+    }
+
+    async prepareInvocation(
+        _options: vscode.LanguageModelToolInvocationPrepareOptions<Record<string, never>>,
+        _token: vscode.CancellationToken,
+    ): Promise<vscode.PreparedToolInvocation> {
+        return { invocationMessage: 'Checking replay status…' };
+    }
+}
+
+// ─── Tool: Get Bound Resources ─────────────────────────────────────────────────
+interface GetBoundResourcesInput {
+    eventId: number;
+    includeUnused?: boolean;
+    includeConstantBuffers?: boolean;
+}
+
+export class GetBoundResourcesTool implements vscode.LanguageModelTool<GetBoundResourcesInput> {
+    async invoke(
+        options: vscode.LanguageModelToolInvocationOptions<GetBoundResourcesInput>,
+        _token: vscode.CancellationToken,
+    ): Promise<vscode.LanguageModelToolResult> {
+        if (!_bridge.hasNativeBridge()) {
+            return new vscode.LanguageModelToolResult([
+                new vscode.LanguageModelTextPart(JSON.stringify({
+                    available: false,
+                    reason: 'Bound resource inspection requires an active local replay via the RenderDoc native bridge.',
+                }, null, 2)),
+            ]);
+        }
+
+        const eventId = options.input.eventId;
+        const includeConstantBuffers = options.input.includeConstantBuffers ?? true;
+        const includeUnused = options.input.includeUnused ?? true;
+
+        let pipelineState: any;
+        try {
+            pipelineState = await _bridge.nativeGetPipelineState(eventId);
+        } catch (err: any) {
+            return new vscode.LanguageModelToolResult([
+                new vscode.LanguageModelTextPart(JSON.stringify({
+                    available: false,
+                    eventId,
+                    reason: err.message ?? 'Failed to get pipeline state.',
+                }, null, 2)),
+            ]);
+        }
+
+        const result = normalizeBoundResources(pipelineState, { includeConstantBuffers, includeUnused });
+        return new vscode.LanguageModelToolResult([
+            new vscode.LanguageModelTextPart(JSON.stringify(result, null, 2)),
+        ]);
+    }
+
+    async prepareInvocation(
+        _options: vscode.LanguageModelToolInvocationPrepareOptions<GetBoundResourcesInput>,
+        _token: vscode.CancellationToken,
+    ): Promise<vscode.PreparedToolInvocation> {
+        return { invocationMessage: `Loading bound resources at EID ${_options.input.eventId}…` };
+    }
+}
+
+function normalizeBoundResources(pipelineState: any, opts: { includeConstantBuffers: boolean; includeUnused: boolean }): any {
+    if (!pipelineState || typeof pipelineState !== 'object') {
+        return { available: false, reason: 'Pipeline state is empty or invalid.' };
+    }
+
+    const api = pipelineState.api ?? 'Unknown';
+    const stageResources = pipelineState.stageResources ?? {};
+    const shaders = pipelineState.shaders ?? {};
+
+    // Render targets
+    const outputMerger = pipelineState.outputMerger ?? pipelineState.om ?? {};
+    const renderTargets: any[] = [];
+    const rtArray = outputMerger.renderTargets ?? outputMerger.colorTargets ?? [];
+    if (Array.isArray(rtArray)) {
+        for (const rt of rtArray) {
+            if (rt && rt.resourceId != null) {
+                renderTargets.push({
+                    slot: rt.slot ?? renderTargets.length,
+                    resourceId: String(rt.resourceId),
+                    name: rt.resourceName ?? rt.name ?? '',
+                    format: rt.format ?? '',
+                    width: rt.width ?? 0,
+                    height: rt.height ?? 0,
+                });
+            }
+        }
+    }
+
+    // Depth target
+    let depthTarget: any = null;
+    const dt = outputMerger.depthTarget ?? outputMerger.depthStencilTarget ?? null;
+    if (dt && dt.resourceId != null) {
+        depthTarget = {
+            resourceId: String(dt.resourceId),
+            name: dt.resourceName ?? dt.name ?? '',
+            format: dt.format ?? '',
+            width: dt.width ?? 0,
+            height: dt.height ?? 0,
+        };
+    }
+
+    // Stages
+    const stageOrder = ['vertex', 'hull', 'domain', 'geometry', 'fragment', 'pixel', 'compute'];
+    const stages: any[] = [];
+    const seenStages = new Set<string>();
+
+    for (const stageKey of stageOrder) {
+        const resources = stageResources[stageKey];
+        const shader = shaders[stageKey];
+        if (!resources && !shader) { continue; }
+        const normalizedKey = stageKey === 'pixel' ? 'Fragment' : stageKey.charAt(0).toUpperCase() + stageKey.slice(1);
+        if (seenStages.has(normalizedKey)) { continue; }
+        seenStages.add(normalizedKey);
+
+        const res = resources ?? {};
+        const stageEntry: any = {
+            stage: normalizedKey,
+            shaderName: shader?.name ?? shader?.entryPoint ?? '',
+            readOnlyTextures: summarizeBoundResources(res.textures, 'read', opts.includeUnused),
+            readWriteTextures: summarizeBoundResources(res.readWriteTextures ?? res.uavTextures, 'rw', opts.includeUnused),
+            buffers: summarizeBoundResources(res.buffers, 'read', opts.includeUnused),
+            samplers: summarizeSamplers(res.samplers),
+        };
+
+        if (opts.includeConstantBuffers) {
+            stageEntry.constantBuffers = summarizeConstantBlockMetadata(res.constantBlocks);
+        }
+
+        stages.push(stageEntry);
+    }
+
+    // Resource counts
+    let sampledTextures = 0, storageTextures = 0, buffers = 0, samplers = 0, constantBuffers = 0;
+    for (const stage of stages) {
+        sampledTextures += stage.readOnlyTextures?.length ?? 0;
+        storageTextures += stage.readWriteTextures?.length ?? 0;
+        buffers += stage.buffers?.length ?? 0;
+        samplers += stage.samplers?.length ?? 0;
+        constantBuffers += stage.constantBuffers?.length ?? 0;
+    }
+
+    return {
+        available: true,
+        eventId: pipelineState.eventId ?? null,
+        api,
+        renderTargets,
+        depthTarget,
+        stages,
+        resourceCounts: {
+            renderTargets: renderTargets.length,
+            sampledTextures,
+            storageTextures,
+            buffers,
+            samplers,
+            constantBuffers,
+        },
+    };
+}
+
+function summarizeBoundResources(entries: any, _kind: string, includeUnused: boolean): any[] {
+    if (!Array.isArray(entries)) { return []; }
+    const filtered = includeUnused ? entries : entries.filter((entry: any) => !entry?.staticallyUnused);
+    return filtered.map((entry) => ({
+        name: entry.name ?? '',
+        slot: entry.slot,
+        space: entry.space,
+        resourceId: entry.resourceId != null ? String(entry.resourceId) : null,
+        resourceName: entry.resourceName ?? '',
+        format: entry.format ?? '',
+        width: entry.width ?? 0,
+        height: entry.height ?? 0,
+        byteSize: entry.byteSize ?? 0,
+        staticallyUnused: entry.staticallyUnused ?? false,
+    }));
+}
+
+function summarizeSamplers(entries: any): any[] {
+    if (!Array.isArray(entries)) { return []; }
+    return entries.map((entry) => ({
+        name: entry.name ?? '',
+        slot: entry.slot,
+        space: entry.space,
+        resourceId: entry.resourceId != null ? String(entry.resourceId) : null,
+        resourceName: entry.resourceName ?? '',
+        minFilter: entry.minFilter ?? '',
+        magFilter: entry.magFilter ?? '',
+        addressU: entry.addressU ?? '',
+        addressV: entry.addressV ?? '',
+    }));
+}
+
+// ─── Tool: Get Event Chunks ─────────────────────────────────────────────────
+interface GetEventChunksInput {
+    eventId: number;
+}
+
+export class GetEventChunksTool implements vscode.LanguageModelTool<GetEventChunksInput> {
+    async invoke(
+        options: vscode.LanguageModelToolInvocationOptions<GetEventChunksInput>,
+        _token: vscode.CancellationToken,
+    ): Promise<vscode.LanguageModelToolResult> {
+        if (!_bridge.hasNativeBridge()) {
+            return new vscode.LanguageModelToolResult([
+                new vscode.LanguageModelTextPart(JSON.stringify({
+                    available: false,
+                    reason: 'Event chunks require the RenderDoc native bridge.',
+                }, null, 2)),
+            ]);
+        }
+
+        const eventId = options.input.eventId;
+        try {
+            const result = await _bridge.nativeGetEventChunks(eventId);
+            return new vscode.LanguageModelToolResult([
+                new vscode.LanguageModelTextPart(JSON.stringify({
+                    available: true,
+                    eventId: result.eventId,
+                    chunkCount: result.chunks?.length ?? 0,
+                    chunks: result.chunks ?? [],
+                }, null, 2)),
+            ]);
+        } catch (err: any) {
+            return new vscode.LanguageModelToolResult([
+                new vscode.LanguageModelTextPart(JSON.stringify({
+                    available: false,
+                    eventId,
+                    reason: err.message ?? 'Failed to get event chunks.',
+                }, null, 2)),
+            ]);
+        }
+    }
+
+    async prepareInvocation(
+        _options: vscode.LanguageModelToolInvocationPrepareOptions<GetEventChunksInput>,
+        _token: vscode.CancellationToken,
+    ): Promise<vscode.PreparedToolInvocation> {
+        return { invocationMessage: `Loading API event chunks for EID ${_options.input.eventId}…` };
+    }
+}
+
+// ─── Tool: Get Current Draw Preview ─────────────────────────────────────────
+interface GetCurrentDrawPreviewInput {
+    eventId: number;
+    channelExtract?: number;
+    overlayMode?: string;
+    resourceId?: string;
+    overlayResourceId?: string;
+}
+
+export class GetCurrentDrawPreviewTool implements vscode.LanguageModelTool<GetCurrentDrawPreviewInput> {
+    async invoke(
+        options: vscode.LanguageModelToolInvocationOptions<GetCurrentDrawPreviewInput>,
+        _token: vscode.CancellationToken,
+    ): Promise<vscode.LanguageModelToolResult> {
+        if (!_bridge.hasNativeBridge()) {
+            return new vscode.LanguageModelToolResult([
+                new vscode.LanguageModelTextPart(JSON.stringify({
+                    available: false,
+                    reason: 'Current draw preview requires an active local replay via the RenderDoc native bridge.',
+                }, null, 2)),
+            ]);
+        }
+
+        const { eventId, channelExtract = -1, overlayMode = 'none', resourceId, overlayResourceId } = options.input;
+
+        try {
+            const result = await _bridge.nativeGetCurrentDrawPreview(
+                eventId,
+                channelExtract,
+                overlayMode as any,
+                true,
+                resourceId,
+                overlayResourceId,
+            );
+
+            if (!result || !result.base64) {
+                return new vscode.LanguageModelToolResult([
+                    new vscode.LanguageModelTextPart(JSON.stringify({
+                        available: false,
+                        eventId,
+                        reason: 'No preview image was returned for this event.',
+                    }, null, 2)),
+                ]);
+            }
+
+            return new vscode.LanguageModelToolResult([
+                new vscode.LanguageModelTextPart(JSON.stringify({
+                    available: true,
+                    eventId,
+                    resourceId: result.resourceId ?? null,
+                    label: result.label ?? '',
+                    width: result.width ?? 0,
+                    height: result.height ?? 0,
+                    format: result.format ?? 'png',
+                    overlayMode,
+                    base64: result.base64,
+                }, null, 2)),
+            ]);
+        } catch (err: any) {
+            return new vscode.LanguageModelToolResult([
+                new vscode.LanguageModelTextPart(JSON.stringify({
+                    available: false,
+                    eventId,
+                    reason: err.message ?? 'Failed to get current draw preview.',
+                }, null, 2)),
+            ]);
+        }
+    }
+
+    async prepareInvocation(
+        _options: vscode.LanguageModelToolInvocationPrepareOptions<GetCurrentDrawPreviewInput>,
+        _token: vscode.CancellationToken,
+    ): Promise<vscode.PreparedToolInvocation> {
+        return { invocationMessage: `Rendering current draw preview at EID ${_options.input.eventId}…` };
+    }
+}
+
+// ─── Tool: Trace Resource Usage ─────────────────────────────────────────────
+interface TraceResourceUsageInput {
+    resourceId: string;
+    maxEvents?: number;
+}
+
+export class TraceResourceUsageTool implements vscode.LanguageModelTool<TraceResourceUsageInput> {
+    async invoke(
+        options: vscode.LanguageModelToolInvocationOptions<TraceResourceUsageInput>,
+        _token: vscode.CancellationToken,
+    ): Promise<vscode.LanguageModelToolResult> {
+        if (!_bridge.hasNativeBridge()) {
+            return new vscode.LanguageModelToolResult([
+                new vscode.LanguageModelTextPart(JSON.stringify({
+                    available: false,
+                    reason: 'Resource usage tracing requires an active local replay via the RenderDoc native bridge.',
+                }, null, 2)),
+            ]);
+        }
+
+        const { resourceId, maxEvents = 50 } = options.input;
+        const capturePath = requireCapturePath();
+
+        try {
+            // Get all draw calls
+            const drawCalls = await _bridge.getDrawCalls(capturePath);
+            
+            // Find all events that reference this resource
+            const usageEvents: Array<{
+                eventId: number;
+                name: string;
+                usageType: string;
+                stage?: string;
+                slot?: number;
+            }> = [];
+
+            const searchResource = async (events: DrawCall[]) => {
+                for (const event of events) {
+                    if (usageEvents.length >= maxEvents) break;
+                    
+                    try {
+                        const pipelineState = await _bridge.nativeGetPipelineState(event.eventId);
+                        if (!pipelineState) continue;
+
+                        // Check render targets
+                        const outputMerger = pipelineState.outputMerger ?? pipelineState.om ?? {};
+                        const renderTargets = outputMerger.renderTargets ?? outputMerger.colorTargets ?? [];
+                        if (Array.isArray(renderTargets)) {
+                            for (const rt of renderTargets) {
+                                if (rt && String(rt.resourceId) === resourceId) {
+                                    usageEvents.push({
+                                        eventId: event.eventId,
+                                        name: event.name,
+                                        usageType: 'renderTarget',
+                                        slot: rt.slot,
+                                    });
+                                }
+                            }
+                        }
+
+                        // Check depth target
+                        const depthTarget = outputMerger.depthTarget ?? outputMerger.depthStencilTarget;
+                        if (depthTarget && String(depthTarget.resourceId) === resourceId) {
+                            usageEvents.push({
+                                eventId: event.eventId,
+                                name: event.name,
+                                usageType: 'depthTarget',
+                            });
+                        }
+
+                        // Check stage resources
+                        const stageResources = pipelineState.stageResources ?? {};
+                        for (const [stageName, resources] of Object.entries(stageResources)) {
+                            if (!resources || typeof resources !== 'object') continue;
+                            const res = resources as any;
+                            
+                            // Check textures
+                            const textures = res.textures ?? [];
+                            if (Array.isArray(textures)) {
+                                for (const tex of textures) {
+                                    if (tex && String(tex.resourceId) === resourceId) {
+                                        usageEvents.push({
+                                            eventId: event.eventId,
+                                            name: event.name,
+                                            usageType: 'sampledTexture',
+                                            stage: stageName,
+                                            slot: tex.slot,
+                                        });
+                                    }
+                                }
+                            }
+
+                            // Check read-write textures
+                            const rwTextures = res.readWriteTextures ?? res.uavTextures ?? [];
+                            if (Array.isArray(rwTextures)) {
+                                for (const tex of rwTextures) {
+                                    if (tex && String(tex.resourceId) === resourceId) {
+                                        usageEvents.push({
+                                            eventId: event.eventId,
+                                            name: event.name,
+                                            usageType: 'readWriteTexture',
+                                            stage: stageName,
+                                            slot: tex.slot,
+                                        });
+                                    }
+                                }
+                            }
+
+                            // Check buffers
+                            const buffers = res.buffers ?? [];
+                            if (Array.isArray(buffers)) {
+                                for (const buf of buffers) {
+                                    if (buf && String(buf.resourceId) === resourceId) {
+                                        usageEvents.push({
+                                            eventId: event.eventId,
+                                            name: event.name,
+                                            usageType: 'buffer',
+                                            stage: stageName,
+                                            slot: buf.slot,
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                    } catch {
+                        // Skip events that fail to query
+                    }
+
+                    // Recurse into children
+                    if (event.children && event.children.length > 0) {
+                        await searchResource(event.children);
+                    }
+                }
+            };
+
+            await searchResource(drawCalls);
+
+            // Classify usage
+            // Confirmed producers: render target and depth target writes are definitive output bindings
+            const producers = usageEvents.filter(e =>
+                e.usageType === 'renderTarget' ||
+                e.usageType === 'depthTarget'
+            );
+            // Consumers: sampled textures and buffer reads
+            const consumers = usageEvents.filter(e =>
+                e.usageType === 'sampledTexture' ||
+                e.usageType === 'buffer'
+            );
+            // Read-write bindings: bound as UAV/storage but we cannot confirm whether this event
+            // actually wrote to the resource. These are potential producers, not confirmed ones.
+            const readWriteBindings = usageEvents.filter(e =>
+                e.usageType === 'readWriteTexture'
+            );
+
+            const result = {
+                available: true,
+                resourceId,
+                totalUsageEvents: usageEvents.length,
+                producers: producers.slice(0, maxEvents),
+                consumers: consumers.slice(0, maxEvents),
+                readWriteBindings: readWriteBindings.slice(0, maxEvents),
+                summary: {
+                    renderTargetWrites: producers.filter(e => e.usageType === 'renderTarget').length,
+                    depthTargetWrites: producers.filter(e => e.usageType === 'depthTarget').length,
+                    sampledReads: consumers.filter(e => e.usageType === 'sampledTexture').length,
+                    bufferReads: consumers.filter(e => e.usageType === 'buffer').length,
+                    readWriteBindings: readWriteBindings.length,
+                },
+                note: 'readWriteBindings are resources bound as read-write (UAV/storage) but not confirmed as written by this event. Do not treat them as confirmed producers.',
+            };
+
+            return new vscode.LanguageModelToolResult([
+                new vscode.LanguageModelTextPart(JSON.stringify(result, null, 2)),
+            ]);
+        } catch (err: any) {
+            return new vscode.LanguageModelToolResult([
+                new vscode.LanguageModelTextPart(JSON.stringify({
+                    available: false,
+                    resourceId,
+                    reason: err.message ?? 'Failed to trace resource usage.',
+                }, null, 2)),
+            ]);
+        }
+    }
+
+    async prepareInvocation(
+        _options: vscode.LanguageModelToolInvocationPrepareOptions<TraceResourceUsageInput>,
+        _token: vscode.CancellationToken,
+    ): Promise<vscode.PreparedToolInvocation> {
+        return { invocationMessage: `Tracing usage of resource ${_options.input.resourceId}…` };
+    }
+}
+
+// ─── Tool: Diff Pipeline State ───────────────────────────────────────────────
+interface DiffPipelineStateInput {
+    eventIdA: number;
+    eventIdB: number;
+}
+
+export class DiffPipelineStateTool implements vscode.LanguageModelTool<DiffPipelineStateInput> {
+    async invoke(
+        options: vscode.LanguageModelToolInvocationOptions<DiffPipelineStateInput>,
+        _token: vscode.CancellationToken,
+    ): Promise<vscode.LanguageModelToolResult> {
+        if (!_bridge.hasNativeBridge()) {
+            return new vscode.LanguageModelToolResult([
+                new vscode.LanguageModelTextPart(JSON.stringify({
+                    available: false,
+                    reason: 'Pipeline state diff requires an active local replay via the RenderDoc native bridge.',
+                }, null, 2)),
+            ]);
+        }
+
+        const { eventIdA, eventIdB } = options.input;
+
+        try {
+            const [stateA, stateB] = await Promise.all([
+                _bridge.nativeGetPipelineState(eventIdA),
+                _bridge.nativeGetPipelineState(eventIdB),
+            ]);
+
+            if (!stateA || !stateB) {
+                return new vscode.LanguageModelToolResult([
+                    new vscode.LanguageModelTextPart(JSON.stringify({
+                        available: false,
+                        reason: 'Failed to retrieve pipeline state for one or both events.',
+                    }, null, 2)),
+                ]);
+            }
+
+            const diff: Record<string, any> = {};
+            const changes: string[] = [];
+
+            // Compare shaders
+            const shadersA = stateA.shaders ?? {};
+            const shadersB = stateB.shaders ?? {};
+            const shaderDiff: Record<string, any> = {};
+            
+            for (const stage of ['vertex', 'hull', 'domain', 'geometry', 'fragment', 'pixel', 'compute']) {
+                const shaderA = shadersA[stage];
+                const shaderB = shadersB[stage];
+                
+                if (shaderA || shaderB) {
+                    const nameA = shaderA?.name ?? shaderA?.entryPoint ?? null;
+                    const nameB = shaderB?.name ?? shaderB?.entryPoint ?? null;
+                    
+                    if (nameA !== nameB) {
+                        shaderDiff[stage] = { before: nameA, after: nameB };
+                        changes.push(`Shader ${stage}: ${nameA ?? 'none'} → ${nameB ?? 'none'}`);
+                    }
+                }
+            }
+            
+            if (Object.keys(shaderDiff).length > 0) {
+                diff.shaders = shaderDiff;
+            }
+
+            // Compare render targets
+            const omA = stateA.outputMerger ?? stateA.om ?? {};
+            const omB = stateB.outputMerger ?? stateB.om ?? {};
+            
+            const rtA = omA.renderTargets ?? omA.colorTargets ?? [];
+            const rtB = omB.renderTargets ?? omB.colorTargets ?? [];
+            
+            if (JSON.stringify(rtA) !== JSON.stringify(rtB)) {
+                diff.renderTargets = { before: rtA, after: rtB };
+                changes.push('Render targets changed');
+            }
+
+            // Compare depth target
+            const depthA = omA.depthTarget ?? omA.depthStencilTarget;
+            const depthB = omB.depthTarget ?? omB.depthStencilTarget;
+            
+            if (JSON.stringify(depthA) !== JSON.stringify(depthB)) {
+                diff.depthTarget = { before: depthA, after: depthB };
+                changes.push('Depth target changed');
+            }
+
+            // Compare blend state
+            const blendA = stateA.blendState ?? stateA.blend;
+            const blendB = stateB.blendState ?? stateB.blend;
+            
+            if (JSON.stringify(blendA) !== JSON.stringify(blendB)) {
+                diff.blendState = { before: blendA, after: blendB };
+                changes.push('Blend state changed');
+            }
+
+            // Compare rasterizer state
+            const rasterA = stateA.rasterizerState ?? stateA.rasterizer;
+            const rasterB = stateB.rasterizerState ?? stateB.rasterizer;
+            
+            if (JSON.stringify(rasterA) !== JSON.stringify(rasterB)) {
+                diff.rasterizerState = { before: rasterA, after: rasterB };
+                changes.push('Rasterizer state changed');
+            }
+
+            // Compare depth stencil state
+            const depthStencilA = stateA.depthStencilState ?? stateA.depthStencil;
+            const depthStencilB = stateB.depthStencilState ?? stateB.depthStencil;
+            
+            if (JSON.stringify(depthStencilA) !== JSON.stringify(depthStencilB)) {
+                diff.depthStencilState = { before: depthStencilA, after: depthStencilB };
+                changes.push('Depth stencil state changed');
+            }
+
+            const result = {
+                available: true,
+                eventIdA,
+                eventIdB,
+                hasChanges: changes.length > 0,
+                changeCount: changes.length,
+                changes,
+                diff,
+            };
+
+            return new vscode.LanguageModelToolResult([
+                new vscode.LanguageModelTextPart(JSON.stringify(result, null, 2)),
+            ]);
+        } catch (err: any) {
+            return new vscode.LanguageModelToolResult([
+                new vscode.LanguageModelTextPart(JSON.stringify({
+                    available: false,
+                    eventIdA,
+                    eventIdB,
+                    reason: err.message ?? 'Failed to diff pipeline state.',
+                }, null, 2)),
+            ]);
+        }
+    }
+
+    async prepareInvocation(
+        _options: vscode.LanguageModelToolInvocationPrepareOptions<DiffPipelineStateInput>,
+        _token: vscode.CancellationToken,
+    ): Promise<vscode.PreparedToolInvocation> {
+        return { invocationMessage: `Comparing pipeline state between EID ${_options.input.eventIdA} and EID ${_options.input.eventIdB}…` };
+    }
+}
+
+// ─── Tool: Analyze Hot Event ────────────────────────────────────────────────
+interface AnalyzeHotEventInput {
+    eventId: number;
+    includeShaderInfo?: boolean;
+    includeMeshData?: boolean;
+}
+
+export class AnalyzeHotEventTool implements vscode.LanguageModelTool<AnalyzeHotEventInput> {
+    async invoke(
+        options: vscode.LanguageModelToolInvocationOptions<AnalyzeHotEventInput>,
+        _token: vscode.CancellationToken,
+    ): Promise<vscode.LanguageModelToolResult> {
+        if (!_bridge.hasNativeBridge()) {
+            return new vscode.LanguageModelToolResult([
+                new vscode.LanguageModelTextPart(JSON.stringify({
+                    available: false,
+                    reason: 'Hot event analysis requires an active local replay via the RenderDoc native bridge.',
+                }, null, 2)),
+            ]);
+        }
+
+        const { eventId, includeShaderInfo = true, includeMeshData = false } = options.input;
+
+        try {
+            // Gather all relevant information for this event
+            const capturePath = requireCapturePath();
+            const [drawCalls, pipelineState, timings] = await Promise.all([
+                _bridge.getDrawCalls(capturePath),
+                _bridge.nativeGetPipelineState(eventId),
+                _bridge.getDrawTimings().catch(() => new Map<number, number>()),
+            ]);
+
+            const durationUs = timings.get(eventId);
+
+            // Find the draw call for this event
+            const eventDrawCall = findDrawCallByEventId(drawCalls, eventId);
+
+            const analysis: any = {
+                available: true,
+                eventId,
+                event: eventDrawCall ? {
+                    eventId: eventDrawCall.eventId,
+                    name: eventDrawCall.name,
+                    flags: eventDrawCall.flags,
+                    numIndices: eventDrawCall.numIndices,
+                    numInstances: eventDrawCall.numInstances,
+                } : null,
+                durationUs: durationUs ?? null,
+                durationMs: durationUs ? durationUs / 1000 : null,
+            };
+
+            // Pipeline state summary
+            if (pipelineState) {
+                const shaders = pipelineState.shaders ?? {};
+                const stageResources = pipelineState.stageResources ?? {};
+                const outputMerger = pipelineState.outputMerger ?? pipelineState.om ?? {};
+
+                analysis.pipelineState = {
+                    api: pipelineState.api,
+                    shaders: Object.entries(shaders).map(([stage, shader]: [string, any]) => ({
+                        stage,
+                        name: shader?.name ?? shader?.entryPoint ?? 'unknown',
+                        resourceId: shader?.resourceId,
+                    })),
+                    renderTargets: (outputMerger.renderTargets ?? outputMerger.colorTargets ?? [])
+                        .filter((rt: any) => rt && rt.resourceId != null)
+                        .map((rt: any) => ({
+                            resourceId: String(rt.resourceId),
+                            name: rt.resourceName ?? rt.name ?? '',
+                            format: rt.format ?? '',
+                            width: rt.width ?? 0,
+                            height: rt.height ?? 0,
+                        })),
+                    depthTarget: outputMerger.depthTarget ?? outputMerger.depthStencilTarget ?? null,
+                };
+
+                // Resource counts
+                let sampledTextures = 0;
+                let storageTextures = 0;
+                let buffers = 0;
+                let samplers = 0;
+                let constantBuffers = 0;
+
+                for (const resources of Object.values(stageResources)) {
+                    if (!resources || typeof resources !== 'object') continue;
+                    const res = resources as any;
+                    sampledTextures += (res.textures ?? []).length;
+                    storageTextures += (res.readWriteTextures ?? res.uavTextures ?? []).length;
+                    buffers += (res.buffers ?? []).length;
+                    samplers += (res.samplers ?? []).length;
+                    constantBuffers += (res.constantBlocks ?? []).length;
+                }
+
+                analysis.resourceCounts = {
+                    sampledTextures,
+                    storageTextures,
+                    buffers,
+                    samplers,
+                    constantBuffers,
+                };
+            }
+
+            // Optional shader info - structured metadata, not source code
+            if (includeShaderInfo && pipelineState) {
+                const shaders = pipelineState.shaders ?? {};
+                const stageResources = pipelineState.stageResources ?? {};
+                const shaderSummary: any[] = [];
+
+                for (const [stage, shader] of Object.entries(shaders)) {
+                    if (!shader || typeof shader !== 'object') continue;
+                    const res = stageResources[stage] ?? {};
+                    shaderSummary.push({
+                        stage,
+                        name: (shader as any).name ?? (shader as any).entryPoint ?? 'unknown',
+                        resourceId: (shader as any).resourceId,
+                        boundTextures: (res.textures ?? []).length,
+                        boundBuffers: (res.buffers ?? []).length,
+                        boundConstantBuffers: (res.constantBlocks ?? []).length,
+                    });
+                }
+
+                if (shaderSummary.length > 0) {
+                    analysis.shaderInfo = shaderSummary;
+                }
+            }
+
+            // Optional mesh data
+            if (includeMeshData) {
+                try {
+                    const meshData = await _bridge.nativeGetMeshData(eventId, 'vsin', { maxVertices: 10 });
+                    analysis.meshData = {
+                        topology: meshData.topology,
+                        vertexCount: meshData.vertexCount,
+                        indexCount: meshData.indexCount,
+                        attributes: meshData.attributes?.map((attr: any) => ({
+                            name: attr.name,
+                            format: attr.format,
+                            semantic: attr.semantic,
+                        })),
+                    };
+                } catch {
+                    // Mesh data not available
+                }
+            }
+
+            return new vscode.LanguageModelToolResult([
+                new vscode.LanguageModelTextPart(JSON.stringify(analysis, null, 2)),
+            ]);
+        } catch (err: any) {
+            return new vscode.LanguageModelToolResult([
+                new vscode.LanguageModelTextPart(JSON.stringify({
+                    available: false,
+                    eventId,
+                    reason: err.message ?? 'Failed to analyze hot event.',
+                }, null, 2)),
+            ]);
+        }
+    }
+
+    async prepareInvocation(
+        _options: vscode.LanguageModelToolInvocationPrepareOptions<AnalyzeHotEventInput>,
+        _token: vscode.CancellationToken,
+    ): Promise<vscode.PreparedToolInvocation> {
+        return { invocationMessage: `Analyzing hot event EID ${_options.input.eventId}…` };
+    }
+}
+
+// ─── Tool: Get Pass Graph ───────────────────────────────────────────────────
+interface GetPassGraphInput {
+    includeResources?: boolean;
+}
+
+export class GetPassGraphTool implements vscode.LanguageModelTool<GetPassGraphInput> {
+    async invoke(
+        options: vscode.LanguageModelToolInvocationOptions<GetPassGraphInput>,
+        _token: vscode.CancellationToken,
+    ): Promise<vscode.LanguageModelToolResult> {
+        if (!_bridge.hasNativeBridge()) {
+            return new vscode.LanguageModelToolResult([
+                new vscode.LanguageModelTextPart(JSON.stringify({
+                    available: false,
+                    reason: 'Pass graph requires an active local replay via the RenderDoc native bridge.',
+                }, null, 2)),
+            ]);
+        }
+
+        const { includeResources = true } = options.input;
+        const capturePath = requireCapturePath();
+
+        try {
+            const drawCalls = await _bridge.getDrawCalls(capturePath);
+            const timings = await _bridge.getDrawTimings().catch(() => new Map<number, number>());
+
+            // Build pass graph from top-level markers
+            const passes: Array<{
+                id: string;
+                name: string;
+                eventIdStart: number;
+                eventIdEnd: number;
+                drawCount: number;
+                durationUs?: number;
+                resources?: {
+                    renderTargets: string[];
+                    sampledTextures: string[];
+                };
+            }> = [];
+
+            const buildPasses = async (events: DrawCall[], depth = 0) => {
+                for (const event of events) {
+                    // Top-level markers become passes
+                    if (depth === 0 && event.children && event.children.length > 0) {
+                        const firstChild = findFirstLeaf(event);
+                        const lastChild = findLastLeaf(event);
+                        const eventIdStart = firstChild?.eventId ?? event.eventId;
+                        const eventIdEnd = lastChild?.eventId ?? event.eventId;
+                         
+                        const pass: any = {
+                            id: buildPassId(event.name, eventIdStart, eventIdEnd),
+                            name: event.name,
+                            eventIdStart,
+                            eventIdEnd,
+                            drawCount: countDrawCalls(event),
+                        };
+
+                        // Calculate duration
+                        const duration = calculatePassDuration(event, timings);
+                        if (duration > 0) {
+                            pass.durationUs = duration;
+                        }
+
+                        // Collect resources if requested
+                        if (includeResources) {
+                            const resources = await collectPassResources(event, _bridge);
+                            if (resources.renderTargets.length > 0 || resources.sampledTextures.length > 0) {
+                                pass.resources = resources;
+                            }
+                        }
+
+                        passes.push(pass);
+                    } else if (depth === 0) {
+                        // Single draw call at top level
+                        passes.push({
+                            id: buildPassId(event.name, event.eventId, event.eventId),
+                            name: event.name,
+                            eventIdStart: event.eventId,
+                            eventIdEnd: event.eventId,
+                            drawCount: 1,
+                            durationUs: timings.get(event.eventId),
+                        });
+                    }
+
+                    // Recurse for nested structure
+                    if (event.children && event.children.length > 0) {
+                        await buildPasses(event.children, depth + 1);
+                    }
+                }
+            };
+
+            await buildPasses(drawCalls);
+
+            // Build dependency edges between passes
+            const edges: Array<{
+                fromPassId: string;
+                fromPassName: string;
+                toPassId: string;
+                toPassName: string;
+                resourceId: string;
+                usage: 'sampledFromRenderTarget';
+            }> = [];
+
+            // Build a map of resource producers (passes that write to render targets)
+            const resourceProducers = new Map<string, Array<{ id: string; name: string }>>();
+            for (const pass of passes) {
+                if (pass.resources?.renderTargets) {
+                    for (const rt of pass.resources.renderTargets) {
+                        if (!resourceProducers.has(rt)) {
+                            resourceProducers.set(rt, []);
+                        }
+                        resourceProducers.get(rt)!.push({ id: pass.id, name: pass.name });
+                    }
+                }
+            }
+
+            // Find edges: if pass B samples a texture that pass A wrote to
+            for (const pass of passes) {
+                if (pass.resources?.sampledTextures) {
+                    for (const tex of pass.resources.sampledTextures) {
+                        const producers = resourceProducers.get(tex);
+                        if (producers) {
+                            for (const producerPass of producers) {
+                                if (producerPass.id !== pass.id) {
+                                    edges.push({
+                                        fromPassId: producerPass.id,
+                                        fromPassName: producerPass.name,
+                                        toPassId: pass.id,
+                                        toPassName: pass.name,
+                                        resourceId: tex,
+                                        usage: 'sampledFromRenderTarget',
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            const result = {
+                available: true,
+                passCount: passes.length,
+                passes,
+                edges,
+                edgeCount: edges.length,
+                totalDurationUs: passes.reduce((sum, p) => sum + (p.durationUs ?? 0), 0),
+            };
+
+            return new vscode.LanguageModelToolResult([
+                new vscode.LanguageModelTextPart(JSON.stringify(result, null, 2)),
+            ]);
+        } catch (err: any) {
+            return new vscode.LanguageModelToolResult([
+                new vscode.LanguageModelTextPart(JSON.stringify({
+                    available: false,
+                    reason: err.message ?? 'Failed to build pass graph.',
+                }, null, 2)),
+            ]);
+        }
+    }
+
+    async prepareInvocation(
+        _options: vscode.LanguageModelToolInvocationPrepareOptions<GetPassGraphInput>,
+        _token: vscode.CancellationToken,
+    ): Promise<vscode.PreparedToolInvocation> {
+        return { invocationMessage: 'Building pass graph…' };
+    }
+}
+
+// Helper functions for pass graph
+function findFirstLeaf(event: DrawCall): DrawCall | null {
+    if (!event.children || event.children.length === 0) {
+        return event;
+    }
+    return findFirstLeaf(event.children[0]);
+}
+
+function buildPassId(name: string, eventIdStart: number, eventIdEnd: number): string {
+    const safeName = (name || 'pass').replace(/\s+/g, '_');
+    return `${safeName}:${eventIdStart}-${eventIdEnd}`;
+}
+
+function findLastLeaf(event: DrawCall): DrawCall | null {
+    if (!event.children || event.children.length === 0) {
+        return event;
+    }
+    return findLastLeaf(event.children[event.children.length - 1]);
+}
+
+function countDrawCalls(event: DrawCall): number {
+    let count = 0;
+    if (!event.children || event.children.length === 0) {
+        count = 1;
+    } else {
+        for (const child of event.children) {
+            count += countDrawCalls(child);
+        }
+    }
+    return count;
+}
+
+function calculatePassDuration(event: DrawCall, timings: Map<number, number>): number {
+    let duration = 0;
+    
+    if (!event.children || event.children.length === 0) {
+        duration = timings.get(event.eventId) ?? 0;
+    } else {
+        for (const child of event.children) {
+            duration += calculatePassDuration(child, timings);
+        }
+    }
+    
+    return duration;
+}
+
+async function collectPassResources(
+    event: DrawCall,
+    bridge: RenderDocBridge,
+): Promise<{ renderTargets: string[]; sampledTextures: string[] }> {
+    const renderTargets = new Set<string>();
+    const sampledTextures = new Set<string>();
+
+    const collectFromEvent = async (e: DrawCall) => {
+        try {
+            const pipelineState = await bridge.nativeGetPipelineState(e.eventId);
+            if (!pipelineState) return;
+
+            const outputMerger = pipelineState.outputMerger ?? pipelineState.om ?? {};
+            const rts = outputMerger.renderTargets ?? outputMerger.colorTargets ?? [];
+            if (Array.isArray(rts)) {
+                for (const rt of rts) {
+                    if (rt && rt.resourceId != null) {
+                        renderTargets.add(String(rt.resourceId));
+                    }
+                }
+            }
+
+            const stageResources = pipelineState.stageResources ?? {};
+            for (const resources of Object.values(stageResources)) {
+                if (!resources || typeof resources !== 'object') continue;
+                const res = resources as any;
+                const textures = res.textures ?? [];
+                if (Array.isArray(textures)) {
+                    for (const tex of textures) {
+                        if (tex && tex.resourceId != null) {
+                            sampledTextures.add(String(tex.resourceId));
+                        }
+                    }
+                }
+            }
+        } catch {
+            // Skip events that fail
+        }
+
+        if (e.children) {
+            for (const child of e.children) {
+                await collectFromEvent(child);
+            }
+        }
+    };
+
+    await collectFromEvent(event);
+
+    return {
+        renderTargets: Array.from(renderTargets),
+        sampledTextures: Array.from(sampledTextures),
+    };
 }
 

@@ -1,0 +1,4 @@
+interface:
+  display_name: "RenderDoc Buffer Inspector"
+  short_description: "Inspect buffer contents and constant data."
+  default_prompt: "Use $renderdoc-buffer-inspector to inspect a RenderDoc buffer, its contents, and related event context."
