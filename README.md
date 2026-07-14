@@ -74,7 +74,7 @@ A C++ bridge (`renderdoc_bridge.exe`) links directly to RenderDoc's replay DLL �
 <td width="50%" valign="top">
 
 ### AI-Powered Frame Analysis (MCP)
-Connect any MCP-capable AI client to the local **RenderDoc For VSCode MCP** endpoint. The server exposes 21 specialized tools — including on-demand action timings, shader and constant-buffer inspection, resource reverse lookups, project-source mapping, and Mali shader analysis results.
+Connect any MCP-capable AI client to the local **RenderDoc For VSCode MCP** endpoint. The server exposes 29 specialized tools — including on-demand action timings, shader and constant-buffer inspection, resource reverse lookups, project-source mapping, Mali shader analysis results, resource usage tracing, pipeline state diffing, hot event analysis, and pass graph generation.
 
 </td>
 <td width="50%" valign="top">
@@ -264,18 +264,17 @@ Navigation:
 
 ### 7 · AI-Powered Analysis via MCP
 
-Connect any MCP-capable AI client (Cline, Roo Code, Zoo Code, Claude Code, etc.) to the local **RenderDoc For VSCode MCP** endpoint exposed by this extension. The default endpoint is `http://127.0.0.1:38967/mcp`, but you should prefer the actual URL shown in the sidebar GUI because the configured port can differ. In the **Capture Target** view, use **Local MCP → One-Click Configure** first. That button enables MCP if needed, starts the local server, and auto-writes workspace config files with the actual current URL. If you need to inspect or copy the final endpoint manually, click **MCP Info** in the same card or run **RenderDoc: Show RenderDoc For VSCode MCP Info**.
+Connect any MCP-capable AI client (Cline, Roo Code, Zoo Code, Claude Code, etc.) to the local **RenderDoc For VSCode MCP** endpoint exposed by this extension. The default endpoint is `http://127.0.0.1:38967/mcp`, but you should prefer the actual URL shown in the sidebar GUI because the configured port can differ. In the **Capture Target** view, the **Local MCP** card shows the current status. Click **MCP Info** to inspect or copy the endpoint, or run **RenderDoc: Show RenderDoc For VSCode MCP Info**.
 
 #### External MCP Client Setup
 
-Use this checklist when helping a teammate connect **Roo Code**, **Zoo Code**, **Claude Code**, **Codex/CodeX**, or another non-Copilot client:
+Use this checklist when helping a teammate connect **Roo Code**, **Zoo Code**, **Claude Code**, **Codex/CodeX**, or another MCP client:
 
 1. Install this extension in VS Code and open the target `.rdc` capture in the same VS Code window.
-2. In the **Capture Target** view, find the **Local MCP** card and click **One-Click Configure**. This enables MCP if needed, starts the server, and updates `.vscode/mcp.json` and `.roo/mcp.json` in the current workspace so VS Code workspace MCP and Roo/Zoo project config both point at the actual current endpoint.
-3. Confirm that the **Local MCP** card now shows the running status and actual port number.
-4. If you need to inspect or copy the final URL manually, click **MCP Info** in that same card or run **RenderDoc: Show RenderDoc For VSCode MCP Info**.
-5. In the external AI client, add one MCP server named `renderdoc-for-vscode` that points to that local URL only if the client does not already read one of those workspace config files.
-6. After the client connects, have it call `renderdoc_openCapture` first without `filePath` if capture state is unknown. That lets the extension resolve the already opened capture from this VS Code window.
+2. In the **Capture Target** view, find the **Local MCP** card and confirm it shows the running status and actual port number.
+3. Click **MCP Info** to inspect or copy the endpoint URL, or run **RenderDoc: Show RenderDoc For VSCode MCP Info** from the command palette.
+4. In the external AI client, add one MCP server named `renderdoc-for-vscode` that points to the local URL.
+5. After the client connects, have it call `renderdoc_openCapture` first without `filePath` if capture state is unknown. That lets the extension resolve the already opened capture from this VS Code window.
 
 VS Code workspace MCP uses `.vscode/mcp.json` with root `servers` and `type: "http"`:
 
@@ -305,13 +304,13 @@ Roo Code, Zoo Code, and most generic MCP clients use a config with root `mcpServ
 
 Client notes:
 
-- `Roo Code` / `Zoo Code`: prefer the sidebar **Local MCP → One-Click Configure** button. It writes project `.roo/mcp.json` for you. If your teammate uses a global `mcp_settings.json` instead, use **MCP Info** and paste the generic snippet there.
+- `Roo Code` / `Zoo Code`: use **MCP Info** to get the endpoint URL and add it to your project's `.roo/mcp.json` or global `mcp_settings.json`.
 - `Claude Code`: add a remote HTTP MCP server named `renderdoc-for-vscode`. If it asks for a transport, choose `streamable-http` or the equivalent HTTP streaming option. If it accepts raw JSON config, use the generic `mcpServers` snippet above.
 - `Codex` / `CodeX`: use the same generic remote MCP server settings as Claude Code. Choose an HTTP or `streamable-http` transport, not a local `stdio` server.
+
 Common gotchas:
 
 - The MCP endpoint reflects the capture opened in this VS Code window, not a global RenderDoc session from some other app.
-- The fastest setup path is the sidebar **Local MCP → One-Click Configure** button. The command-palette workflow is now just a fallback.
 - If the client connects but sees no useful context, open the capture in VS Code first or ask it to call `renderdoc_openCapture` with no `filePath`.
 - If a client offers both `stdio` and HTTP transports, use HTTP / `streamable-http` for this extension.
 - If you changed `renderdoc.mcpServer.port`, update the URL in the client config to match.
@@ -337,47 +336,61 @@ Which textures are bound at the currently selected draw?
 
 The MCP tools can use your **active Inspector selection** (focused EID, draw call, sidebar resource), so natural references like *"this draw"* or *"the current event"* resolve automatically.
 
-Available MCP tools:
+Available MCP tools (29 total):
 
 Context and overview:
 
 | Tool | Description |
 | ---- | ----------- |
-| `#openCapture` | Resolve the active or open `.rdc` in this VS Code window, or load a specific capture by `filePath` |
-| `#selectionContext` | Current Inspector focus: selected EID, draw call, sidebar resource, replay status, and related context |
-| `#captureInfo` | Capture metadata: API, driver, version, file sections, and capture summary |
-| `#frameSummary` | High-level frame structure: top-level passes/markers, draw counts, and capture stats |
-| `#analyzeFrame` | Holistic frame analysis with flagged issues and suggested next inspection steps |
+| `renderdoc_openCapture` | Resolve the active or open `.rdc` in this VS Code window, or load a specific capture by `filePath` |
+| `renderdoc_getSelectionContext` | Current Inspector focus: selected EID, draw call, sidebar resource, replay status, and related context |
+| `renderdoc_getCaptureInfo` | Capture metadata: API, driver, version, file sections, and capture summary |
+| `renderdoc_getFrameSummary` | High-level frame structure: top-level passes/markers, draw counts, and capture stats |
+| `renderdoc_analyzeFrame` | Holistic frame analysis with flagged issues and suggested next inspection steps |
+| `renderdoc_getReplayStatus` | Query replay state and available capabilities before calling replay-dependent tools |
 
 Events and timings:
 
 | Tool | Description |
 | ---- | ----------- |
-| `#drawCalls` | Full draw call tree with marker hierarchy, filtering, and `durationUs` when timings are available |
-| `#actionTimings` | Fetch GPU timings on demand, optionally filtered by event IDs or marker groups |
-| `#eventDetails` | Full details for one EID, including richer pipeline context when replay is active |
-| `#pipelineState` | Complete pipeline state at a given EID |
+| `renderdoc_getDrawCalls` | Full draw call tree with marker hierarchy, filtering, and `durationUs` when timings are available |
+| `renderdoc_getActionTimings` | Fetch GPU timings on demand, optionally filtered by event IDs or marker groups |
+| `renderdoc_getEventDetails` | Full details for one EID, including richer pipeline context when replay is active |
+| `renderdoc_getEventChunks` | API-level event chunks (draw calls, state changes) for a specific event ID |
+| `renderdoc_getPipelineState` | Complete pipeline state at a given EID |
 
 Shaders and resources:
 
 | Tool | Description |
 | ---- | ----------- |
-| `#shaderSource` | Raw GLSL/HLSL source for the bound shader stages at an EID |
-| `#shaderInfo` | Higher-level shader analysis with bindings, samplers, and decoded constant buffers |
-| `#resources` | Paginated list of textures, buffers, and shaders in the capture |
-| `#resourceDetail` | Detailed information for a specific resource ID |
-| `#textureInfo` | Texture metadata and identity lookup |
-| `#textureData` | Texture pixel data sampled at a specific event/mip and returned as PNG data |
-| `#bufferContents` | Raw bytes from a GPU buffer with offset/length paging |
+| `renderdoc_getShaderSource` | Raw GLSL/HLSL source for the bound shader stages at an EID |
+| `renderdoc_getShaderInfo` | Higher-level shader analysis with bindings, samplers, and decoded constant buffers |
+| `renderdoc_getResources` | Paginated list of textures, buffers, and shaders in the capture |
+| `renderdoc_getResourceDetail` | Detailed information for a specific resource ID |
+| `renderdoc_getBoundResources` | Normalized summary of resources bound at a given event (render targets, textures, buffers, samplers, constant buffers) |
+| `renderdoc_getTextureInfo` | Texture metadata and identity lookup |
+| `renderdoc_getTextureData` | Texture pixel data sampled at a specific event/mip and returned as PNG data |
+| `renderdoc_getBufferContents` | Raw bytes from a GPU buffer with offset/length paging |
+| `renderdoc_getCurrentDrawPreview` | Preview image of the current draw call output at a specific event ID |
 
 Reverse lookups and source mapping:
 
 | Tool | Description |
 | ---- | ----------- |
-| `#findDrawsByShader` | Reverse-search draw calls by shader name or entry point |
-| `#findDrawsByTexture` | Reverse-search draw calls by sampled texture name |
-| `#findDrawsByResourceId` | Reverse-search draw calls by exact resource ID |
-| `#projectImplementation` | Search the open workspace for likely shader/pass implementation files related to a capture event |
+| `renderdoc_findDrawsByShader` | Reverse-search draw calls by shader name or entry point |
+| `renderdoc_findDrawsByTexture` | Reverse-search draw calls by sampled texture name |
+| `renderdoc_findDrawsByResourceId` | Reverse-search draw calls by exact resource ID |
+| `renderdoc_findProjectImplementation` | Search the open workspace for likely shader/pass implementation files related to a capture event |
+
+Advanced analysis:
+
+| Tool | Description |
+| ---- | ----------- |
+| `renderdoc_traceResourceUsage` | Trace how a resource is used across the frame, identifying producers (writes) and consumers (reads) |
+| `renderdoc_diffPipelineState` | Compare pipeline state between two events and identify differences in shaders, render targets, and state |
+| `renderdoc_analyzeHotEvent` | Comprehensive analysis of a hot event including timing, pipeline state, resources, and optional shader/mesh data |
+| `renderdoc_getPassGraph` | Build a graph of render passes from the draw call hierarchy, including timing, resource usage, and dependency edges |
+| `renderdoc_getMeshData` | Mesh data for one event and mesh stage, including topology, attributes, and sampled rows |
 
 The MCP server includes built-in workflow instructions that guide AI clients through the optimal analysis path: selection context first, frame overview, performance drill-down, shader/texture/buffer inspection, and project source mapping.
 
@@ -410,7 +423,7 @@ The MCP server includes built-in workflow instructions that guide AI clients thr
 │                        VS Code Extension Host                        │
 │  ┌──────────────┐   ┌──────────────────┐   ┌──────────────────────┐  │
 │  │   Sidebar    │   │    Inspector     │   │    MCP Server        │  │
-│  │   Views      │   │    Webview       │   │  (21 tools, HTTP)    │  │
+│  │   Views      │   │    Webview       │   │  (29 tools, HTTP)    │  │
 │  └──────┬───────┘   └────────┬─────────┘   └──────────┬───────────┘  │
 │         └────────────────────┼────────────────────────┘              │
 │                              ▼                                       │
