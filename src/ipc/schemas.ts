@@ -246,6 +246,8 @@ export const LiveTargetInfoResponse = z.object({
 export const TriggerCaptureResponse = LiveTargetInfoResponse.extend({
     capturePath: z.string(),
     frameNumber: z.number().optional(),
+    loadedIntoInspector: z.boolean().optional(),
+    replayStatus: z.enum(['none', 'active', 'failed', 'unavailable']).optional(),
 });
 
 export type TGetTimingsResponse = z.infer<typeof GetTimingsResponse>;

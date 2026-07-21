@@ -1,0 +1,4 @@
+interface:
+  display_name: "RenderDoc Performance Report"
+  short_description: "Find GPU hotspots and large captured resources."
+  default_prompt: "Use $renderdoc-performance-report to produce an evidence-based GPU timing and resource footprint report."

@@ -32,6 +32,7 @@ import { ThumbnailPanel } from './views/thumbnailPanel';
 import { InspectorPanel } from './views/inspectorPanel';
 import { DrawOverlayPanel } from './views/drawOverlayPanel';
 import { initTools } from './copilot/tools';
+import type { AndroidReadinessInput, Bookmark, LaunchApplicationInput, LaunchRemoteApplicationInput, TriggerRemoteCaptureInput, WindowsLaunchInput } from './copilot/tools';
 import { BUILD_DOCS_URL, ensureNativeBridge } from './bridgeInstaller';
 import { openShaderSourceDocument } from './shaderEditor';
 import { CaptureCache, formatBytes } from './util/captureCache';
@@ -1640,7 +1641,6 @@ export async function activate(context: vscode.ExtensionContext) {
     drawCallProvider = new DrawCallProvider();
     apiInspectorProvider = new ApiInspectorProvider(bridge);
     resourceProvider = new ResourceProvider();
-    let launchTargetViewProvider: LaunchTargetViewProvider | undefined;
 
     context.subscriptions.push({
         dispose: bridge.onNativeNotification('replayHostDisconnected', (params) => {
@@ -1730,6 +1730,11 @@ export async function activate(context: vscode.ExtensionContext) {
         selectedResource: currentSelectedResource,
     });
 
+    const renderDocMcpServer = new RenderDocMcpServer(
+        context.extension.packageJSON.version,
+        getCapturePath,
+    );
+
     initTools(
         bridge,
         getCapturePath,
@@ -1743,11 +1748,174 @@ export async function activate(context: vscode.ExtensionContext) {
             replayMode: currentReplayMode,
             nativeBridgeRunning: bridge.hasNativeBridge(),
         }),
-    );
-
-    const renderDocMcpServer = new RenderDocMcpServer(
-        context.extension.packageJSON.version,
-        getCapturePath,
+        () => bridge.nativeListCaptureTargets(),
+        async (input: LaunchRemoteApplicationInput) => {
+            await launchTargetState.refresh(bridge);
+            const targets = getSupportedReplayHostTargets();
+            const query = input.targetQuery?.trim().toLowerCase();
+            const target = input.targetUrl
+                ? targets.find((candidate) => candidate.url === input.targetUrl)
+                : query
+                    ? targets.find((candidate) => [candidate.name, candidate.id, candidate.url].some((value) => value.toLowerCase().includes(query)))
+                    : targets.find((candidate) => candidate.protocol.toLowerCase().includes('android')) || targets[0];
+            if (!target) {
+                throw new Error('No supported remote RenderDoc target is connected. Call renderdoc_listCaptureTargets first.');
+            }
+            await launchTargetState.selectDevice(target.url);
+            const result = await runCaptureWithProgress('RenderDoc — Launch Android Application', () => bridge.nativeLaunchCapture({
+                url: target.url,
+                executable: input.packageActivity,
+                cmdLine: input.commandLine,
+            }));
+            launchTargetState.setLiveTarget(result);
+            await refreshLiveTargetState();
+            return { ...result, selectedTarget: target, message: `Launched ${input.packageActivity} on ${target.name || target.url}.` };
+        },
+        async (input: TriggerRemoteCaptureInput) => {
+            const liveTarget = launchTargetState.getLiveTarget();
+            if (!liveTarget) {
+                throw new Error('No active application session. Launch an application first.');
+            }
+            launchTargetState.setSessionState({ phase: 'capturing', error: undefined });
+            const trigger = input.trigger ?? 'immediate';
+            if (trigger === 'frame' && (!Number.isInteger(input.frameNumber) || (input.frameNumber ?? 0) < 0)) {
+                throw new Error('frameNumber must be a non-negative integer when trigger is frame.');
+            }
+            if (trigger === 'delay' && (!Number.isFinite(input.delaySeconds) || (input.delaySeconds ?? 0) <= 0)) {
+                throw new Error('delaySeconds must be greater than zero when trigger is delay.');
+            }
+            const tempDir = getLiveCaptureTempDir(context);
+            await fs.promises.mkdir(tempDir, { recursive: true });
+            let result: TriggerCaptureResult;
+            try {
+                result = await runCaptureWithProgress('RenderDoc — Capture Remote Frame', () => bridge.nativeTriggerCapture({
+                    localCopyPath: `${buildLiveCaptureTemplate(tempDir, liveTarget.target || 'remote-capture')}.rdc`,
+                    trigger,
+                    ...(input.frameNumber !== undefined ? { frameNumber: input.frameNumber } : {}),
+                    ...(input.delaySeconds !== undefined ? { delaySeconds: input.delaySeconds } : {}),
+                }));
+            } catch (error: any) {
+                launchTargetState.setSessionError('CAPTURE_FAILED', error?.message ?? String(error), true);
+                return { ok: false, code: 'CAPTURE_FAILED', phase: 'capture', recoverable: true, message: error?.message ?? String(error) } as any;
+            }
+            const entry = createLiveCaptureEntry(result, result.capturePath, false);
+            launchTargetState.addRecentCapture(entry);
+            let loadedIntoInspector = false;
+            try {
+                await loadCapture(context, result.capturePath);
+                loadedIntoInspector = currentCapturePath === result.capturePath;
+            } catch (error: any) {
+                launchTargetState.setSessionError('CAPTURE_LOAD_FAILED', error?.message ?? String(error), true);
+            }
+            await refreshLiveTargetState();
+            return { ...result, loadedIntoInspector, replayStatus: captureInfoProvider.getReplayStatus(), message: `Captured frame to ${result.capturePath}.` };
+        },
+        async (input: AndroidReadinessInput) => {
+            const adbPath = await findAdbExecutable();
+            if (!adbPath) return { ready: false, code: 'ADB_NOT_FOUND', message: 'adb was not found on PATH.' };
+            let devicesOutput = '';
+            try { devicesOutput = await execFileText(adbPath, ['devices']); } catch (error: any) {
+                return { ready: false, code: 'ADB_UNAVAILABLE', message: error?.message ?? String(error) };
+            }
+            const devices = devicesOutput.split(/\r?\n/).slice(1).map((line) => line.trim()).filter(Boolean).map((line) => {
+                const [serial, state] = line.split(/\s+/);
+                return { serial, state };
+            });
+            const online = devices.filter((device) => device.state === 'device');
+            if (online.length === 0) {
+                const state = devices[0]?.state;
+                return { ready: false, code: state === 'unauthorized' ? 'ADB_UNAUTHORIZED' : state === 'offline' ? 'ADB_OFFLINE' : 'NO_ANDROID_DEVICE', devices, message: state ? `Android device is ${state}.` : 'No Android device is connected.' };
+            }
+            await launchTargetState.refresh(bridge);
+            const query = input.targetQuery?.trim().toLowerCase();
+            const candidates = getSupportedReplayHostTargets().filter((target) => !query || [target.url, target.id, target.name].some((value) => value.toLowerCase().includes(query)));
+            const device = online.length === 1 ? online[0] : online.find((item) => !query || item.serial.toLowerCase().includes(query));
+            if (!device || online.length > 1 && !query) return { ready: false, code: 'MULTIPLE_ANDROID_DEVICES', devices, message: 'Multiple Android devices are online; provide a serial or targetQuery.', targets: candidates };
+            let packages: string[];
+            try { packages = await listAndroidPackages(adbPath, device.serial); } catch (error: any) { return { ready: false, code: 'PACKAGE_ENUMERATION_FAILED', device, message: error?.message ?? String(error) }; }
+            if (!packages.includes(input.packageName)) return { ready: false, code: 'PACKAGE_NOT_INSTALLED', device, packageName: input.packageName, message: `Package ${input.packageName} is not installed on ${device.serial}.` };
+            let activity: string | undefined;
+            try { activity = await resolveAndroidLaunchActivity(adbPath, device.serial, input.packageName); } catch { activity = undefined; }
+            if (!activity) return { ready: false, code: 'ACTIVITY_NOT_FOUND', device, packageName: input.packageName, message: 'Could not resolve a launcher activity; provide package/activity explicitly.' };
+            const target = candidates.find((item) => item.id === device.serial || item.name.toLowerCase().includes(device.serial.toLowerCase())) || candidates[0];
+            if (!target) return { ready: false, code: 'RENDERDOC_TARGET_NOT_FOUND', device, activity, message: 'Android is visible to adb but no supported RenderDoc target is available.' };
+            return { ready: true, adbPath, device, packageName: input.packageName, activity, target };
+        },
+        async (input: WindowsLaunchInput) => {
+            if (process.platform !== 'win32') throw new Error('Windows application launch is only available on Windows.');
+            if (path.extname(input.executablePath).toLowerCase() !== '.exe') throw new Error('executablePath must point to a .exe file.');
+            if (!fs.existsSync(input.executablePath)) throw new Error(`Executable does not exist: ${input.executablePath}`);
+            const result = await runCaptureWithProgress('RenderDoc — Launch Windows Application', () => bridge.nativeLaunchCapture({ url: '', executable: input.executablePath, workingDir: input.workingDir || path.dirname(input.executablePath), cmdLine: input.commandLine }));
+            launchTargetState.setLiveTarget(result);
+            await refreshLiveTargetState();
+            return { ...result, platform: 'windows', message: `Launched ${input.executablePath}.` };
+        },
+        async (input: LaunchApplicationInput) => {
+            launchTargetState.setSessionState({ phase: 'checking', application: input.app, error: undefined });
+            if (!input.platform) return { ok: false, code: 'PLATFORM_REQUIRED', phase: 'platform-check', recoverable: true, message: 'Specify whether the application should launch on Windows or Android.', nextActions: ['Choose Windows and provide a .exe path.', 'Choose Android and provide a package name.'] };
+            if (input.platform === 'windows') return await (async () => {
+                try { return { ok: true, ...(await (async () => {
+                    launchTargetState.setSessionState({ phase: 'launching', platform: 'windows', application: input.app });
+                    if (path.extname(input.app).toLowerCase() !== '.exe') throw new Error('EXE_PATH_REQUIRED');
+                    if (!fs.existsSync(input.app)) throw new Error('EXE_NOT_FOUND');
+                    const result = await runCaptureWithProgress('RenderDoc — Launch Windows Application', () => bridge.nativeLaunchCapture({ url: '', executable: input.app, workingDir: input.workingDir || path.dirname(input.app), cmdLine: input.commandLine }));
+                    launchTargetState.setLiveTarget(result);
+                    await refreshLiveTargetState();
+                    return { ...result, platform: 'windows', application: input.app };
+                })()) }; } catch (error: any) { launchTargetState.setSessionError(String(error?.message || error), String(error?.message || error), false); return { ok: false, code: String(error?.message || error), phase: 'launch', recoverable: false, message: String(error?.message || error) }; }
+            })();
+            const readiness = await (async () => {
+                const adb = await findAdbExecutable();
+                if (!adb) return { ready: false, code: 'ADB_NOT_FOUND', message: 'adb was not found on PATH.' };
+                const packageActivity = input.app.includes('/') ? input.app : `${input.app}/`;
+                const packageName = packageActivity.split('/')[0];
+                const deviceOutput = await execFileText(adb, ['devices']);
+                const devices = deviceOutput.split(/\r?\n/).slice(1).map((line) => line.trim()).filter(Boolean).map((line) => {
+                    const [serial, state] = line.split(/\s+/);
+                    return { serial, state };
+                });
+                const online = devices.filter((device) => device.state === 'device');
+                if (online.length === 0) return { ready: false, code: devices[0]?.state === 'unauthorized' ? 'ADB_UNAUTHORIZED' : devices[0]?.state === 'offline' ? 'ADB_OFFLINE' : 'NO_ANDROID_DEVICE', message: 'No online Android device is available.' };
+                await launchTargetState.refresh(bridge);
+                const targets = getSupportedReplayHostTargets().filter((target) => !input.targetQuery || [target.url, target.id, target.name].some((value) => value.toLowerCase().includes(input.targetQuery!.toLowerCase())));
+                const target = targets[0];
+                if (!target) return { ready: false, code: 'RENDERDOC_TARGET_NOT_FOUND', message: 'No supported RenderDoc Android target is available.' };
+                const packages = await listAndroidPackages(adb, online[0].serial);
+                if (!packages.includes(packageName)) return { ready: false, code: 'PACKAGE_NOT_INSTALLED', message: `Package ${packageName} is not installed.` };
+                const activity = packageActivity.endsWith('/') ? await resolveAndroidLaunchActivity(adb, online[0].serial, packageName) : packageActivity.split('/').slice(1).join('/');
+                if (!activity) return { ready: false, code: 'ACTIVITY_NOT_FOUND', message: `No launcher activity found for ${packageName}.` };
+                return { ready: true, target, packageActivity: `${packageName}/${activity}` };
+            })();
+            if (!readiness.ready) { launchTargetState.setSessionError(readiness.code ?? 'ANDROID_READINESS_FAILED', readiness.message ?? 'Android launch readiness check failed.', true); return { ok: false, ...readiness, phase: 'device-check', recoverable: true }; }
+            const androidTarget = readiness.target;
+            const androidPackageActivity = readiness.packageActivity;
+            if (!androidTarget || !androidPackageActivity) return { ok: false, code: 'ANDROID_READINESS_INCOMPLETE', phase: 'device-check', recoverable: true, message: 'Android readiness did not return a target and package activity.' };
+            launchTargetState.setSessionState({ phase: 'launching', platform: 'android', application: input.app, targetUrl: androidTarget.url });
+            try {
+                await launchTargetState.selectDevice(androidTarget.url);
+                const result = await runCaptureWithProgress('RenderDoc — Launch Android Application', () => bridge.nativeLaunchCapture({ url: androidTarget.url, executable: androidPackageActivity, cmdLine: input.commandLine }));
+                launchTargetState.setLiveTarget(result);
+                await refreshLiveTargetState();
+                return { ok: true, ...result, platform: 'android', application: input.app, target: androidTarget, packageActivity: androidPackageActivity };
+            } catch (error: any) {
+                launchTargetState.setSessionError('INJECTION_FAILED', error?.message ?? String(error), true);
+                return { ok: false, code: 'INJECTION_FAILED', phase: 'launch', recoverable: true, message: error?.message ?? String(error) };
+            }
+        },
+        () => launchTargetState.getSessionState(),
+        async () => {
+            await bridge.nativeDisconnectLiveTarget();
+            launchTargetState.clearSession();
+            await refreshLiveTargetState();
+            return { ok: true, phase: 'idle', message: 'RenderDoc application session closed.' };
+        },
+        undefined,
+        undefined,
+        () => renderDocMcpServer.getStatus(),
+        context.globalState.get<Bookmark[]>('renderdoc.bookmarks') ?? [],
+        async (bookmarks: Bookmark[]) => {
+            await context.globalState.update('renderdoc.bookmarks', bookmarks);
+        },
     );
     context.subscriptions.push(renderDocMcpServer);
 
@@ -1823,7 +1991,7 @@ export async function activate(context: vscode.ExtensionContext) {
         }
     };
 
-    launchTargetViewProvider = new LaunchTargetViewProvider(
+    const launchTargetViewProvider = new LaunchTargetViewProvider(
         launchTargetState,
         async () => { await launchTargetState.refresh(bridge); },
         () => renderDocMcpServer.getStatus(),

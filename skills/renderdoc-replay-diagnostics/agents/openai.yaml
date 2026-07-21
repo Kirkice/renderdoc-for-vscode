@@ -1,0 +1,4 @@
+interface:
+  display_name: RenderDoc Replay Diagnostics
+  short_description: Diagnose RenderDoc launch and replay failures
+  default_prompt: Diagnose the current RenderDoc, replay, MCP, and Android environment and provide evidence-based recovery steps.

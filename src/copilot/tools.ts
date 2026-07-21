@@ -1,7 +1,8 @@
 import * as vscode from 'vscode';
 import * as path from 'path';
+import * as fs from 'fs';
 import { RenderDocBridge } from '../renderdocBridge';
-import { CaptureInfo, DrawCall, ResourceInfo } from '../types';
+import { CaptureInfo, CaptureLaunchTarget, DrawCall, ResourceInfo, TriggerCaptureOptions, TriggerCaptureResult } from '../types';
 import { InspectorPanel } from '../views/inspectorPanel';
 
 // Shared state — set by extension.ts after bridge/providers are initialized
@@ -11,6 +12,19 @@ let _getSelectionContext: () => { selectedDrawCall: any; selectedResource: any }
 let _getCurrentDrawCalls: () => DrawCall[];
 let _openCaptureForChat: ((filePath?: string) => Promise<OpenCaptureResult>) | undefined;
 let _getReplayState: (() => ReplayStateInfo) | undefined;
+let _listCaptureTargets: (() => Promise<CaptureLaunchTarget[]>) | undefined;
+let _launchRemoteApplication: ((input: LaunchRemoteApplicationInput) => Promise<unknown>) | undefined;
+let _triggerRemoteCapture: ((input: TriggerRemoteCaptureInput) => Promise<TriggerCaptureResult>) | undefined;
+let _checkAndroidReadiness: ((input: AndroidReadinessInput) => Promise<unknown>) | undefined;
+let _launchWindowsApplication: ((input: WindowsLaunchInput) => Promise<unknown>) | undefined;
+let _getSessionState: (() => unknown) | undefined;
+let _closeSession: (() => Promise<unknown>) | undefined;
+let _launchApplication: ((input: LaunchApplicationInput) => Promise<unknown>) | undefined;
+let _captureFrame: ((input: TriggerRemoteCaptureInput) => Promise<unknown>) | undefined;
+let _diagnoseEnvironment: (() => Promise<unknown>) | undefined;
+let _getMcpStatus: (() => unknown) | undefined;
+let _bookmarks: Bookmark[] = [];
+let _updateBookmarks: ((bookmarks: Bookmark[]) => Promise<void>) | undefined;
 
 interface ReplayStateInfo {
     captureLoaded: boolean;
@@ -29,6 +43,27 @@ interface OpenCaptureResult {
     message: string;
 }
 
+export interface LaunchApplicationInput {
+    platform?: 'windows' | 'android';
+    app: string;
+    targetUrl?: string;
+    targetQuery?: string;
+    workingDir?: string;
+    commandLine?: string;
+}
+
+export interface Bookmark {
+    id: string;
+    capturePath?: string;
+    eventId?: number;
+    title: string;
+    note?: string;
+    conclusion?: string;
+    analysis?: string;
+    screenshotPath?: string;
+    createdAt: string;
+}
+
 export function initTools(
     bridge: RenderDocBridge,
     getCurrentCapturePath: () => string | undefined,
@@ -36,6 +71,19 @@ export function initTools(
     getCurrentDrawCalls?: () => DrawCall[],
     openCaptureForChat?: (filePath?: string) => Promise<OpenCaptureResult>,
     getReplayState?: () => ReplayStateInfo,
+    listCaptureTargets?: () => Promise<CaptureLaunchTarget[]>,
+    launchRemoteApplication?: (input: LaunchRemoteApplicationInput) => Promise<unknown>,
+    triggerRemoteCapture?: (input: TriggerRemoteCaptureInput) => Promise<TriggerCaptureResult>,
+    checkAndroidReadiness?: (input: AndroidReadinessInput) => Promise<unknown>,
+    launchWindowsApplication?: (input: WindowsLaunchInput) => Promise<unknown>,
+    launchApplication?: (input: LaunchApplicationInput) => Promise<unknown>,
+    getSessionState?: () => unknown,
+    closeSession?: () => Promise<unknown>,
+    captureFrame?: (input: TriggerRemoteCaptureInput) => Promise<unknown>,
+    diagnoseEnvironment?: () => Promise<unknown>,
+    getMcpStatus?: () => unknown,
+    initialBookmarks?: Bookmark[],
+    updateBookmarks?: (bookmarks: Bookmark[]) => Promise<void>,
 ) {
     _bridge = bridge;
     _getCurrentCapturePath = getCurrentCapturePath;
@@ -43,6 +91,498 @@ export function initTools(
     _getCurrentDrawCalls = getCurrentDrawCalls ?? (() => []);
     _openCaptureForChat = openCaptureForChat;
     _getReplayState = getReplayState;
+    _listCaptureTargets = listCaptureTargets;
+    _launchRemoteApplication = launchRemoteApplication;
+    _triggerRemoteCapture = triggerRemoteCapture;
+    _checkAndroidReadiness = checkAndroidReadiness;
+    _launchWindowsApplication = launchWindowsApplication;
+    _getSessionState = getSessionState;
+    _closeSession = closeSession;
+    _launchApplication = launchApplication;
+    _captureFrame = captureFrame;
+    _diagnoseEnvironment = diagnoseEnvironment;
+    _getMcpStatus = getMcpStatus;
+    _bookmarks = initialBookmarks ?? [];
+    _updateBookmarks = updateBookmarks;
+}
+
+interface BookmarkInput { eventId?: number; title: string; note?: string; conclusion?: string; analysis?: string; screenshotPath?: string }
+export class AddBookmarkTool implements vscode.LanguageModelTool<BookmarkInput> {
+    async invoke(options: vscode.LanguageModelToolInvocationOptions<BookmarkInput>): Promise<vscode.LanguageModelToolResult> {
+        const bookmark: Bookmark = { id: `${Date.now()}-${Math.random().toString(16).slice(2)}`, capturePath: _getCurrentCapturePath(), eventId: options.input.eventId, title: options.input.title, note: options.input.note, conclusion: options.input.conclusion, analysis: options.input.analysis, screenshotPath: options.input.screenshotPath, createdAt: new Date().toISOString() };
+        _bookmarks = [bookmark, ..._bookmarks].slice(0, 200);
+        await _updateBookmarks?.(_bookmarks);
+        return new vscode.LanguageModelToolResult([new vscode.LanguageModelTextPart(JSON.stringify(bookmark, null, 2))]);
+    }
+    async prepareInvocation(options: vscode.LanguageModelToolInvocationPrepareOptions<BookmarkInput>): Promise<vscode.PreparedToolInvocation> { return { invocationMessage: `Adding RenderDoc bookmark ${options.input?.title ?? ''}…` }; }
+}
+export class ListBookmarksTool implements vscode.LanguageModelTool<Record<string, never>> {
+    async invoke(): Promise<vscode.LanguageModelToolResult> { return new vscode.LanguageModelToolResult([new vscode.LanguageModelTextPart(JSON.stringify({ count: _bookmarks.length, bookmarks: _bookmarks }, null, 2))]); }
+    async prepareInvocation(): Promise<vscode.PreparedToolInvocation> { return { invocationMessage: 'Loading RenderDoc investigation bookmarks…' }; }
+}
+export class RemoveBookmarkTool implements vscode.LanguageModelTool<{ id: string }> {
+    async invoke(options: vscode.LanguageModelToolInvocationOptions<{ id: string }>): Promise<vscode.LanguageModelToolResult> { _bookmarks = _bookmarks.filter((bookmark) => bookmark.id !== options.input.id); await _updateBookmarks?.(_bookmarks); return new vscode.LanguageModelToolResult([new vscode.LanguageModelTextPart(JSON.stringify({ ok: true, id: options.input.id }, null, 2))]); }
+    async prepareInvocation(): Promise<vscode.PreparedToolInvocation> { return { invocationMessage: 'Removing RenderDoc bookmark…' }; }
+}
+
+interface UpdateBookmarkInput { id: string; title?: string; note?: string; eventId?: number; conclusion?: string; analysis?: string; screenshotPath?: string }
+export class UpdateBookmarkTool implements vscode.LanguageModelTool<UpdateBookmarkInput> {
+    async invoke(options: vscode.LanguageModelToolInvocationOptions<UpdateBookmarkInput>): Promise<vscode.LanguageModelToolResult> {
+        const index = _bookmarks.findIndex((bookmark) => bookmark.id === options.input.id);
+        if (index < 0) throw new Error(`Bookmark ${options.input.id} was not found.`);
+        const current = _bookmarks[index];
+        _bookmarks[index] = {
+            ...current,
+            ...(options.input.title !== undefined ? { title: options.input.title } : {}),
+            ...(options.input.note !== undefined ? { note: options.input.note } : {}),
+            ...(options.input.eventId !== undefined ? { eventId: options.input.eventId } : {}),
+            ...(options.input.conclusion !== undefined ? { conclusion: options.input.conclusion } : {}),
+            ...(options.input.analysis !== undefined ? { analysis: options.input.analysis } : {}),
+            ...(options.input.screenshotPath !== undefined ? { screenshotPath: options.input.screenshotPath } : {}),
+        };
+        await _updateBookmarks?.(_bookmarks);
+        return new vscode.LanguageModelToolResult([new vscode.LanguageModelTextPart(JSON.stringify(_bookmarks[index], null, 2))]);
+    }
+    async prepareInvocation(): Promise<vscode.PreparedToolInvocation> { return { invocationMessage: 'Updating RenderDoc investigation bookmark…' }; }
+}
+
+interface InvestigationReportInput { format?: 'markdown' | 'json'; outputPath?: string; timingLimit?: number }
+export class ExportInvestigationReportTool implements vscode.LanguageModelTool<InvestigationReportInput> {
+    async invoke(options: vscode.LanguageModelToolInvocationOptions<InvestigationReportInput>): Promise<vscode.LanguageModelToolResult> {
+        const capturePath = requireCapturePath();
+        const [captureInfo, drawCalls, resources] = await Promise.all([
+            _bridge.getCaptureInfo(capturePath),
+            _bridge.getDrawCalls(capturePath),
+            _bridge.getResources(capturePath),
+        ]);
+        const timings = _bridge.hasNativeBridge() ? await _bridge.getDrawTimings() : new Map<number, number>();
+        const hotspots: Array<{ eventId: number; name: string; durationUs: number }> = [];
+        const visit = (items: DrawCall[]) => items.forEach((item) => {
+            if (item.children?.length) visit(item.children);
+            else {
+                const durationUs = timings.get(item.eventId) ?? item.durationUs ?? 0;
+                if (durationUs > 0) hotspots.push({ eventId: item.eventId, name: item.name, durationUs });
+            }
+        });
+        visit(drawCalls);
+        hotspots.sort((a, b) => b.durationUs - a.durationUs);
+        const totalBytes = resources.reduce((sum, resource) => sum + Number(resource.byteSize ?? 0), 0);
+        const report = {
+            generatedAt: new Date().toISOString(),
+            capturePath,
+            captureInfo,
+            session: _getSessionState?.() ?? { phase: 'idle' },
+            bookmarks: _bookmarks.filter((bookmark) => !bookmark.capturePath || bookmark.capturePath === capturePath),
+            performance: { timingAvailable: timings.size > 0, hottestEvents: hotspots.slice(0, Math.max(1, Math.min(options.input?.timingLimit ?? 20, 200))) },
+            resources: { count: resources.length, totalBytes, totalMiB: totalBytes / (1024 * 1024), largest: [...resources].sort((a, b) => Number(b.byteSize ?? 0) - Number(a.byteSize ?? 0)).slice(0, 25) },
+            limitations: ['Resource byteSize is a capture footprint estimate.', 'Performance conclusions require available GPU timing evidence.'],
+        };
+        const format = options.input?.format ?? 'markdown';
+        const content = format === 'json' ? JSON.stringify(report, null, 2) : [
+            '# RenderDoc Investigation Report',
+            '',
+            `- Generated: ${report.generatedAt}`,
+            `- Capture: ${capturePath}`,
+            `- API: ${captureInfo.api ?? 'unknown'}`,
+            `- Resources: ${resources.length} (${(totalBytes / (1024 * 1024)).toFixed(2)} MiB)`,
+            '',
+            '## Bookmarks',
+            ...(report.bookmarks.length ? report.bookmarks.map((bookmark) => `- **${bookmark.title}**${bookmark.eventId !== undefined ? ` (EID ${bookmark.eventId})` : ''}${bookmark.note ? ` — ${bookmark.note}` : ''}`) : ['- None']),
+            '',
+            '## Performance hotspots',
+            ...(report.performance.timingAvailable ? report.performance.hottestEvents.map((event) => `- EID ${event.eventId}: ${event.name} — ${event.durationUs.toFixed(2)} µs`) : ['- GPU timings unavailable; treat performance conclusions as hypotheses.']),
+            '',
+            '## Limitations',
+            ...report.limitations.map((note) => `- ${note}`),
+        ].join('\n');
+        const outputPath = options.input?.outputPath ? path.resolve(options.input.outputPath) : undefined;
+        if (outputPath) {
+            await fs.promises.mkdir(path.dirname(outputPath), { recursive: true });
+            await fs.promises.writeFile(outputPath, content, 'utf8');
+        }
+        return new vscode.LanguageModelToolResult([new vscode.LanguageModelTextPart(JSON.stringify({ ok: true, format, outputPath: outputPath ?? null, report, content: outputPath ? undefined : content }, null, 2))]);
+    }
+    async prepareInvocation(): Promise<vscode.PreparedToolInvocation> { return { invocationMessage: 'Exporting the RenderDoc investigation report…' }; }
+}
+
+interface WaitForSessionInput { timeoutMs?: number; pollMs?: number }
+async function waitForSessionState(predicate: (state: any) => boolean, input?: WaitForSessionInput): Promise<any> {
+    const timeoutMs = Math.max(100, Math.min(input?.timeoutMs ?? 10000, 60000));
+    const pollMs = Math.max(50, Math.min(input?.pollMs ?? 250, 2000));
+    const deadline = Date.now() + timeoutMs;
+    let state = _getSessionState?.() ?? { phase: 'idle' };
+    while (!predicate(state) && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, pollMs));
+        state = _getSessionState?.() ?? { phase: 'idle' };
+    }
+    return { ok: predicate(state), timedOut: !predicate(state), timeoutMs, state };
+}
+
+export class WaitForLiveTargetTool implements vscode.LanguageModelTool<WaitForSessionInput> {
+    async invoke(options: vscode.LanguageModelToolInvocationOptions<WaitForSessionInput>): Promise<vscode.LanguageModelToolResult> {
+        const result = await waitForSessionState((state) => ['ready', 'running', 'capturing', 'completed'].includes(state.phase) && !!state.target, options.input);
+        return new vscode.LanguageModelToolResult([new vscode.LanguageModelTextPart(JSON.stringify(result, null, 2))]);
+    }
+    async prepareInvocation(): Promise<vscode.PreparedToolInvocation> { return { invocationMessage: 'Waiting for the RenderDoc live target to become ready…' }; }
+}
+
+export class WaitForCaptureTool implements vscode.LanguageModelTool<WaitForSessionInput> {
+    async invoke(options: vscode.LanguageModelToolInvocationOptions<WaitForSessionInput>): Promise<vscode.LanguageModelToolResult> {
+        const result = await waitForSessionState((state) => ['completed'].includes(state.phase) && !!state.lastCapture, options.input);
+        return new vscode.LanguageModelToolResult([new vscode.LanguageModelTextPart(JSON.stringify(result, null, 2))]);
+    }
+    async prepareInvocation(): Promise<vscode.PreparedToolInvocation> { return { invocationMessage: 'Waiting for the RenderDoc capture to complete…' }; }
+}
+
+export class LaunchApplicationTool implements vscode.LanguageModelTool<LaunchApplicationInput> {
+    async invoke(options: vscode.LanguageModelToolInvocationOptions<LaunchApplicationInput>): Promise<vscode.LanguageModelToolResult> {
+        if (!_launchApplication) throw new Error('Application launch workflow is not initialized.');
+        const result = await _launchApplication(options.input);
+        return new vscode.LanguageModelToolResult([new vscode.LanguageModelTextPart(JSON.stringify(result, null, 2))]);
+    }
+    async prepareInvocation(options: vscode.LanguageModelToolInvocationPrepareOptions<LaunchApplicationInput>): Promise<vscode.PreparedToolInvocation> {
+        return { invocationMessage: `Launching ${options.input?.platform ?? 'the requested platform'} application ${options.input?.app ?? ''}…` };
+    }
+}
+
+export class GeneratePerformanceReportTool implements vscode.LanguageModelTool<{ limit?: number }> {
+    async invoke(options: vscode.LanguageModelToolInvocationOptions<{ limit?: number }>): Promise<vscode.LanguageModelToolResult> {
+        const filePath = requireCapturePath();
+        const drawCalls = _getCurrentDrawCalls().length ? _getCurrentDrawCalls() : await _bridge.getDrawCalls(filePath);
+        const timings = _bridge.hasNativeBridge() ? await _bridge.getDrawTimings() : new Map<number, number>();
+        const rows: Array<{ eventId: number; name: string; durationUs: number }> = [];
+        const visit = (items: DrawCall[]) => items.forEach((item) => {
+            if (item.children?.length) visit(item.children);
+            else {
+                const durationUs = timings.get(item.eventId) ?? item.durationUs ?? 0;
+                if (durationUs > 0) rows.push({ eventId: item.eventId, name: item.name, durationUs });
+            }
+        });
+        visit(drawCalls);
+        rows.sort((a, b) => b.durationUs - a.durationUs);
+        const passTotals = new Map<string, number>();
+        const aggregate = (items: DrawCall[], marker = 'Frame') => items.forEach((item) => {
+            const durationUs = timings.get(item.eventId) ?? item.durationUs ?? 0;
+            const name = item.children?.length ? item.name : marker;
+            if (durationUs > 0) passTotals.set(name, (passTotals.get(name) ?? 0) + durationUs);
+            if (item.children?.length) aggregate(item.children, item.name);
+        });
+        aggregate(drawCalls);
+        const hottestPasses = Array.from(passTotals, ([name, durationUs]) => ({ name, durationUs })).sort((a, b) => b.durationUs - a.durationUs).slice(0, Math.max(1, Math.min(options.input?.limit ?? 20, 200)));
+        const limit = Math.max(1, Math.min(options.input?.limit ?? 20, 200));
+        const hottestEvents = await Promise.all(rows.slice(0, limit).map(async (event) => {
+            const evidence: any = { event: { eventId: event.eventId, name: event.name, durationUs: event.durationUs }, resource: undefined, shader: undefined, mesh: undefined };
+            try {
+                const details = await _bridge.nativeGetPipelineState(event.eventId);
+                evidence.shader = details?.shaders ? Object.fromEntries(Object.entries(details.shaders as Record<string, any>).map(([stage, shader]) => [stage, { resourceId: (shader as any)?.resourceId, name: (shader as any)?.name, entryPoint: (shader as any)?.entryPoint }])) : undefined;
+                const bindings = details?.stageResources ?? {};
+                const resourceIds = Object.values(bindings).flatMap((stage: any) => [...(stage?.textures ?? []), ...(stage?.constantBlocks ?? [])].map((item: any) => item?.resourceId ?? item?.resourceName).filter(Boolean)).slice(0, 12);
+                evidence.resource = resourceIds;
+            } catch (error: any) { evidence.pipelineError = error?.message ?? String(error); }
+            try { evidence.mesh = await _bridge.nativeGetMeshData(event.eventId, 'vsin', { maxVertices: 0 }); } catch (error: any) { evidence.mesh = { available: false, reason: error?.message ?? String(error) }; }
+            return { ...event, evidence: { capturePath: filePath, ...evidence } };
+        }));
+        const report = {
+            capturePath: filePath,
+            timingAvailable: timings.size > 0,
+            hottestPasses,
+            hottestEvents,
+            totalTimedEvents: rows.length,
+            conclusions: timings.size > 0
+                ? { confirmed: ['Hotspot ranking is based on captured GPU timing values.'], inferred: [], toVerify: ['Inspect pipeline, shader, mesh, and resource bindings for the top EIDs.'] }
+                : { confirmed: [], inferred: [], toVerify: ['Collect GPU timings before making performance conclusions.'] },
+            evidence: timings.size ? 'Hotspots are based on GPU timing evidence.' : 'GPU timings are unavailable; treat performance conclusions as hypotheses.',
+        };
+        return new vscode.LanguageModelToolResult([new vscode.LanguageModelTextPart(JSON.stringify(report, null, 2))]);
+    }
+    async prepareInvocation(): Promise<vscode.PreparedToolInvocation> { return { invocationMessage: 'Generating an evidence-based RenderDoc performance report…' }; }
+}
+
+export class ResourceMemoryAuditTool implements vscode.LanguageModelTool<{ limit?: number }> {
+    async invoke(options: vscode.LanguageModelToolInvocationOptions<{ limit?: number }>): Promise<vscode.LanguageModelToolResult> {
+        const resources = await _bridge.getResources(requireCapturePath());
+        const limit = Math.max(1, Math.min(options.input?.limit ?? 25, 200));
+        const rows = resources.map((resource) => ({
+            resourceId: resource.resourceId,
+            type: resource.type,
+            name: resource.name,
+            byteSize: Number(resource.byteSize ?? 0),
+            width: resource.width,
+            height: resource.height,
+            format: resource.format,
+        })).sort((a, b) => b.byteSize - a.byteSize);
+        const totalBytes = rows.reduce((sum, row) => sum + row.byteSize, 0);
+        const textures = rows.filter((row) => row.type.toLowerCase().includes('texture'));
+        const byFormat = textures.reduce<Record<string, { count: number; bytes: number }>>((result, row) => { const key = row.format || 'unknown'; result[key] = result[key] ?? { count: 0, bytes: 0 }; result[key].count += 1; result[key].bytes += row.byteSize; return result; }, {});
+        return new vscode.LanguageModelToolResult([new vscode.LanguageModelTextPart(JSON.stringify({ totalResources: rows.length, totalBytes, totalMiB: totalBytes / (1024 * 1024), largestResources: rows.slice(0, limit), textureAudit: { count: textures.length, byFormat, mipLevelsAvailable: textures.filter((row: any) => row.mipLevels > 1).length, dimensions: textures.slice(0, limit).map((row) => ({ resourceId: row.resourceId, width: row.width, height: row.height, format: row.format, byteSize: row.byteSize })) } , notes: ['byteSize is reported by RenderDoc resource metadata.', 'This is a capture resource footprint audit, not a full runtime allocation/leak proof.'] }, null, 2))]);
+    }
+    async prepareInvocation(): Promise<vscode.PreparedToolInvocation> { return { invocationMessage: 'Auditing the largest captured textures and buffers…' }; }
+}
+
+interface ResourceLifetimeInput { resourceId?: string; limit?: number }
+export class ResourceLifetimeTool implements vscode.LanguageModelTool<ResourceLifetimeInput> {
+    async invoke(options: vscode.LanguageModelToolInvocationOptions<ResourceLifetimeInput>): Promise<vscode.LanguageModelToolResult> {
+        const resources = await _bridge.getResources(requireCapturePath());
+        const drawCalls = _getCurrentDrawCalls().length ? _getCurrentDrawCalls() : await _bridge.getDrawCalls(requireCapturePath());
+        const eventIds = new Set<number>();
+        const visit = (items: DrawCall[]) => items.forEach((item) => { eventIds.add(item.eventId); if (item.children?.length) visit(item.children); });
+        visit(drawCalls);
+        const filtered = options.input?.resourceId ? resources.filter((resource) => resource.resourceId === options.input.resourceId) : resources;
+        const rows = filtered.slice(0, Math.max(1, Math.min(options.input?.limit ?? 100, 500))).map((resource) => ({
+            resourceId: resource.resourceId,
+            name: resource.name,
+            type: resource.type,
+            byteSize: resource.byteSize,
+            observedEventCount: eventIds.size,
+            evidence: 'Capture metadata exposes resource identity and footprint, but not full create/destroy lifetime intervals.',
+        }));
+        return new vscode.LanguageModelToolResult([new vscode.LanguageModelTextPart(JSON.stringify({ available: true, rows }, null, 2))]);
+    }
+    async prepareInvocation(): Promise<vscode.PreparedToolInvocation> { return { invocationMessage: 'Analyzing captured resource lifetime evidence…' }; }
+}
+
+export class FindUnusedResourcesTool implements vscode.LanguageModelTool<{ limit?: number }> {
+    async invoke(options: vscode.LanguageModelToolInvocationOptions<{ limit?: number }>): Promise<vscode.LanguageModelToolResult> {
+        const resources = await _bridge.getResources(requireCapturePath());
+        const drawCalls = _getCurrentDrawCalls().length ? _getCurrentDrawCalls() : await _bridge.getDrawCalls(requireCapturePath());
+        const names = new Set<string>();
+        const visit = (items: DrawCall[]) => items.forEach((item) => { const match = item.name.match(/[0-9a-f]{8,}/i); if (match) names.add(match[0].toLowerCase()); if (item.children?.length) visit(item.children); });
+        visit(drawCalls);
+        const candidates = resources.filter((resource) => resource.type !== 'Shader' && !names.has(resource.resourceId.toLowerCase())).slice(0, Math.max(1, Math.min(options.input?.limit ?? 100, 500)));
+        return new vscode.LanguageModelToolResult([new vscode.LanguageModelTextPart(JSON.stringify({ available: true, candidates, confidence: 'low', limitation: 'This is a conservative heuristic; definitive unused-resource analysis requires binding/lifetime usage data.' }, null, 2))]);
+    }
+    async prepareInvocation(): Promise<vscode.PreparedToolInvocation> { return { invocationMessage: 'Finding resources with no direct capture usage evidence…' }; }
+}
+
+interface FindResourceLeaksInput { baselinePath: string; candidatePath: string; limit?: number }
+export class FindResourceLeaksTool implements vscode.LanguageModelTool<FindResourceLeaksInput> {
+    async invoke(options: vscode.LanguageModelToolInvocationOptions<FindResourceLeaksInput>): Promise<vscode.LanguageModelToolResult> {
+        const [baseline, candidate] = await Promise.all([_bridge.getResources(options.input.baselinePath), _bridge.getResources(options.input.candidatePath)]);
+        const before = new Map(baseline.map((resource) => [resource.resourceId, resource]));
+        const retained = candidate.filter((resource) => before.has(resource.resourceId)).sort((a, b) => Number(b.byteSize ?? 0) - Number(a.byteSize ?? 0)).slice(0, Math.max(1, Math.min(options.input.limit ?? 100, 500)));
+        return new vscode.LanguageModelToolResult([new vscode.LanguageModelTextPart(JSON.stringify({ available: true, retainedResources: retained, candidateOnlyCount: candidate.filter((resource) => !before.has(resource.resourceId)).length, confidence: 'low', limitation: 'Persistent resource identity across captures is only a leak candidate signal, not proof of a runtime leak.' }, null, 2))]);
+    }
+    async prepareInvocation(): Promise<vscode.PreparedToolInvocation> { return { invocationMessage: 'Finding persistent resource allocation candidates across captures…' }; }
+}
+
+interface CompareResourceMemoryInput { baselinePath: string; candidatePath: string; limit?: number }
+export class CompareResourceMemoryTool implements vscode.LanguageModelTool<CompareResourceMemoryInput> {
+    async invoke(options: vscode.LanguageModelToolInvocationOptions<CompareResourceMemoryInput>): Promise<vscode.LanguageModelToolResult> {
+        const [baseline, candidate] = await Promise.all([_bridge.getResources(options.input.baselinePath), _bridge.getResources(options.input.candidatePath)]);
+        const before = new Map(baseline.map((resource) => [resource.resourceId, resource]));
+        const changed = candidate.map((resource) => { const previous = before.get(resource.resourceId); return previous && previous.byteSize !== resource.byteSize ? { resourceId: resource.resourceId, name: resource.name, beforeBytes: previous.byteSize, afterBytes: resource.byteSize, deltaBytes: Number(resource.byteSize ?? 0) - Number(previous.byteSize ?? 0) } : undefined; }).filter(Boolean).sort((a: any, b: any) => Math.abs(b.deltaBytes) - Math.abs(a.deltaBytes)).slice(0, Math.max(1, Math.min(options.input.limit ?? 100, 500)));
+        return new vscode.LanguageModelToolResult([new vscode.LanguageModelTextPart(JSON.stringify({ baselineBytes: baseline.reduce((sum, resource) => sum + Number(resource.byteSize ?? 0), 0), candidateBytes: candidate.reduce((sum, resource) => sum + Number(resource.byteSize ?? 0), 0), changedResources: changed }, null, 2))]);
+    }
+    async prepareInvocation(): Promise<vscode.PreparedToolInvocation> { return { invocationMessage: 'Comparing resource memory footprints across captures…' }; }
+}
+
+interface CompareEventTimingsInput { baselinePath: string; candidatePath: string; limit?: number }
+export class CompareEventTimingsTool implements vscode.LanguageModelTool<CompareEventTimingsInput> {
+    async invoke(options: vscode.LanguageModelToolInvocationOptions<CompareEventTimingsInput>): Promise<vscode.LanguageModelToolResult> {
+        const [baselineCalls, candidateCalls] = await Promise.all([_bridge.getDrawCalls(options.input.baselinePath), _bridge.getDrawCalls(options.input.candidatePath)]);
+        const flatten = (items: DrawCall[], result = new Map<number, DrawCall>()) => { items.forEach((item) => { result.set(item.eventId, item); if (item.children?.length) flatten(item.children, result); }); return result; };
+        const before = flatten(baselineCalls); const after = flatten(candidateCalls);
+        const changes = Array.from(after.values()).map((item) => { const previous = before.get(item.eventId); const beforeUs = previous?.durationUs ?? 0; const afterUs = item.durationUs ?? 0; return previous && beforeUs !== afterUs ? { eventId: item.eventId, name: item.name, beforeUs, afterUs, deltaUs: afterUs - beforeUs } : undefined; }).filter(Boolean).sort((a: any, b: any) => Math.abs(b.deltaUs) - Math.abs(a.deltaUs)).slice(0, Math.max(1, Math.min(options.input.limit ?? 100, 500)));
+        return new vscode.LanguageModelToolResult([new vscode.LanguageModelTextPart(JSON.stringify({ available: true, matchedEvents: changes.length, changes, limitation: 'Only timings already attached to draw-call metadata are compared; cross-capture replay timing is not fabricated.' }, null, 2))]);
+    }
+    async prepareInvocation(): Promise<vscode.PreparedToolInvocation> { return { invocationMessage: 'Comparing event timing evidence across captures…' }; }
+}
+
+export class CompareCapturesTool implements vscode.LanguageModelTool<{ baselinePath: string; candidatePath: string; limit?: number }> {
+    async invoke(options: vscode.LanguageModelToolInvocationOptions<{ baselinePath: string; candidatePath: string; limit?: number }>): Promise<vscode.LanguageModelToolResult> {
+        const input = options.input;
+        const [baselineInfo, candidateInfo] = await Promise.all([_bridge.getCaptureInfo(input.baselinePath), _bridge.getCaptureInfo(input.candidatePath)]);
+        const [baselineResources, candidateResources, baselineDraws, candidateDraws] = await Promise.all([_bridge.getResources(input.baselinePath), _bridge.getResources(input.candidatePath), _bridge.getDrawCalls(input.baselinePath), _bridge.getDrawCalls(input.candidatePath)]);
+        const byType = (resources: ResourceInfo[]) => resources.reduce<Record<string, { count: number; bytes: number }>>((result, resource) => {
+            const current = result[resource.type] ?? { count: 0, bytes: 0 };
+            current.count += 1;
+            current.bytes += Number(resource.byteSize ?? 0);
+            result[resource.type] = current;
+            return result;
+        }, {});
+        const flattenCount = (items: DrawCall[]): number => items.reduce((sum, item) => sum + 1 + (item.children?.length ? flattenCount(item.children) : 0), 0);
+        const baselineById = new Map(baselineResources.map((resource) => [resource.resourceId, resource]));
+        const candidateById = new Map(candidateResources.map((resource) => [resource.resourceId, resource]));
+        const changedResources = candidateResources.map((resource) => {
+            const before = baselineById.get(resource.resourceId);
+            return before && (before.byteSize !== resource.byteSize || before.width !== resource.width || before.height !== resource.height || before.format !== resource.format)
+                ? { resourceId: resource.resourceId, name: resource.name, before: { byteSize: before.byteSize, width: before.width, height: before.height, format: before.format }, after: { byteSize: resource.byteSize, width: resource.width, height: resource.height, format: resource.format }, deltaBytes: Number(resource.byteSize ?? 0) - Number(before.byteSize ?? 0), percentChange: Number(before.byteSize ?? 0) ? ((Number(resource.byteSize ?? 0) - Number(before.byteSize ?? 0)) / Number(before.byteSize ?? 0)) * 100 : null }
+                : undefined;
+        }).filter(Boolean).slice(0, Math.max(1, Math.min(input.limit ?? 50, 200)));
+        const baselineBytes = baselineResources.reduce((sum, resource) => sum + Number(resource.byteSize ?? 0), 0);
+        const candidateBytes = candidateResources.reduce((sum, resource) => sum + Number(resource.byteSize ?? 0), 0);
+        const baselineDrawCount = flattenCount(baselineDraws);
+        const candidateDrawCount = flattenCount(candidateDraws);
+        return new vscode.LanguageModelToolResult([new vscode.LanguageModelTextPart(JSON.stringify({ baseline: { path: input.baselinePath, api: baselineInfo.api, resources: baselineResources.length, bytes: baselineBytes, drawCalls: baselineDrawCount, byType: byType(baselineResources) }, candidate: { path: input.candidatePath, api: candidateInfo.api, resources: candidateResources.length, bytes: candidateBytes, drawCalls: candidateDrawCount, byType: byType(candidateResources) }, deltas: { resourceCount: candidateResources.length - baselineResources.length, drawCalls: candidateDrawCount - baselineDrawCount, addedResources: candidateResources.filter((resource) => !baselineById.has(resource.resourceId)).length, removedResources: baselineResources.filter((resource) => !candidateById.has(resource.resourceId)).length, bytesDelta: candidateBytes - baselineBytes, bytesPercentChange: baselineBytes ? ((candidateBytes - baselineBytes) / baselineBytes) * 100 : null, changedResources: changedResources }, limitation: 'Cross-capture event timing comparison requires both captures to be replayed and timed separately.' }, null, 2))]);
+    }
+    async prepareInvocation(): Promise<vscode.PreparedToolInvocation> { return { invocationMessage: 'Comparing RenderDoc capture metadata and resource footprint…' }; }
+}
+
+export class FindShaderVariantsTool implements vscode.LanguageModelTool<{ shaderName: string; limit?: number }> {
+    async invoke(options: vscode.LanguageModelToolInvocationOptions<{ shaderName: string; limit?: number }>): Promise<vscode.LanguageModelToolResult> {
+        const needle = options.input.shaderName.toLowerCase();
+        const resources = await _bridge.getResources(requireCapturePath());
+        const variants = resources.filter((resource) => resource.type.toLowerCase() === 'shader' && [resource.name, resource.resourceId].some((value) => value.toLowerCase().includes(needle))).slice(0, Math.max(1, Math.min(options.input.limit ?? 50, 200)));
+        return new vscode.LanguageModelToolResult([new vscode.LanguageModelTextPart(JSON.stringify({ query: options.input.shaderName, matchCount: variants.length, variants: variants.map((resource) => ({ resourceId: resource.resourceId, name: resource.name, format: resource.format, byteSize: resource.byteSize })) }, null, 2))]);
+    }
+    async prepareInvocation(options: vscode.LanguageModelToolInvocationPrepareOptions<{ shaderName: string; limit?: number }>): Promise<vscode.PreparedToolInvocation> { return { invocationMessage: `Finding shader variants matching ${options.input?.shaderName ?? ''}…` }; }
+}
+
+interface CompareShadersInput { leftEventId: number; rightEventId: number; stage?: string }
+export class CompareShadersTool implements vscode.LanguageModelTool<CompareShadersInput> {
+    async invoke(options: vscode.LanguageModelToolInvocationOptions<CompareShadersInput>): Promise<vscode.LanguageModelToolResult> {
+        if (!_bridge.hasNativeBridge()) return new vscode.LanguageModelToolResult([new vscode.LanguageModelTextPart(JSON.stringify({ available: false, reason: 'Shader comparison requires the native replay bridge.' }, null, 2))]);
+        const [left, right] = await Promise.all([_bridge.nativeGetShaderSource(options.input.leftEventId, options.input.stage), _bridge.nativeGetShaderSource(options.input.rightEventId, options.input.stage)]);
+        const normalize = (payload: any) => JSON.stringify(payload ?? null, Object.keys(payload ?? {}).sort());
+        return new vscode.LanguageModelToolResult([new vscode.LanguageModelTextPart(JSON.stringify({ available: true, leftEventId: options.input.leftEventId, rightEventId: options.input.rightEventId, stage: options.input.stage ?? null, equivalentPayload: normalize(left) === normalize(right), left, right, note: 'Comparison is structural JSON evidence; compiler-level semantic equivalence is not inferred.' }, null, 2))]);
+    }
+    async prepareInvocation(): Promise<vscode.PreparedToolInvocation> { return { invocationMessage: 'Comparing shader payloads between two events…' }; }
+}
+
+interface ShaderCompileDiagnosticsInput { eventId: number; stage?: string; includeSource?: boolean }
+export class GetShaderCompileDiagnosticsTool implements vscode.LanguageModelTool<ShaderCompileDiagnosticsInput> {
+    async invoke(options: vscode.LanguageModelToolInvocationOptions<ShaderCompileDiagnosticsInput>): Promise<vscode.LanguageModelToolResult> {
+        if (!_bridge.hasNativeBridge()) return new vscode.LanguageModelToolResult([new vscode.LanguageModelTextPart(JSON.stringify({ available: false, reason: 'Shader compile diagnostics require the native replay bridge.' }, null, 2))]);
+        const payload = await _bridge.nativeGetShaderSource(options.input.eventId, options.input.stage);
+        const shaders = payload?.shaders ?? {};
+        const diagnostics = Object.entries(shaders).map(([stage, shader]: [string, any]) => ({ stage, resourceId: shader?.resourceId, compiler: shader?.compiler, entryPoint: shader?.entryPoint, compileFlags: shader?.compileFlags, sourceFiles: shader?.sourceFiles?.map((file: any) => file.filename ?? file.name ?? file) ?? [], hasSource: !!(shader?.source || shader?.sourceFiles?.length) }));
+        return new vscode.LanguageModelToolResult([new vscode.LanguageModelTextPart(JSON.stringify({ available: true, eventId: options.input.eventId, requestedStage: options.input.stage ?? null, diagnostics, analysisWorkflow: { source: 'Call renderdoc_getShaderInfo for source, bindings, and constant buffers; call renderdoc_getActionTimings for EID timing; call renderdoc_validateShaderEdit before applying changes.' }, limitation: 'This reports captured compiler metadata and source availability; it does not recompile unless an explicit shader edit workflow is used.' }, null, 2))]);
+    }
+    async prepareInvocation(): Promise<vscode.PreparedToolInvocation> { return { invocationMessage: 'Reading captured shader compiler diagnostics…' }; }
+}
+
+interface ValidateShaderEditInput { resourceId: string; shaderStage: number; sourceEncoding: number; entryPoint: string; entryFileIndex?: number; compileFlags?: Array<{ name: string; value: string }>; files: Array<{ filename: string; contents: string }> }
+export class ValidateShaderEditTool implements vscode.LanguageModelTool<ValidateShaderEditInput> {
+    async invoke(options: vscode.LanguageModelToolInvocationOptions<ValidateShaderEditInput>): Promise<vscode.LanguageModelToolResult> {
+        if (!_bridge.hasNativeBridge()) return new vscode.LanguageModelToolResult([new vscode.LanguageModelTextPart(JSON.stringify({ available: false, reason: 'Shader edit validation requires the native replay bridge.' }, null, 2))]);
+        const input = options.input;
+        try {
+            const result = await _bridge.nativeCompileShaderEdit({ resourceId: input.resourceId, shaderStage: input.shaderStage, sourceEncoding: input.sourceEncoding, entryPoint: input.entryPoint, entryFileIndex: input.entryFileIndex ?? 0, compileFlags: input.compileFlags ?? [], files: input.files });
+            return new vscode.LanguageModelToolResult([new vscode.LanguageModelTextPart(JSON.stringify({ available: true, valid: !!result?.compiled && !(result?.errors), resourceId: input.resourceId, result, sideEffect: 'Validation invokes compilation but does not apply or persist a replacement.' }, null, 2))]);
+        } catch (error: any) {
+            return new vscode.LanguageModelToolResult([new vscode.LanguageModelTextPart(JSON.stringify({ available: true, valid: false, resourceId: input.resourceId, diagnostics: error?.message ?? String(error), sideEffect: 'No shader replacement was applied.' }, null, 2))]);
+        }
+    }
+    async prepareInvocation(): Promise<vscode.PreparedToolInvocation> { return { invocationMessage: 'Validating shader edit without applying it…' }; }
+}
+
+export class ApplyShaderEditTool implements vscode.LanguageModelTool<ValidateShaderEditInput> {
+    async invoke(options: vscode.LanguageModelToolInvocationOptions<ValidateShaderEditInput>): Promise<vscode.LanguageModelToolResult> {
+        if (!_bridge.hasNativeBridge()) return new vscode.LanguageModelToolResult([new vscode.LanguageModelTextPart(JSON.stringify({ available: false, reason: 'Applying a shader edit requires the native replay bridge.' }, null, 2))]);
+        const input = options.input;
+        try {
+            const applied = await _bridge.nativeApplyShaderEdit({ resourceId: input.resourceId, shaderStage: input.shaderStage, sourceEncoding: input.sourceEncoding, entryPoint: input.entryPoint, entryFileIndex: input.entryFileIndex ?? 0, compileFlags: input.compileFlags ?? [], files: input.files });
+            const replay = applied.applied ? await _bridge.nativeTryReplay() : undefined;
+            return new vscode.LanguageModelToolResult([new vscode.LanguageModelTextPart(JSON.stringify({ available: true, resourceId: input.resourceId, applied: applied.applied, applyResult: applied, replay: replay ? { ok: replay.replay, remote: replay.replayRemote, host: replay.replayHost, error: replay.replayError } : null, sideEffect: 'The replacement was applied to the active replay session. It is not written to the capture file.' }, null, 2))]);
+        } catch (error: any) {
+            return new vscode.LanguageModelToolResult([new vscode.LanguageModelTextPart(JSON.stringify({ available: true, applied: false, resourceId: input.resourceId, error: error?.message ?? String(error), sideEffect: 'The shader replacement was not confirmed as applied.' }, null, 2))]);
+        }
+    }
+    async prepareInvocation(): Promise<vscode.PreparedToolInvocation> { return { invocationMessage: 'Applying shader edit and validating the active replay…' }; }
+}
+
+export class GetSessionStateTool implements vscode.LanguageModelTool<Record<string, never>> {
+    async invoke(): Promise<vscode.LanguageModelToolResult> {
+        return new vscode.LanguageModelToolResult([new vscode.LanguageModelTextPart(JSON.stringify(_getSessionState?.() ?? { phase: 'idle' }, null, 2))]);
+    }
+    async prepareInvocation(): Promise<vscode.PreparedToolInvocation> {
+        return { invocationMessage: 'Reading the current RenderDoc application session…' };
+    }
+}
+
+export class CloseSessionTool implements vscode.LanguageModelTool<Record<string, never>> {
+    async invoke(): Promise<vscode.LanguageModelToolResult> {
+        if (!_closeSession) throw new Error('Session control is not initialized.');
+        return new vscode.LanguageModelToolResult([new vscode.LanguageModelTextPart(JSON.stringify(await _closeSession(), null, 2))]);
+    }
+    async prepareInvocation(): Promise<vscode.PreparedToolInvocation> {
+        return { invocationMessage: 'Closing the active RenderDoc application session…' };
+    }
+}
+
+export class CaptureFrameTool implements vscode.LanguageModelTool<TriggerRemoteCaptureInput> {
+    async invoke(options: vscode.LanguageModelToolInvocationOptions<TriggerRemoteCaptureInput>): Promise<vscode.LanguageModelToolResult> {
+        if (!_captureFrame) throw new Error('Capture workflow is not initialized.');
+        const result = await _captureFrame(options.input ?? {});
+        return new vscode.LanguageModelToolResult([new vscode.LanguageModelTextPart(JSON.stringify(result, null, 2))]);
+    }
+    async prepareInvocation(): Promise<vscode.PreparedToolInvocation> { return { invocationMessage: 'Capturing a frame from the active RenderDoc session…' }; }
+}
+
+export class DiagnoseEnvironmentTool implements vscode.LanguageModelTool<Record<string, never>> {
+    async invoke(): Promise<vscode.LanguageModelToolResult> {
+        if (!_diagnoseEnvironment) throw new Error('Environment diagnostics are not initialized.');
+        const result = { environment: await _diagnoseEnvironment(), mcp: _getMcpStatus?.() ?? { available: false, reason: 'MCP status provider is not initialized.' } };
+        return new vscode.LanguageModelToolResult([new vscode.LanguageModelTextPart(JSON.stringify(result, null, 2))]);
+    }
+    async prepareInvocation(): Promise<vscode.PreparedToolInvocation> { return { invocationMessage: 'Diagnosing RenderDoc, replay, MCP, and Android environment…' }; }
+}
+
+export class CheckAndroidLaunchReadinessTool implements vscode.LanguageModelTool<AndroidReadinessInput> {
+    async invoke(options: vscode.LanguageModelToolInvocationOptions<AndroidReadinessInput>): Promise<vscode.LanguageModelToolResult> {
+        if (!_checkAndroidReadiness) throw new Error('Android readiness support is not initialized.');
+        const result = await _checkAndroidReadiness(options.input);
+        return new vscode.LanguageModelToolResult([new vscode.LanguageModelTextPart(JSON.stringify(result, null, 2))]);
+    }
+    async prepareInvocation(): Promise<vscode.PreparedToolInvocation> {
+        return { invocationMessage: 'Checking adb, Android devices, package installation, and RenderDoc target readiness…' };
+    }
+}
+
+export class LaunchWindowsApplicationTool implements vscode.LanguageModelTool<WindowsLaunchInput> {
+    async invoke(options: vscode.LanguageModelToolInvocationOptions<WindowsLaunchInput>): Promise<vscode.LanguageModelToolResult> {
+        if (!_launchWindowsApplication) throw new Error('Windows launch support is not initialized.');
+        const result = await _launchWindowsApplication(options.input);
+        return new vscode.LanguageModelToolResult([new vscode.LanguageModelTextPart(JSON.stringify(result, null, 2))]);
+    }
+    async prepareInvocation(options: vscode.LanguageModelToolInvocationPrepareOptions<WindowsLaunchInput>): Promise<vscode.PreparedToolInvocation> {
+        return { invocationMessage: `Launching Windows application ${path.basename(options.input?.executablePath ?? '')}…` };
+    }
+}
+
+export class ListCaptureTargetsTool implements vscode.LanguageModelTool<Record<string, never>> {
+    async invoke(): Promise<vscode.LanguageModelToolResult> {
+        const targets = _listCaptureTargets ? await _listCaptureTargets() : [];
+        return new vscode.LanguageModelToolResult([
+            new vscode.LanguageModelTextPart(JSON.stringify({ targets }, null, 2)),
+        ]);
+    }
+
+    async prepareInvocation(): Promise<vscode.PreparedToolInvocation> {
+        return { invocationMessage: 'Listing connected RenderDoc capture targets…' };
+    }
+}
+
+export class LaunchRemoteApplicationTool implements vscode.LanguageModelTool<LaunchRemoteApplicationInput> {
+    async invoke(options: vscode.LanguageModelToolInvocationOptions<LaunchRemoteApplicationInput>): Promise<vscode.LanguageModelToolResult> {
+        if (!_launchRemoteApplication) {
+            throw new Error('Remote launch support is not initialized.');
+        }
+        const result = await _launchRemoteApplication(options.input);
+        return new vscode.LanguageModelToolResult([
+            new vscode.LanguageModelTextPart(JSON.stringify(result, null, 2)),
+        ]);
+    }
+
+    async prepareInvocation(options: vscode.LanguageModelToolInvocationPrepareOptions<LaunchRemoteApplicationInput>): Promise<vscode.PreparedToolInvocation> {
+        return { invocationMessage: `Launching Android application ${options.input?.packageActivity ?? ''}…` };
+    }
+}
+
+export class TriggerRemoteCaptureTool implements vscode.LanguageModelTool<TriggerRemoteCaptureInput> {
+    async invoke(options: vscode.LanguageModelToolInvocationOptions<TriggerRemoteCaptureInput>): Promise<vscode.LanguageModelToolResult> {
+        if (!_triggerRemoteCapture) {
+            throw new Error('Remote capture support is not initialized.');
+        }
+        const result = await _triggerRemoteCapture(options.input ?? {});
+        return new vscode.LanguageModelToolResult([
+            new vscode.LanguageModelTextPart(JSON.stringify(result, null, 2)),
+        ]);
+    }
+
+    async prepareInvocation(): Promise<vscode.PreparedToolInvocation> {
+        return { invocationMessage: 'Capturing a frame from the active remote application…' };
+    }
 }
 
 function requireCapturePath(): string {
@@ -129,6 +669,9 @@ interface GetDrawCallsInput {
     eventIdMin?: number;
     /** Only include events with eventId <= this value. */
     eventIdMax?: number;
+    sortByDuration?: boolean;
+    excludeDebugMarkers?: boolean;
+    excludeEmptyOperations?: boolean;
 }
 
 interface GetActionTimingsInput {
@@ -181,6 +724,22 @@ export class GetDrawCallsTool implements vscode.LanguageModelTool<GetDrawCallsIn
     ): Promise<vscode.PreparedToolInvocation> {
         return { invocationMessage: 'Loading draw calls…' };
     }
+}
+
+export class BuildEventBrowserContextTool implements vscode.LanguageModelTool<GetDrawCallsInput> {
+    async invoke(options: vscode.LanguageModelToolInvocationOptions<GetDrawCallsInput>): Promise<vscode.LanguageModelToolResult> {
+        const filePath = requireCapturePath();
+        let drawCalls = _getCurrentDrawCalls().length ? _getCurrentDrawCalls() : await _bridge.getDrawCalls(filePath);
+        const input = options.input ?? {};
+        drawCalls = filterDrawCallsAdvanced(drawCalls, { markerFilter: input.markerFilter, excludeMarkers: input.excludeMarkers, onlyDrawCalls: input.onlyDrawCalls, eventIdMin: input.eventIdMin, eventIdMax: input.eventIdMax, excludeDebugMarkers: input.excludeDebugMarkers, excludeEmptyOperations: input.excludeEmptyOperations });
+        if (input.filter) drawCalls = filterDrawCalls(drawCalls, input.filter.toLowerCase());
+        const rows: any[] = [];
+        const flatten = (items: DrawCall[]) => items.forEach((item) => { rows.push({ eventId: item.eventId, name: item.name, flags: item.flags, durationUs: item.durationUs ?? null, numIndices: item.numIndices, numInstances: item.numInstances }); if (item.children?.length) flatten(item.children); });
+        flatten(drawCalls);
+        if (input.sortByDuration) rows.sort((a, b) => (b.durationUs ?? -1) - (a.durationUs ?? -1));
+        return new vscode.LanguageModelToolResult([new vscode.LanguageModelTextPart(JSON.stringify({ capturePath: filePath, filters: input, matchedEvents: rows.length, events: rows.slice(0, 500), aiContext: `RenderDoc event context: ${rows.length} filtered events. Focus on EIDs, flags, names, GPU duration, indices, and instances; request pipeline/shader/resource evidence before inferring a cause.` }, null, 2))]);
+    }
+    async prepareInvocation(): Promise<vscode.PreparedToolInvocation> { return { invocationMessage: 'Building filtered Event Browser context for analysis…' }; }
 }
 
 export class GetActionTimingsTool implements vscode.LanguageModelTool<GetActionTimingsInput> {
@@ -902,6 +1461,8 @@ interface AdvancedFilterOptions {
     onlyDrawCalls?: boolean;
     eventIdMin?: number;
     eventIdMax?: number;
+    excludeDebugMarkers?: boolean;
+    excludeEmptyOperations?: boolean;
 }
 
 /** Returns true if the flags string indicates a real GPU operation (not a marker/group). */
@@ -1726,9 +2287,11 @@ function filterDrawCallsAdvanced(drawCalls: DrawCall[], opts: AdvancedFilterOpti
         const passesEventIdMax = opts.eventIdMax === undefined || dc.eventId <= opts.eventIdMax;
         const passesOnlyDrawCalls = !opts.onlyDrawCalls || isRealDrawCall(dc.flags);
         const passesExcludeMarkers = !opts.excludeMarkers || !isMarkerGroup(dc);
+        const passesExcludeDebug = !opts.excludeDebugMarkers || !isDebugMarker(dc);
+        const passesExcludeEmpty = !opts.excludeEmptyOperations || !isEmptyOperation(dc);
         const passesMarkerFilter = !markerLower || inMarkerScope || filteredChildren.length > 0;
 
-        if (passesEventIdMin && passesEventIdMax && passesOnlyDrawCalls && passesExcludeMarkers && passesMarkerFilter) {
+        if (passesEventIdMin && passesEventIdMax && passesOnlyDrawCalls && passesExcludeMarkers && passesExcludeDebug && passesExcludeEmpty && passesMarkerFilter) {
             // Produce a copy with filtered children
             result.push({ ...dc, children: filteredChildren });
         } else if (filteredChildren.length > 0) {
@@ -1737,6 +2300,15 @@ function filterDrawCallsAdvanced(drawCalls: DrawCall[], opts: AdvancedFilterOpti
         }
     }
     return result;
+}
+
+function isDebugMarker(dc: DrawCall): boolean {
+    const name = dc.name.toLowerCase();
+    return isMarkerGroup(dc) && (name.includes('debug') || name.includes('marker') || name.startsWith('rdoc'));
+}
+
+function isEmptyOperation(dc: DrawCall): boolean {
+    return !dc.children?.length && isRealDrawCall(dc.flags) && (dc.numIndices ?? 0) === 0 && (dc.numInstances ?? 0) === 0;
 }
 
 function findDrawCallByEventId(drawCalls: DrawCall[], eventId: number): DrawCall | undefined {
@@ -3459,6 +4031,30 @@ function findFirstLeaf(event: DrawCall): DrawCall | null {
         return event;
     }
     return findFirstLeaf(event.children[0]);
+}
+
+export interface LaunchRemoteApplicationInput {
+    targetUrl?: string;
+    targetQuery?: string;
+    packageActivity: string;
+    commandLine?: string;
+}
+
+export interface TriggerRemoteCaptureInput {
+    trigger?: TriggerCaptureOptions['trigger'];
+    frameNumber?: number;
+    delaySeconds?: number;
+}
+
+export interface AndroidReadinessInput {
+    packageName: string;
+    targetQuery?: string;
+}
+
+export interface WindowsLaunchInput {
+    executablePath: string;
+    workingDir?: string;
+    commandLine?: string;
 }
 
 function buildPassId(name: string, eventIdStart: number, eventIdEnd: number): string {

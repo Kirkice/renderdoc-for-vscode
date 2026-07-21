@@ -1,0 +1,8 @@
+CMake Warning:
+  Ignoring extra path from command line:
+
+   "ninja.exe"
+
+
+CMake Error: Unknown argument --version;
+CMake Error: Run 'cmake --help' for all supported options.

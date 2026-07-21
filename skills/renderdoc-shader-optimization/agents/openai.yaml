@@ -1,0 +1,4 @@
+interface:
+  display_name: "RenderDoc Shader Optimization"
+  short_description: "Review shader variants and evidence-based optimization targets."
+  default_prompt: "Use $renderdoc-shader-optimization to inspect shader variants, bindings, source, and measured GPU evidence."

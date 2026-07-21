@@ -1,0 +1,4 @@
+interface:
+  display_name: RenderDoc Resource Memory Audit
+  short_description: Audit captured resource memory footprint
+  default_prompt: Analyze the current RenderDoc capture's largest resources and explain the memory footprint with evidence and limitations.

@@ -29,9 +29,14 @@ jobs:
       - name: Compile TypeScript
         run: npm run compile
 
-      - name: Configure native bridge
+      - name: Set up MSVC build environment
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Configure native bridge (CMake + Ninja)
         working-directory: native
-        run: cmake -B build -G "Visual Studio 17 2022" -A x64
+        run: cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
 
       - name: Build native bridge
         working-directory: native

@@ -1,0 +1,4 @@
+interface:
+  display_name: "RenderDoc Capture Diff"
+  short_description: "Compare two GPU captures and resource changes."
+  default_prompt: "Use $renderdoc-capture-diff to compare the baseline and candidate RenderDoc captures with evidence-first reporting."

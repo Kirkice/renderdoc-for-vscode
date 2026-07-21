@@ -105,6 +105,8 @@ export type LaunchCaptureResult = LiveTargetInfo;
 export interface TriggerCaptureResult extends LiveTargetInfo {
     capturePath: string;
     frameNumber?: number;
+    loadedIntoInspector?: boolean;
+    replayStatus?: 'none' | 'active' | 'failed' | 'unavailable';
 }
 
 export interface LiveCaptureEntry {

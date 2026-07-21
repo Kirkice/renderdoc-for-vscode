@@ -1,0 +1,4 @@
+interface:
+  display_name: "RenderDoc App Launch and Capture"
+  short_description: "Launch Windows or Android apps and capture frames."
+  default_prompt: "Use $renderdoc-app-launch-capture to launch the requested app on the correct platform and capture a frame from its RenderDoc session."

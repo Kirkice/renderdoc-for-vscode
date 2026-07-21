@@ -9,6 +9,19 @@ export type SelectedLaunchTarget =
     | { kind: 'local' }
     | { kind: 'device'; url: string };
 
+export type LiveSessionPhase = 'idle' | 'checking' | 'ready' | 'launching' | 'running' | 'capturing' | 'completed' | 'failed';
+
+export interface LiveSessionState {
+    phase: LiveSessionPhase;
+    platform: 'windows' | 'android' | 'unknown';
+    target?: LiveTargetInfo;
+    targetUrl?: string;
+    application?: string;
+    lastCapture?: LiveCaptureEntry;
+    error?: { code?: string; message: string; recoverable: boolean };
+    updatedAt: string;
+}
+
 export class LaunchTargetState {
     private readonly _onDidChange = new vscode.EventEmitter<void>();
     readonly onDidChange = this._onDidChange.event;
@@ -24,6 +37,7 @@ export class LaunchTargetState {
     private refreshing = false;
     private lastRefreshError: string | undefined;
     private refreshGeneration = 0;
+    private session: LiveSessionState = { phase: 'idle', platform: 'unknown', updatedAt: new Date().toISOString() };
 
     constructor(private readonly context: vscode.ExtensionContext) {
         const persisted = context.workspaceState.get<string>(STATE_KEY);
@@ -82,6 +96,35 @@ export class LaunchTargetState {
         return this.lastRefreshError;
     }
 
+    getSessionState(): LiveSessionState {
+        return {
+            ...this.session,
+            target: this.liveTarget ?? this.session.target,
+            lastCapture: this.session.lastCapture ?? this.recentCaptures[0],
+        };
+    }
+
+    setSessionState(update: Partial<LiveSessionState>): void {
+        const nextPhase = update.phase ?? this.session.phase;
+        if (!isValidSessionTransition(this.session.phase, nextPhase)) {
+            console.warn(`[RenderDoc] Ignoring invalid session transition ${this.session.phase} -> ${nextPhase}.`);
+            return;
+        }
+        this.session = { ...this.session, ...update, updatedAt: new Date().toISOString() };
+        this._onDidChange.fire();
+    }
+
+    setSessionError(code: string, message: string, recoverable = true): void {
+        this.session = { ...this.session, phase: 'failed', error: { code, message, recoverable }, updatedAt: new Date().toISOString() };
+        this._onDidChange.fire();
+    }
+
+    clearSession(): void {
+        this.liveTarget = undefined;
+        this.session = { phase: 'idle', platform: 'unknown', updatedAt: new Date().toISOString() };
+        this._onDidChange.fire();
+    }
+
     async refresh(bridge: RenderDocBridge): Promise<void> {
         const generation = ++this.refreshGeneration;
         this.refreshing = true;
@@ -136,6 +179,13 @@ export class LaunchTargetState {
 
     setLiveTarget(target: LiveTargetInfo | undefined): void {
         this.liveTarget = target;
+        this.session = {
+            ...this.session,
+            phase: target ? 'running' : 'idle',
+            platform: target?.local ? 'windows' : (target ? 'android' : 'unknown'),
+            target,
+            updatedAt: new Date().toISOString(),
+        };
         this._onDidChange.fire();
     }
 
@@ -156,6 +206,7 @@ export class LaunchTargetState {
 
     addRecentCapture(capture: LiveCaptureEntry): void {
         this.recentCaptures = [capture, ...this.recentCaptures.filter((entry) => entry.id !== capture.id)].slice(0, 12);
+        this.session = { ...this.session, phase: 'completed', lastCapture: capture };
         this._onDidChange.fire();
     }
 
@@ -180,4 +231,19 @@ export class LaunchTargetState {
         await this.context.workspaceState.update(STATE_KEY, url);
         this._onDidChange.fire();
     }
+}
+
+function isValidSessionTransition(from: LiveSessionPhase, to: LiveSessionPhase): boolean {
+    if (from === to) return true;
+    const allowed: Record<LiveSessionPhase, LiveSessionPhase[]> = {
+        idle: ['checking', 'launching', 'running'],
+        checking: ['ready', 'launching', 'failed', 'idle'],
+        ready: ['launching', 'running', 'capturing', 'failed', 'idle'],
+        launching: ['running', 'ready', 'failed', 'idle'],
+        running: ['capturing', 'completed', 'failed', 'idle'],
+        capturing: ['completed', 'running', 'failed', 'idle'],
+        completed: ['capturing', 'running', 'launching', 'failed', 'idle'],
+        failed: ['checking', 'launching', 'running', 'capturing', 'idle'],
+    };
+    return allowed[from].includes(to);
 }
