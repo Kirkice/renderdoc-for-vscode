@@ -71,7 +71,7 @@
 
 - [x] 增加 `renderdoc_diagnoseEnvironment`。实现：[`src/copilot/toolRegistry.ts`](../src/copilot/toolRegistry.ts)、[`src/copilot/tools.ts`](../src/copilot/tools.ts)、[`src/extension.ts`](../src/extension.ts)。
 - [x] 检查 Native Bridge、Replay、当前 Session、adb 和 RenderDoc targets。
-- [ ] 检查 MCP endpoint、端口和连接状态。
+- [x] 检查 MCP endpoint、端口和连接状态。
 - [x] 检查 adb 版本和 RenderDoc Android targets。
 - [ ] 输出可复制的诊断报告 Markdown/JSON。
 
@@ -83,7 +83,7 @@
 - [x] 自动收集当前 Capture 和 GPU Timings，并输出热点摘要。实现：[`src/copilot/tools.ts`](../src/copilot/tools.ts)。
 - [x] 按 marker/pass 聚合耗时。
 - [x] 找出 Top N 热点 pass 和 leaf draw。
-- [x] 对热点补充 event/EID 和 GPU timing 证据，并给出后续 mesh/shader/resource 验证路径。
+- [x] 对热点自动补充 EID、GPU timing、Mesh、Shader 和 Resource 证据。
 - [x] 区分确认事实、推断原因、后续验证项。
 - [ ] 支持 Markdown 和 JSON 导出。
 - [ ] 新增 `renderdoc-performance-report` Skill。
@@ -116,6 +116,7 @@
 - [x] 增加 `renderdoc_findShaderVariants`。实现：[`src/copilot/toolRegistry.ts`](../src/copilot/toolRegistry.ts)、[`src/copilot/tools.ts`](../src/copilot/tools.ts)。
 - [x] 增加 `renderdoc_compareShaders`，提供跨 event 的结构化 Shader payload 对比。实现：[`src/copilot/toolRegistry.ts`](../src/copilot/toolRegistry.ts)、[`src/copilot/tools.ts`](../src/copilot/tools.ts)。
 - [x] 增加 `renderdoc_validateShaderEdit`。
+- [x] 增加 `renderdoc_applyShaderEdit`，应用替换后执行 replay 验证；不修改 RDC 文件。
 - [x] 增加 `renderdoc_getShaderCompileDiagnostics`，报告 Capture 中的 compiler metadata、entry point、flags 和 source availability。实现：[`src/copilot/toolRegistry.ts`](../src/copilot/toolRegistry.ts)、[`src/copilot/tools.ts`](../src/copilot/tools.ts)。
 - [ ] 结合 Shader source、bindings、constant buffers、timings 和 Mali 分析。
 - [x] 新增 `renderdoc-shader-optimization` Skill。实现：[`skills/renderdoc-shader-optimization/SKILL.md`](../skills/renderdoc-shader-optimization/SKILL.md)。
@@ -172,7 +173,7 @@
 
 - [ ] TypeScript typecheck。
 - [ ] ESLint 全绿。
-- [ ] Native Bridge 构建。
+- [x] Native Bridge 构建：使用 MinGW/GCC + Ninja 在 `native/build-release` 完成 Release 构建。
 - [ ] RDC parser 测试。
 - [ ] MCP tool parity 测试。
 - [ ] MCP runtime smoke 测试。

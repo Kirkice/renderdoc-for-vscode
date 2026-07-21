@@ -24,8 +24,14 @@ if(WIN32)
         WIN32_LEAN_AND_MEAN
         NOMINMAX
     )
-    # Suppress warnings from RenderDoc and nlohmann headers
-    target_compile_options(renderdoc_bridge PRIVATE /W3 /wd4267 /wd4244 /wd4996 /bigobj)
+    # Suppress warnings from RenderDoc and nlohmann headers when using MSVC.
+    # MinGW/GCC is also supported for local validation, but does not understand
+    # MSVC's slash-prefixed warning flags.
+    if(MSVC)
+        target_compile_options(renderdoc_bridge PRIVATE /W3 /wd4267 /wd4244 /wd4996 /bigobj)
+    else()
+        target_compile_options(renderdoc_bridge PRIVATE -Wall -Wextra -Wno-sign-conversion)
+    endif()
 endif()
 
 # Release optimizations
