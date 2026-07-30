@@ -74,13 +74,13 @@ A C++ bridge (`renderdoc_bridge.exe`) links directly to RenderDoc's replay DLL �
 <td width="50%" valign="top">
 
 ### AI-Powered Frame Analysis (MCP)
-Connect any MCP-capable AI client to the local **RenderDoc For VSCode MCP** endpoint. The server exposes 29 specialized tools — including on-demand action timings, shader and constant-buffer inspection, resource reverse lookups, project-source mapping, Mali shader analysis results, resource usage tracing, pipeline state diffing, hot event analysis, and pass graph generation.
+Connect any MCP-capable AI client to the local **RenderDoc For VSCode MCP** endpoint. The server exposes **60 schema-validated tools** for capture/session control, replay inspection, performance evidence, shader diagnostics, resource tracing, Capture comparison, investigation reports, and bookmarks.
 
 </td>
 <td width="50%" valign="top">
 
 ### Mali Offline Compiler Integration
-Analyze any shader directly from the Inspector's Shaders tab using the **Mali Offline Compiler** (`malioc`). Results are shown in a resizable side-by-side panel alongside the shader source, and are also exposed to MCP clients for AI-assisted optimization advice.
+Analyze any shader directly from the Inspector's Shaders tab using the **Mali Offline Compiler** (`malioc`). Results are shown in a resizable side-by-side panel alongside the shader source; MCP workflows identify the relevant shader/EID evidence and keep offline-compiler validation separate from capture facts.
 
 </td>
 </tr>
@@ -264,7 +264,23 @@ Navigation:
 
 ### 7 · AI-Powered Analysis via MCP
 
-Connect any MCP-capable AI client (Cline, Roo Code, Zoo Code, Claude Code, etc.) to the local **RenderDoc For VSCode MCP** endpoint exposed by this extension. The default endpoint is `http://127.0.0.1:38967/mcp`, but you should prefer the actual URL shown in the sidebar GUI because the configured port can differ. In the **Capture Target** view, the **Local MCP** card shows the current status. Click **MCP Info** to inspect or copy the endpoint, or run **RenderDoc: Show RenderDoc For VSCode MCP Info**.
+Connect any MCP-capable AI client (Cline, Roo Code, Zoo Code, Claude Code, Codex/CodeX, etc.) to the local **RenderDoc For VSCode MCP** endpoint exposed by this extension. The default endpoint is `http://127.0.0.1:38967/mcp`, but you should prefer the actual URL shown in the sidebar GUI because the configured port can differ. In the **Capture Target** view, the **Local MCP** card shows the current status. Click **MCP Info** to inspect or copy the endpoint, or run **RenderDoc: Show RenderDoc For VSCode MCP Info**.
+
+#### What the MCP Server Exposes
+
+The MCP server is the automation and AI-analysis surface of the extension. It exposes **60 tools**, all registered from one shared schema registry. Inputs are validated before execution; invalid input returns `INVALID_TOOL_INPUT` rather than being silently guessed.
+
+- **Evidence-first analysis:** performance conclusions are grounded in EIDs, GPU timing, resources, pipeline state, shader metadata, bindings, constant buffers, and mesh data. Responses distinguish confirmed facts, inferences, and follow-up validation.
+- **Safe large-data access:** resources are paginated; timing, mesh, buffer, and texture responses have bounded output. Large texture base64 payloads are summarized instead of dumped into the client context.
+- **Live workflow control:** launch a Windows or Android application, wait for a live target/capture, capture a frame, inspect Session state, and close the Session. The high-level workflow tools are preferred; platform-specific tools remain available for diagnosis and explicit target control.
+- **Structured recovery:** launch and capture failures expose an error code, recoverability, and next actions. Use `renderdoc_diagnoseEnvironment` for bridge, replay, MCP, `adb`, target, and device diagnostics.
+- **Explicit side effects:** launch, capture, close-session, shader application, bookmark edits, and report export change state. An agent must confirm returned status, saved output path where applicable, and Session impact before reporting success.
+
+Recommended first prompt:
+
+```text
+Open the current RenderDoc capture, summarize the frame's top-level passes, identify timed hotspots when available, and clearly separate confirmed evidence from follow-up checks.
+```
 
 #### External MCP Client Setup
 
@@ -315,12 +331,6 @@ Common gotchas:
 - If a client offers both `stdio` and HTTP transports, use HTTP / `streamable-http` for this extension.
 - If you changed `renderdoc.mcpServer.port`, update the URL in the client config to match.
 
-Recommended first test prompt for teammates:
-
-```text
-Open the current RenderDoc capture, summarize the top-level passes in this frame, and if capture state is unknown call renderdoc_openCapture first with no filePath.
-```
-
 Typical prompts for your MCP client:
 
 ```text
@@ -336,30 +346,40 @@ Which textures are bound at the currently selected draw?
 
 The MCP tools can use your **active Inspector selection** (focused EID, draw call, sidebar resource), so natural references like *"this draw"* or *"the current event"* resolve automatically.
 
-Available MCP tools (29 total):
+#### MCP Tool Catalog (60 tools)
 
-Context and overview:
+**Capture, Session, and environment workflow**
 
 | Tool | Description |
 | ---- | ----------- |
 | `renderdoc_openCapture` | Resolve the active or open `.rdc` in this VS Code window, or load a specific capture by `filePath` |
+| `renderdoc_launchApplication` | High-level Windows/Android launch workflow; requires an explicit platform rather than guessing |
+| `renderdoc_captureFrame` | Capture a frame from the active local or remote Session, save it, and load it into the Inspector |
+| `renderdoc_getSessionState` | Read the active Session phase, platform, target, application, latest capture, and recoverable error data |
+| `renderdoc_waitForLiveTarget` / `renderdoc_waitForCapture` | Wait for a live target or a completed capture instead of polling from the client |
+| `renderdoc_closeSession` | Disconnect the active live Session without deleting saved captures |
+| `renderdoc_diagnoseEnvironment` | Report native bridge, replay, MCP, `adb`, Android device, and RenderDoc target readiness; export JSON or Markdown |
+| `renderdoc_checkAndroidLaunchReadiness` | Validate `adb`, device state, package/activity, and RenderDoc target before Android launch |
+| `renderdoc_launchWindowsApplication` | Platform-specific local Windows launch for diagnostics or explicit control |
+| `renderdoc_listCaptureTargets` / `renderdoc_launchRemoteApplication` / `renderdoc_triggerRemoteCapture` | Enumerate remote targets, launch an Android package/activity, and capture from that remote target |
+
+**Context, events, replay, and timings**
+
+| Tool | Description |
+| ---- | ----------- |
 | `renderdoc_getSelectionContext` | Current Inspector focus: selected EID, draw call, sidebar resource, replay status, and related context |
 | `renderdoc_getCaptureInfo` | Capture metadata: API, driver, version, file sections, and capture summary |
 | `renderdoc_getFrameSummary` | High-level frame structure: top-level passes/markers, draw counts, and capture stats |
 | `renderdoc_analyzeFrame` | Holistic frame analysis with flagged issues and suggested next inspection steps |
 | `renderdoc_getReplayStatus` | Query replay state and available capabilities before calling replay-dependent tools |
-
-Events and timings:
-
-| Tool | Description |
-| ---- | ----------- |
 | `renderdoc_getDrawCalls` | Full draw call tree with marker hierarchy, filtering, and `durationUs` when timings are available |
 | `renderdoc_getActionTimings` | Fetch GPU timings on demand, optionally filtered by event IDs or marker groups |
 | `renderdoc_getEventDetails` | Full details for one EID, including richer pipeline context when replay is active |
 | `renderdoc_getEventChunks` | API-level event chunks (draw calls, state changes) for a specific event ID |
 | `renderdoc_getPipelineState` | Complete pipeline state at a given EID |
+| `renderdoc_buildEventBrowserContext` | Filter and compact event-browser evidence for an AI analysis workflow |
 
-Shaders and resources:
+**Shaders, pipeline bindings, geometry, and resources**
 
 | Tool | Description |
 | ---- | ----------- |
@@ -372,8 +392,9 @@ Shaders and resources:
 | `renderdoc_getTextureData` | Texture pixel data sampled at a specific event/mip and returned as PNG data |
 | `renderdoc_getBufferContents` | Raw bytes from a GPU buffer with offset/length paging |
 | `renderdoc_getCurrentDrawPreview` | Preview image of the current draw call output at a specific event ID |
+| `renderdoc_getMeshData` | Bounded mesh rows, topology, vertex attributes, and instance data for an EID |
 
-Reverse lookups and source mapping:
+**Reverse lookups, source mapping, and shader editing**
 
 | Tool | Description |
 | ---- | ----------- |
@@ -381,18 +402,28 @@ Reverse lookups and source mapping:
 | `renderdoc_findDrawsByTexture` | Reverse-search draw calls by sampled texture name |
 | `renderdoc_findDrawsByResourceId` | Reverse-search draw calls by exact resource ID |
 | `renderdoc_findProjectImplementation` | Search the open workspace for likely shader/pass implementation files related to a capture event |
+| `renderdoc_findShaderVariants` | Find captured shader resources whose names or IDs match a shader query |
+| `renderdoc_compareShaders` | Compare captured shader payload structure at two events without claiming semantic equivalence |
+| `renderdoc_getShaderCompileDiagnostics` | Read captured compiler metadata, entry points, flags, and source availability |
+| `renderdoc_validateShaderEdit` / `renderdoc_applyShaderEdit` | Validate a replacement shader, or apply it to the live replay Session without modifying the RDC file |
 
-Advanced analysis:
+**Performance, memory, comparison, and investigation**
 
 | Tool | Description |
 | ---- | ----------- |
 | `renderdoc_traceResourceUsage` | Trace how a resource is used across the frame, identifying producers (writes) and consumers (reads) |
 | `renderdoc_diffPipelineState` | Compare pipeline state between two events and identify differences in shaders, render targets, and state |
-| `renderdoc_analyzeHotEvent` | Comprehensive analysis of a hot event including timing, pipeline state, resources, and optional shader/mesh data |
 | `renderdoc_getPassGraph` | Build a graph of render passes from the draw call hierarchy, including timing, resource usage, and dependency edges |
-| `renderdoc_getMeshData` | Mesh data for one event and mesh stage, including topology, attributes, and sampled rows |
+| `renderdoc_generatePerformanceReport` | Produce an evidence-based hotspot report with optional JSON/Markdown export |
+| `renderdoc_analyzeHotEvent` | Comprehensive timing, pipeline, resource, shader, and optional mesh evidence for a hot EID |
+| `renderdoc_resourceMemoryAudit` | Rank resources by byte size and summarize capture footprint |
+| `renderdoc_getResourceLifetime` / `renderdoc_findUnusedResources` | Return lifecycle evidence and conservative unused-resource candidates with limitations |
+| `renderdoc_findResourceLeaks` / `renderdoc_compareResourceMemory` | Compare captures for persistent resource candidates and memory-footprint differences |
+| `renderdoc_compareCaptures` / `renderdoc_compareEventTimings` | Compare Capture metadata/resources and existing timing evidence without fabricating replay timings |
+| `renderdoc_addBookmark` / `renderdoc_listBookmarks` / `renderdoc_updateBookmark` / `renderdoc_removeBookmark` | Persist and manage investigation notes, EIDs, conclusions, and screenshot references |
+| `renderdoc_exportInvestigationReport` | Export capture metadata, bookmarks, performance hotspots, and resource footprint as Markdown or JSON |
 
-The MCP server includes built-in workflow instructions that guide AI clients through the optimal analysis path: selection context first, frame overview, performance drill-down, shader/texture/buffer inspection, and project source mapping.
+The MCP server includes workflow instructions that guide compatible agents through capture resolution, selection context, frame overview, performance drill-down, shader/texture/buffer inspection, and project-source mapping. Skill files express recommended workflow and recovery constraints; MCP tools execute the deterministic operations.
 
 ---
 
@@ -423,7 +454,7 @@ The MCP server includes built-in workflow instructions that guide AI clients thr
 │                        VS Code Extension Host                        │
 │  ┌──────────────┐   ┌──────────────────┐   ┌──────────────────────┐  │
 │  │   Sidebar    │   │    Inspector     │   │    MCP Server        │  │
-│  │   Views      │   │    Webview       │   │  (29 tools, HTTP)    │  │
+│  │   Views      │   │    Webview       │   │  (60 tools, HTTP)    │  │
 │  └──────┬───────┘   └────────┬─────────┘   └──────────┬───────────┘  │
 │         └────────────────────┼────────────────────────┘              │
 │                              ▼                                       │
