@@ -115,12 +115,31 @@ function serializeToolResult(result: vscode.LanguageModelToolResult): { text: st
     return { text };
 }
 
-async function invokeLanguageModelTool(tool: vscode.LanguageModelTool<any>, input: Record<string, unknown>): Promise<McpCallToolResult> {
+async function invokeLanguageModelTool(
+    tool: vscode.LanguageModelTool<any>,
+    input: Record<string, unknown>,
+    inputSchema?: { safeParse(value: unknown): { success: true; data: unknown } | { success: false; error: { issues: unknown[] } } },
+): Promise<McpCallToolResult> {
     const tokenSource = new vscode.CancellationTokenSource();
 
     try {
+        const parsedInput = inputSchema?.safeParse(input);
+        if (parsedInput && !parsedInput.success) {
+            return {
+                isError: true,
+                content: [{
+                    type: 'text',
+                    text: JSON.stringify({
+                        code: 'INVALID_TOOL_INPUT',
+                        message: 'The tool input failed schema validation.',
+                        issues: parsedInput.error.issues,
+                    }, null, 2),
+                }],
+            };
+        }
+
         const result = await tool.invoke(
-            { input } as vscode.LanguageModelToolInvocationOptions<any>,
+            { input: parsedInput?.success ? parsedInput.data : input } as vscode.LanguageModelToolInvocationOptions<any>,
             tokenSource.token,
         );
         if (!result) {
@@ -227,6 +246,10 @@ export class RenderDocMcpServer implements vscode.Disposable {
                         '',
                         'Core rules:',
                         '- All capture facts must come from renderdoc_* tools. Never invent event IDs, resource IDs, shader code, pipeline state, resource bindings, buffer contents, texture contents, or GPU timings.',
+                        '- Skill files define workflow order, evidence requirements, and recovery policy; MCP tools perform the deterministic capture, replay, inspection, and export operations.',
+                        '- Tool inputs are schema-validated. If a tool returns INVALID_TOOL_INPUT, correct the named fields and retry; do not guess or silently omit required values.',
+                        '- Side-effecting tools include launch, capture, close-session, shader-apply, bookmark changes, and report export. Confirm their returned status, output path, and current Session impact before claiming success.',
+                        '- Launch/capture failures return structured codes with recoverable and nextActions fields. Follow nextActions, and run renderdoc_diagnoseEnvironment for environment or adb failures.',
                         '- If capture state is unknown, call renderdoc_openCapture with no filePath first so the server can resolve an already loaded or open .rdc capture from this VS Code window.',
                         '- Only ask the user for filePath when renderdoc_openCapture reports that no open or loaded capture could be resolved in this window.',
                         '- For questions about the current selection, focused draw, or "this"/"current"/"selected", call renderdoc_getSelectionContext first.',
@@ -249,6 +272,7 @@ export class RenderDocMcpServer implements vscode.Disposable {
                         '- For expensive draws, use the expensiveDraws field when present. Include the full logical marker hierarchy path for costly leaf draws, not just the leaf draw name.',
                         '- Avoid dumping large JSON blobs; summarize the key fields, anomalies, and likely implications.',
                         '- For performance analysis, be detailed: include the hottest passes or leaf draws, exact timing evidence, why each hot item is suspicious, and the next most relevant inspection target.',
+                        '- Every performance conclusion must retain an evidence path through EID, timing, resource, pipeline, shader, or mesh fields. If a field is unavailable, mark the conclusion as toVerify.',
                         '- Distinguish clearly between confirmed capture facts, inferred causes, and follow-up hypotheses that still need validation.',
                         '- If a hot event has shader-, binding-, or constant-buffer relevance, include that drill-down instead of stopping at timing numbers alone.',
                         '- Mention native bridge limitations when pipeline state, shader source, mesh data, texture data, or buffer contents are unavailable.',
@@ -271,7 +295,11 @@ export class RenderDocMcpServer implements vscode.Disposable {
                             openWorldHint: false,
                         },
                     },
-                    async (args: unknown): Promise<McpCallToolResult> => invokeLanguageModelTool(binding.tool, normalizeToolInput(args)),
+                    async (args: unknown): Promise<McpCallToolResult> => invokeLanguageModelTool(
+                        binding.tool,
+                        normalizeToolInput(args),
+                        binding.inputSchema,
+                    ),
                 );
             }
 

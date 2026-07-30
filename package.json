@@ -535,6 +535,8 @@
     "package": "npm run typecheck && node esbuild.js --production",
     "typecheck": "tsc -p ./ --noEmit",
     "lint": "eslint src --ext ts",
+    "test:contracts": "node scripts/test-contracts.js",
+    "test:session-and-limits": "node scripts/test-session-and-limits.js",
     "test:mcp-tool-parity": "node scripts/test-mcp-tool-parity.js",
     "test:rdc-parser": "node scripts/test-rdc-parser.js",
     "test:mcp-runtime": "node scripts/test-mcp-runtime.js"

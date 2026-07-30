@@ -245,8 +245,9 @@ export class LaunchApplicationTool implements vscode.LanguageModelTool<LaunchApp
     }
 }
 
-export class GeneratePerformanceReportTool implements vscode.LanguageModelTool<{ limit?: number }> {
-    async invoke(options: vscode.LanguageModelToolInvocationOptions<{ limit?: number }>): Promise<vscode.LanguageModelToolResult> {
+interface PerformanceReportInput { limit?: number; format?: 'json' | 'markdown'; outputPath?: string }
+export class GeneratePerformanceReportTool implements vscode.LanguageModelTool<PerformanceReportInput> {
+    async invoke(options: vscode.LanguageModelToolInvocationOptions<PerformanceReportInput>): Promise<vscode.LanguageModelToolResult> {
         const filePath = requireCapturePath();
         const drawCalls = _getCurrentDrawCalls().length ? _getCurrentDrawCalls() : await _bridge.getDrawCalls(filePath);
         const timings = _bridge.hasNativeBridge() ? await _bridge.getDrawTimings() : new Map<number, number>();
@@ -293,7 +294,30 @@ export class GeneratePerformanceReportTool implements vscode.LanguageModelTool<{
                 : { confirmed: [], inferred: [], toVerify: ['Collect GPU timings before making performance conclusions.'] },
             evidence: timings.size ? 'Hotspots are based on GPU timing evidence.' : 'GPU timings are unavailable; treat performance conclusions as hypotheses.',
         };
-        return new vscode.LanguageModelToolResult([new vscode.LanguageModelTextPart(JSON.stringify(report, null, 2))]);
+        const format = options.input?.format ?? 'json';
+        const content = format === 'json' ? JSON.stringify(report, null, 2) : [
+            '# RenderDoc Performance Report',
+            '',
+            `- Capture: ${filePath}`,
+            `- GPU timings available: ${report.timingAvailable ? 'yes' : 'no'}`,
+            `- Timed events: ${report.totalTimedEvents}`,
+            '',
+            '## Hottest passes',
+            ...(hottestPasses.length ? hottestPasses.map((pass) => `- ${pass.name}: ${pass.durationUs.toFixed(2)} µs`) : ['- None']),
+            '',
+            '## Hottest events',
+            ...(hottestEvents.length ? hottestEvents.map((event) => `- EID ${event.eventId}: ${event.name} — ${event.durationUs.toFixed(2)} µs`) : ['- None']),
+            '',
+            '## Evidence and limitations',
+            `- ${report.evidence}`,
+            ...report.conclusions.toVerify.map((item) => `- Follow-up: ${item}`),
+        ].join('\n');
+        const outputPath = options.input?.outputPath ? path.resolve(options.input.outputPath) : undefined;
+        if (outputPath) {
+            await fs.promises.mkdir(path.dirname(outputPath), { recursive: true });
+            await fs.promises.writeFile(outputPath, content, 'utf8');
+        }
+        return new vscode.LanguageModelToolResult([new vscode.LanguageModelTextPart(JSON.stringify({ ok: true, format, outputPath: outputPath ?? null, report, content: outputPath ? undefined : content }, null, 2))]);
     }
     async prepareInvocation(): Promise<vscode.PreparedToolInvocation> { return { invocationMessage: 'Generating an evidence-based RenderDoc performance report…' }; }
 }
@@ -509,11 +533,33 @@ export class CaptureFrameTool implements vscode.LanguageModelTool<TriggerRemoteC
     async prepareInvocation(): Promise<vscode.PreparedToolInvocation> { return { invocationMessage: 'Capturing a frame from the active RenderDoc session…' }; }
 }
 
-export class DiagnoseEnvironmentTool implements vscode.LanguageModelTool<Record<string, never>> {
-    async invoke(): Promise<vscode.LanguageModelToolResult> {
+interface EnvironmentDiagnosticsInput { format?: 'json' | 'markdown'; outputPath?: string }
+export class DiagnoseEnvironmentTool implements vscode.LanguageModelTool<EnvironmentDiagnosticsInput> {
+    async invoke(options: vscode.LanguageModelToolInvocationOptions<EnvironmentDiagnosticsInput>): Promise<vscode.LanguageModelToolResult> {
         if (!_diagnoseEnvironment) throw new Error('Environment diagnostics are not initialized.');
-        const result = { environment: await _diagnoseEnvironment(), mcp: _getMcpStatus?.() ?? { available: false, reason: 'MCP status provider is not initialized.' } };
-        return new vscode.LanguageModelToolResult([new vscode.LanguageModelTextPart(JSON.stringify(result, null, 2))]);
+        const report = { generatedAt: new Date().toISOString(), environment: await _diagnoseEnvironment(), mcp: _getMcpStatus?.() ?? { available: false, reason: 'MCP status provider is not initialized.' } };
+        const format = options.input?.format ?? 'json';
+        const content = format === 'json' ? JSON.stringify(report, null, 2) : [
+            '# RenderDoc Environment Diagnostics',
+            '',
+            `- Generated: ${report.generatedAt}`,
+            '',
+            '## Environment',
+            '```json',
+            JSON.stringify(report.environment, null, 2),
+            '```',
+            '',
+            '## MCP',
+            '```json',
+            JSON.stringify(report.mcp, null, 2),
+            '```',
+        ].join('\n');
+        const outputPath = options.input?.outputPath ? path.resolve(options.input.outputPath) : undefined;
+        if (outputPath) {
+            await fs.promises.mkdir(path.dirname(outputPath), { recursive: true });
+            await fs.promises.writeFile(outputPath, content, 'utf8');
+        }
+        return new vscode.LanguageModelToolResult([new vscode.LanguageModelTextPart(JSON.stringify({ ok: true, format, outputPath: outputPath ?? null, report, content: outputPath ? undefined : content }, null, 2))]);
     }
     async prepareInvocation(): Promise<vscode.PreparedToolInvocation> { return { invocationMessage: 'Diagnosing RenderDoc, replay, MCP, and Android environment…' }; }
 }
@@ -777,7 +823,7 @@ export class GetActionTimingsTool implements vscode.LanguageModelTool<GetActionT
 
         applyTimingsToDrawCallTree(drawCalls, timings);
 
-        const limit = options.input?.limit === 0 ? Number.MAX_SAFE_INTEGER : Math.max(1, options.input?.limit ?? 200);
+        const limit = Math.min(2000, Math.max(1, options.input?.limit ?? 200));
         const eventIdSet = options.input?.eventIds?.length ? new Set(options.input.eventIds) : undefined;
         const entries = collectActionTimingEntries(drawCalls, {
             eventIdSet,
@@ -846,8 +892,7 @@ export class GetResourcesTool implements vscode.LanguageModelTool<GetResourcesIn
 
         const total = resources.length;
         const offset = Math.max(0, options.input?.offset ?? 0);
-        const rawLimit = options.input?.limit;
-        const limit = rawLimit === 0 ? total : (rawLimit ?? RESOURCES_DEFAULT_LIMIT);
+        const limit = Math.min(RESOURCES_DEFAULT_LIMIT, Math.max(1, options.input?.limit ?? RESOURCES_DEFAULT_LIMIT));
         const page = resources.slice(offset, offset + limit);
         const truncated = page.length < total - offset;
 
@@ -1103,6 +1148,13 @@ export class GetShaderInfoTool implements vscode.LanguageModelTool<GetShaderInfo
             api: pipelineState?.api ?? shaderPayload?.api ?? null,
             requestedStage: options.input.stage ?? null,
             availableStages,
+            evidenceWorkflow: {
+                timing: 'Call renderdoc_getActionTimings with this EID before attributing GPU cost.',
+                bindings: 'The stages.*.bindings fields summarize textures, samplers, and constant-buffer metadata.',
+                constantBuffers: includeConstantBuffers ? 'Decoded constant-buffer contents were requested where supported.' : 'Constant-buffer contents were omitted by request.',
+                source: includeSource ? 'Captured source or disassembly was included where available.' : 'Call renderdoc_getShaderSource for source or disassembly detail.',
+                mali: 'Mali/offline compiler analysis is not inferred from capture data; use the configured Mali workflow when available.',
+            },
             sourceIncluded: includeSource,
             constantBuffersIncluded: includeConstantBuffers,
             stages,
@@ -2552,7 +2604,8 @@ export class GetMeshDataTool implements vscode.LanguageModelTool<GetMeshDataInpu
         options: vscode.LanguageModelToolInvocationOptions<GetMeshDataInput>,
         _token: vscode.CancellationToken,
     ): Promise<vscode.LanguageModelToolResult> {
-        const { eventId, stage = 'vsin', maxVertices = 32, instance = 0 } = options.input;
+        const { eventId, stage = 'vsin', maxVertices: requestedMaxVertices = 32, instance = 0 } = options.input;
+        const maxVertices = Math.min(4096, Math.max(1, requestedMaxVertices));
         const raw = await _bridge.nativeGetMeshData(eventId, stage, { maxVertices, instance });
 
         // Topology enum → readable string (mirrors RenderDoc Topology enum order)
@@ -2927,8 +2980,9 @@ export class GetTextureDataTool implements vscode.LanguageModelTool<GetTextureDa
             mip,
             eventId,
             channelExtract,
-            base64: result.base64,
             base64Length: result.base64?.length ?? 0,
+            base64: result.base64 && result.base64.length <= 1024 * 1024 ? result.base64 : undefined,
+            dataTruncated: !!result.base64 && result.base64.length > 1024 * 1024,
         };
 
         return new vscode.LanguageModelToolResult([
@@ -2967,7 +3021,9 @@ export class GetBufferContentsTool implements vscode.LanguageModelTool<GetBuffer
             ]);
         }
 
-        const { resourceId, offset = 0, len = 4096, eventId = 0 } = options.input;
+        const { resourceId, offset: requestedOffset = 0, len: requestedLen = 4096, eventId = 0 } = options.input;
+        const offset = Math.max(0, requestedOffset);
+        const len = Math.min(65536, Math.max(1, requestedLen));
         const result = await _bridge.nativeGetBufferContents(resourceId, offset, len, eventId);
 
         return new vscode.LanguageModelToolResult([

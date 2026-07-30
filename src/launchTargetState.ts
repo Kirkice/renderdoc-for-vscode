@@ -2,6 +2,7 @@ import * as vscode from 'vscode';
 import { RenderDocBridge } from './renderdocBridge';
 import { CaptureLaunchTarget, LiveCaptureEntry, LiveTargetInfo, ReplayHostInfo } from './types';
 import { withTimeout } from './util/async';
+import { isValidSessionTransition } from './sessionTransitions';
 
 const STATE_KEY = 'renderdoc.selectedLaunchTarget';
 
@@ -231,19 +232,4 @@ export class LaunchTargetState {
         await this.context.workspaceState.update(STATE_KEY, url);
         this._onDidChange.fire();
     }
-}
-
-function isValidSessionTransition(from: LiveSessionPhase, to: LiveSessionPhase): boolean {
-    if (from === to) return true;
-    const allowed: Record<LiveSessionPhase, LiveSessionPhase[]> = {
-        idle: ['checking', 'launching', 'running'],
-        checking: ['ready', 'launching', 'failed', 'idle'],
-        ready: ['launching', 'running', 'capturing', 'failed', 'idle'],
-        launching: ['running', 'ready', 'failed', 'idle'],
-        running: ['capturing', 'completed', 'failed', 'idle'],
-        capturing: ['completed', 'running', 'failed', 'idle'],
-        completed: ['capturing', 'running', 'launching', 'failed', 'idle'],
-        failed: ['checking', 'launching', 'running', 'capturing', 'idle'],
-    };
-    return allowed[from].includes(to);
 }

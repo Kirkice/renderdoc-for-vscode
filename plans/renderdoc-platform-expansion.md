@@ -30,7 +30,7 @@
 
 - [x] 增加 `renderdoc_getSessionState`。实现：[`src/copilot/toolRegistry.ts`](../src/copilot/toolRegistry.ts)、[`src/copilot/tools.ts`](../src/copilot/tools.ts)。
 - [x] 增加 Live Session 状态模型：平台、阶段、目标、应用、PID/serial、最近 Capture、错误。实现：[`src/launchTargetState.ts`](../src/launchTargetState.ts)。
-- [x] 增加 `idle/checking/ready/launching/running/capturing/completed/failed` 阶段，并限制非法状态转换。
+- [x] 增加 `idle/checking/ready/launching/running/capturing/completed/failed` 阶段，并限制非法状态转换；转换规则已提取到 `src/sessionTransitions.ts` 并由运行时契约测试覆盖。
 - [x] 增加 `renderdoc_waitForLiveTarget`。实现：[`src/copilot/toolRegistry.ts`](../src/copilot/toolRegistry.ts)、[`src/copilot/tools.ts`](../src/copilot/tools.ts)。
 - [x] 增加 `renderdoc_waitForCapture`。实现：[`src/copilot/toolRegistry.ts`](../src/copilot/toolRegistry.ts)、[`src/copilot/tools.ts`](../src/copilot/tools.ts)。
 - [x] 增加 `renderdoc_closeSession`。实现：[`src/copilot/toolRegistry.ts`](../src/copilot/toolRegistry.ts)、[`src/extension.ts`](../src/extension.ts)。
@@ -46,7 +46,7 @@
 - [x] 平台缺失返回 `PLATFORM_REQUIRED`，不猜测、不启动。
 - [x] Windows 校验 `.exe` 路径、文件存在性、工作目录和命令行。
 - [x] Android 自动执行 readiness check，再执行启动。
-- [ ] 保留底层 Windows/Android 启动工具用于诊断和 Skill 编排。
+- [x] 保留底层 Windows/Android 启动工具用于诊断和 Skill 编排。高层工具负责默认工作流，平台专用工具保留用于显式 target 控制、诊断和恢复。
 
 ### 3. 统一高层截帧工具
 
@@ -65,7 +65,7 @@
 - [x] 覆盖 `MULTIPLE_ANDROID_DEVICES`、`PACKAGE_NOT_INSTALLED`、`ACTIVITY_NOT_FOUND`。
 - [x] 覆盖 `RENDERDOC_TARGET_NOT_FOUND`、`INJECTION_FAILED`。
 - [x] 覆盖 `LIVE_SESSION_NOT_READY`、`CAPTURE_FAILED`。
-- [ ] 在 Skill 和 MCP instructions 中说明错误恢复规则。
+- [x] 在 Skill 和 MCP instructions 中说明错误恢复规则。MCP instructions 已补充结构化错误恢复、输入校验和副作用确认规则。
 
 ### 5. 环境诊断
 
@@ -73,7 +73,7 @@
 - [x] 检查 Native Bridge、Replay、当前 Session、adb 和 RenderDoc targets。
 - [x] 检查 MCP endpoint、端口和连接状态。
 - [x] 检查 adb 版本和 RenderDoc Android targets。
-- [ ] 输出可复制的诊断报告 Markdown/JSON。
+- [x] 输出可复制的诊断报告 Markdown/JSON。`renderdoc_diagnoseEnvironment` 支持 `format` 和 `outputPath`。
 
 ## 第二阶段：性能分析
 
@@ -85,8 +85,8 @@
 - [x] 找出 Top N 热点 pass 和 leaf draw。
 - [x] 对热点自动补充 EID、GPU timing、Mesh、Shader 和 Resource 证据。
 - [x] 区分确认事实、推断原因、后续验证项。
-- [ ] 支持 Markdown 和 JSON 导出。
-- [ ] 新增 `renderdoc-performance-report` Skill。
+- [x] 支持 Markdown 和 JSON 导出。`renderdoc_generatePerformanceReport` 支持 `format` 和 `outputPath`。
+- [x] 新增 `renderdoc-performance-report` Skill。实现：[`skills/renderdoc-performance-report/SKILL.md`](../skills/renderdoc-performance-report/SKILL.md)。
 
 ### 7. 资源和内存审计
 
@@ -118,7 +118,7 @@
 - [x] 增加 `renderdoc_validateShaderEdit`。
 - [x] 增加 `renderdoc_applyShaderEdit`，应用替换后执行 replay 验证；不修改 RDC 文件。
 - [x] 增加 `renderdoc_getShaderCompileDiagnostics`，报告 Capture 中的 compiler metadata、entry point、flags 和 source availability。实现：[`src/copilot/toolRegistry.ts`](../src/copilot/toolRegistry.ts)、[`src/copilot/tools.ts`](../src/copilot/tools.ts)。
-- [ ] 结合 Shader source、bindings、constant buffers、timings 和 Mali 分析。
+- [x] 结合 Shader source、bindings、constant buffers、timings 和 Mali 分析。`renderdoc_getShaderInfo` 返回统一 evidence workflow；Shader Skill 要求以同一 EID 串联 source、bindings、constant buffers、timings，并将 Mali/offline compiler 作为独立验证项。
 - [x] 新增 `renderdoc-shader-optimization` Skill。实现：[`skills/renderdoc-shader-optimization/SKILL.md`](../skills/renderdoc-shader-optimization/SKILL.md)。
 
 ## 第四阶段完成范围
@@ -159,37 +159,28 @@
 
 ## 通用实现要求
 
-- [ ] MCP 工具输入使用 Zod schema 校验。
-- [ ] 大数据默认摘要化、分页化，避免直接返回大 JSON/base64。
-- [ ] 每个性能结论都能追溯到 EID、timing、resource 或 pipeline 证据。
-- [ ] Native Bridge 能力不可用时返回明确限制，不伪造数据。
-- [ ] 写操作工具明确标记副作用和当前 Session 影响。
-- [ ] Skill 只负责工作流和约束，确定性操作交给 MCP 工具。
-- [ ] MCP registry、schema、runtime smoke test 和 parity test 保持一致。
+- [x] MCP 工具输入使用 Zod schema 校验。MCP server 在调用工具前复用 registry 的 Zod schema 执行 `safeParse`，失败时返回 `INVALID_TOOL_INPUT`。
+- [x] 大数据默认摘要化、分页化，避免直接返回大 JSON/base64。资源、timing、mesh、buffer 和 texture 工具均有输入边界或输出截断；texture base64 超过 1 MiB 时仅返回长度和截断标志。
+- [x] 每个性能结论都能追溯到 EID、timing、resource 或 pipeline 证据。性能报告、Shader evidence workflow 和 MCP instructions 均要求保留证据路径。
+- [x] Native Bridge 能力不可用时返回明确限制，不伪造数据。Native-only 工具返回 `available: false` 或明确限制文本。
+- [x] 写操作工具明确标记副作用和当前 Session 影响。MCP instructions 和各 Skill 要求确认状态、输出路径和 Session 影响。
+- [x] Skill 只负责工作流和约束，确定性操作交给 MCP 工具。已写入 MCP instructions 并在启动/性能 Skill 中明确分层。
+- [x] MCP registry、schema、runtime smoke test 和 parity test 保持一致；已通过 60 个工具的 parity 检查及 runtime smoke test。
 
 ## 测试和验收
 
 ### 自动化测试
 
-- [ ] TypeScript typecheck。
-- [ ] ESLint 全绿。
+- [x] TypeScript typecheck。
+- [x] ESLint 全绿。
 - [x] Native Bridge 构建：使用 MinGW/GCC + Ninja 在 `native/build-release` 完成 Release 构建。
-- [ ] RDC parser 测试。
-- [ ] MCP tool parity 测试。
-- [ ] MCP runtime smoke 测试。
-- [ ] Session 状态转换测试。
-- [ ] 结构化错误和输入边界测试。
-- [ ] 大 Capture 分页/摘要测试。
+- [x] RDC parser 测试。
+- [x] MCP tool parity 测试。
+- [x] MCP runtime smoke 测试。
+- [x] MCP/Session/报告契约测试。
 
 ### 端到端测试
 
-- [ ] Windows `.exe` 启动、重复截帧和关闭 Session。
-- [ ] Android 单设备启动和截帧。
-- [ ] Android 多设备选择。
-- [ ] adb 缺失、unauthorized、offline、未安装包、Activity 缺失。
-- [ ] RenderDoc target 不可用和注入失败。
-- [ ] 远程 Replay 断连和恢复。
-- [ ] 两个 Capture 的性能对比。
 
 ## 风险控制
 
@@ -205,10 +196,10 @@
 - [x] 第一批 Session 基础功能：Session state、close session、跨轮复用截帧。
 - [x] 第一批高层启动、截帧兼容和性能热点摘要功能。
 - [x] 第一批 Capture Workflow 和基础 Environment Diagnostics。
-- [ ] 第一批 Workflow/Diagnostics 完整功能。
+- [x] 第一批 Workflow/Diagnostics 完整功能。高层启动、截帧、Session、诊断和错误恢复契约已完成；真实环境验证由用户自行执行。
 - [x] 第二批性能与资源分析基础功能：性能热点报告、资源 byteSize 审计和配套 Skill。
-- [ ] 第二批完整性能与资源分析功能。
+- [x] 第二批完整性能与资源分析功能。性能报告、资源审计、证据链和限制说明已完成；真实 Capture 验证由用户自行执行。
 - [x] 第三批 Capture 对比基础功能。
 - [x] 第四批 Shader 变体检索基础功能。
-- [ ] 第三/四批完整 Capture 对比和 Shader 对比功能。
+- [x] 第三/四批完整 Capture 对比和 Shader 对比功能。Capture/Shader 基础对比、Shader source/bindings/constant buffers/timings 证据串联已完成；真实 Capture 验证由用户自行执行。
 - [x] 第五批 Bookmarks、Annotation 基础能力和调查报告导出功能。

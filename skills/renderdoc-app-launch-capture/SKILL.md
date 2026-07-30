@@ -14,17 +14,21 @@ Use this workflow for live application control. Do not guess the platform when t
 3. Android requires an installed `adb`, an authorized online device, an installed package, a resolvable launcher activity, and a matching RenderDoc target.
 4. With multiple Android devices, ask the user to choose one unless a serial, target URL, or device name was supplied.
 
+## Tool layering
+
+Use `renderdoc_launchApplication` and `renderdoc_captureFrame` for the normal high-level workflow. Keep the platform-specific tools below available for diagnostics, explicit target selection, and workflow orchestration when the high-level tool reports a platform-specific failure.
+
 ## Windows
 
-Call `renderdoc_launchWindowsApplication` with the executable path. Preserve the live session. Later, call `renderdoc_triggerCapture` when the user asks to capture.
+Call `renderdoc_launchWindowsApplication` with the executable path when explicit Windows control or diagnostics are needed. Preserve the live session. Later, call `renderdoc_triggerRemoteCapture` only for remote targets; for a local Windows session use `renderdoc_captureFrame`.
 
 ## Android
 
-Call `renderdoc_checkAndroidLaunchReadiness` before launch. Resolve package/activity and device first, then call `renderdoc_launchRemoteApplication`. Later, call `renderdoc_triggerCapture`.
+Call `renderdoc_checkAndroidLaunchReadiness` before launch. Resolve package/activity and device first, then call `renderdoc_launchRemoteApplication` when explicit Android target control is needed. Later, call `renderdoc_triggerRemoteCapture`, or use `renderdoc_captureFrame` in the high-level workflow.
 
 ## Error handling
 
-Report actionable causes: missing adb, unauthorized/offline device, missing package, missing activity, absent RenderDoc target, injection failure, or non-debug/develop build. Do not claim launch succeeded unless the tool reports an active live target.
+Report actionable causes: missing adb, unauthorized/offline device, missing package, missing activity, absent RenderDoc target, injection failure, or non-debug/develop build. Do not claim launch succeeded unless the tool reports an active live target. Use `renderdoc_diagnoseEnvironment` for environment failures and follow the returned `nextActions`.
 
 ## Capture
 
