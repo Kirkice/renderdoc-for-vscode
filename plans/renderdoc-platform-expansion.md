@@ -17,12 +17,12 @@
 ## 总体目标
 
 将插件从 Capture 查看器扩展为完整的 GPU 调试工作台：
-
+  
 1. AI 能可靠地管理应用启动、Live Session 和截帧状态。
 2. AI 能基于证据生成性能、资源和 Shader 分析报告。
-3. 用户能对比多个 Capture，定位优化前后的变化。
+3. 用户能对比多个 Capture，定位优化前后的变化。  
 4. Inspector 能支持高级过滤、状态差异和调查记录。
-5. Skill、MCP 工具、Native Bridge 和 UI 状态保持一致。
+5. Skill、MCP 工具、Native Bridge 和 UI 状态保持一致。  
 
 ## 第一阶段：Session、工作流和诊断
 
